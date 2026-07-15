@@ -64,12 +64,16 @@ def _service_unit() -> str:
     exe = _cleanix_exe()
     report_dir = _report_dir()
     report_file = report_dir / "last-scan.json"
-    # ExecStartPost sends a desktop notification summarizing the scan.
+    # ExecStartPost sends a desktop notification summarizing the scan. It uses
+    # the resolved {exe} (systemd's PATH is restricted, so a bare `cleanix`
+    # often isn't found) and summarizes the JSON *just written* by ExecStart
+    # rather than running a second full scan.
     notify = (
         "/bin/sh -c '"
         f"command -v notify-send >/dev/null 2>&1 && "
         f"notify-send \"Cleanix\" "
-        f"\"$(cleanix scan --quiet --summary 2>/dev/null || echo scan complete)\" "
+        f"\"$({exe} scan --summary --input {report_file} 2>/dev/null "
+        f"|| echo scan complete)\" "
         "|| true'"
     )
     return f"""[Unit]

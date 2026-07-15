@@ -105,6 +105,33 @@ class Config:
     # protected paths (e.g. "~/Projects/**", "/data").
     protected_globs: List[str] = field(default_factory=list)
 
+    # Old language-toolchain *versions* (rustup/nvm/pyenv/rbenv/asdf/sdkman):
+    # keep the active + newest N, offer the older surplus for removal.
+    prune_old_toolchains: bool = True
+    keep_toolchain_versions: int = 2
+
+    # Report-only: stale, regenerable project build/dependency dirs
+    # (node_modules, .venv, target, …) in projects untouched for N+ days.
+    project_scan_dirs: List[str] = field(
+        default_factory=lambda: ["~/Projects", "~/src", "~/dev", "~/code", "~/git"]
+    )
+    project_stale_days: float = 120.0
+
+    # Report-only large-file finder: surface the N largest files >= M MiB.
+    big_file_min_size_mb: float = 500.0
+    big_files_top_n: int = 20
+
+    # Report-only ~/Downloads triage: flag items older than N days and >= M MiB.
+    downloads_stale_days: float = 60.0
+    downloads_min_size_mb: float = 50.0
+
+    # Report-only: non-default browser profiles idle for N+ days (may be orphaned).
+    browser_profile_stale_days: float = 90.0
+
+    # Report-only duplicate finder: compare files >= M MiB, report top N groups.
+    dup_min_size_mb: float = 10.0
+    dup_top_n: int = 50
+
     @classmethod
     def load(cls, path: str | os.PathLike | None = None) -> "Config":
         """Load config, layering a YAML file over the defaults if present."""
@@ -152,6 +179,17 @@ FIELD_HELP = {
     "include_offline_repos": "Include Maven/Ivy/NuGet/etc. offline caches",
     "remove_backup_files": "Remove *~/*.bak/*.orig/*.rej editor backups",
     "purge_unused_locales": "Remove locale/man-page translations you don't use",
+    "prune_old_toolchains": "Offer removal of superseded language toolchains",
+    "keep_toolchain_versions": "Toolchain versions to keep per manager (newest N)",
+    "project_scan_dirs": "Project roots scanned for stale build/dependency dirs",
+    "project_stale_days": "Report build/dep dirs in projects untouched N+ days",
+    "big_file_min_size_mb": "Report files in $HOME at least this large (MiB)",
+    "big_files_top_n": "Report at most the N largest files (largest first)",
+    "downloads_stale_days": "Flag ~/Downloads items older than N days (report only)",
+    "downloads_min_size_mb": "Only flag ~/Downloads items at least N MiB",
+    "browser_profile_stale_days": "Report browser profiles idle N+ days (report only)",
+    "dup_min_size_mb": "Only compare files in $HOME at least this large (MiB)",
+    "dup_top_n": "Report at most the N largest duplicate groups",
 }
 
 
@@ -179,9 +217,15 @@ def coerce_value(key: str, raw: str):
             return False
         raise ValueError(f"expected a boolean for {key}, got {raw!r}")
     if t is int:
-        return int(raw)
+        try:
+            return int(raw)
+        except ValueError:
+            raise ValueError(f"expected an integer for {key}, got {raw!r}")
     if t is float:
-        return float(raw)
+        try:
+            return float(raw)
+        except ValueError:
+            raise ValueError(f"expected a number for {key}, got {raw!r}")
     if t is list:
         return [p.strip() for p in raw.split(",") if p.strip()]
     return raw

@@ -4,8 +4,18 @@ A "leftover" here is anything the engine keeps around that is **not referenced
 by an existing container** and can be regenerated: dangling (untagged) images,
 stopped containers, unused networks and build cache. Rather than lumping these
 into one opaque ``system prune`` with a bogus size, we surface each category as
-its own item whose estimated size matches *exactly* what pruning that category
-reclaims — so the number you see is the number you get.
+its own item whose estimated size closely tracks what pruning that category
+reclaims. Two honest caveats on the estimate:
+
+  * **Dangling-image** size sums each image's reported size; when several
+    dangling images share base layers, ``image prune`` frees only the unique
+    layers, so the figure is an upper bound.
+  * On Docker's **containerd image store** (Docker Desktop's default), the
+    default dangling-only prune may show nothing while real reclaimable image
+    space sits behind ``docker_prune_all_images`` (``image prune -a``).
+  * On **macOS/Windows** the engine runs in a Linux VM; pruning frees space
+    *inside* the VM's disk image, which the host file only reflects after the
+    VM compacts it.
 
 Two categories stay opt-in because they can destroy real work:
   * unused **volumes** (``docker_prune_volumes``) — may hold databases, etc.
@@ -19,12 +29,15 @@ import json
 import re
 from typing import Iterable, Optional
 
-from cleanix.cleaners.base import Cleaner, SCOPE_SYSTEM
+from cleanix.cleaners.base import SCOPE_SYSTEM, Cleaner
 from cleanix.core.models import CleanableItem
 from cleanix.core.utils import run_command, which
 
 _SIZE_RE = re.compile(r"([\d.]+)\s*([KMGT]?B)", re.IGNORECASE)
-_UNIT = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+# Docker/Podman render sizes with go-units in DECIMAL (1000-based) units — the
+# tokens are B/kB/MB/GB/TB, never KiB/GiB. Parsing them with a 1024 table
+# inflated every figure by ~7.4% at GB, so use a decimal table to match.
+_UNIT = {"B": 1, "KB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4}
 
 
 def _parse_size(text: str) -> int:
@@ -98,12 +111,18 @@ class _ContainerCleaner(Cleaner):
         ``ps --size`` reports ``"<writable> (virtual <total>)"``; the writable
         layer is what ``container prune`` actually reclaims, so we take the
         first size token on each line.
+
+        We filter to ``exited`` + ``created`` only. Docker's ``dead`` state is
+        rejected outright by Podman (``unknown container state: dead`` → the
+        whole command errors, so Podman would silently report zero stopped
+        containers); ``container prune -f`` still removes ``dead`` containers on
+        Docker regardless, so dropping the filter only slightly under-counts the
+        estimate on Docker while making Podman work at all.
         """
         code, out, _err = run_command(
             [self.binary, "ps", "-a", "--size",
              "--filter", "status=exited",
              "--filter", "status=created",
-             "--filter", "status=dead",
              "--format", "{{.Size}}"],
             timeout=30,
         )
@@ -180,12 +199,22 @@ class _ContainerCleaner(Cleaner):
             )
 
         # 5) Unused volumes — opt-in, may hold real data.
+        #
+        # The `df` "Local Volumes" reclaimable counts ALL unused volumes (named
+        # + anonymous). Since Docker 23, a bare `volume prune` removes only
+        # *anonymous* volumes, so the figure would overstate what's freed. To
+        # make the size match the action we prune all unused volumes: Docker
+        # needs `-a` for that, Podman removes all unused by default (and older
+        # `podman volume prune` rejects `-a`).
         if self.config.docker_prune_volumes:
             size = df.get("Local Volumes", 0)
             if size > 0:
+                cmd = [self.binary, "volume", "prune", "-f"]
+                if self.binary == "docker":
+                    cmd.insert(3, "-a")
                 yield self.command_item(
-                    [self.binary, "volume", "prune", "-f"],
-                    "Unused (anonymous) volumes",
+                    cmd,
+                    "Unused volumes (incl. named — may hold real data)",
                     size=size,
                 )
 

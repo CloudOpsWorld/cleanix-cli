@@ -1,0 +1,4 @@
+include README.md RELEASING.md LICENSE requirements.txt
+include cleanix.1
+recursive-include packaging *
+include scripts/gen_manpage.py

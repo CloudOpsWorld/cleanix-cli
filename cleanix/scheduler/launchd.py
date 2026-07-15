@@ -79,7 +79,7 @@ def _program_arguments() -> list:
     # macOS). Failures in either half are swallowed so launchd stays happy.
     script = (
         f'{exe} scan --json --output "{report_file}"; '
-        f'summary="$({exe} scan --quiet --summary 2>/dev/null || echo "scan complete")"; '
+        f'summary="$({exe} scan --summary --input "{report_file}" 2>/dev/null || echo "scan complete")"; '
         f'osascript -e "display notification \\"$summary\\" with title \\"Cleanix\\"" '
         f">/dev/null 2>&1 || true"
     )

@@ -5,14 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from cleanix.cleaners.base import SCOPE_SYSTEM
-from cleanix.config import Config, coerce_value
 from cleanix import reset
+from cleanix.config import Config, coerce_value
 from cleanix.core import context, quarantine, safety
 from cleanix.core.context import TargetUser
 from cleanix.core.engine import Engine
 from cleanix.core.models import CleanableItem, CleanerReport, ItemKind, ScanResult
-from cleanix.core.platform import ALL, LINUX, MACOS, supports
+from cleanix.core.platform import ALL, supports
 from cleanix.core.registry import build_cleaners
 from cleanix.core.utils import human_size, surplus_after_keeping
 
@@ -145,7 +144,7 @@ def test_platform_supports():
 
 # --------------------------------------------------------------------------- context
 def test_multi_user_iteration_and_dedup(tmp_path):
-    from cleanix.cleaners.base import Cleaner, SCOPE_USER
+    from cleanix.cleaners.base import SCOPE_USER, Cleaner
 
     h1 = tmp_path / "u1"; (h1 / ".cache" / "j").mkdir(parents=True)
     h2 = tmp_path / "u2"; (h2 / ".cache" / "j").mkdir(parents=True)
@@ -300,7 +299,8 @@ def test_docker_opt_in_all_images_and_volumes(monkeypatch):
     by_cmd = {" ".join(i.command): i for i in items}
     assert by_cmd["docker image prune -a -f"].size == 8_000_000_000
     assert "docker image prune -f" not in by_cmd
-    assert by_cmd["docker volume prune -f"].size == 2_000_000_000
+    # Docker needs `-a` to prune named volumes so the size matches the action.
+    assert by_cmd["docker volume prune -a -f"].size == 2_000_000_000
 
 
 def test_docker_nothing_to_clean_yields_no_items(monkeypatch):
@@ -316,10 +316,28 @@ def test_docker_nothing_to_clean_yields_no_items(monkeypatch):
 def test_docker_parse_size():
     from cleanix.cleaners.containers import _parse_size
 
-    assert _parse_size("1.2GB") == int(1.2 * 1024**3)
-    assert _parse_size("45.6MB (virtual 1.2GB)") == int(45.6 * 1024**2)  # takes first token
+    # Docker/Podman render sizes in DECIMAL (1000-based) go-units.
+    assert _parse_size("1.2GB") == int(1.2 * 1000**3)
+    assert _parse_size("45.6MB (virtual 1.2GB)") == int(45.6 * 1000**2)  # first token
+    assert _parse_size("500kB") == 500_000
     assert _parse_size("0B") == 0
     assert _parse_size("") == 0
+
+
+def test_docker_stopped_containers_no_dead_filter(monkeypatch):
+    # Podman rejects `status=dead`; ensure we never send it.
+    from cleanix.cleaners import containers
+
+    captured = {}
+
+    def fake_run(cmd, timeout=30):
+        captured["cmd"] = cmd
+        return 0, "", ""
+
+    monkeypatch.setattr(containers, "run_command", fake_run)
+    containers.DockerCleaner(Config())._stopped_containers()
+    assert "status=dead" not in captured["cmd"]
+    assert "status=exited" in captured["cmd"]
 
 
 # --------------------------------------------------------------------------- scheduler
@@ -327,9 +345,42 @@ def test_scheduler_backend_per_os(monkeypatch):
     import cleanix.scheduler as sched
 
     monkeypatch.setattr(sched, "is_macos", lambda: True)
+    monkeypatch.setattr(sched, "is_bsd", lambda: False)
     assert sched.backend().__name__.endswith("launchd")
+
     monkeypatch.setattr(sched, "is_macos", lambda: False)
+    monkeypatch.setattr(sched, "is_bsd", lambda: True)
+    assert sched.backend().__name__.endswith("cron")
+
+    monkeypatch.setattr(sched, "is_bsd", lambda: False)
+    monkeypatch.setattr(sched.shutil, "which",
+                        lambda c: "/usr/bin/systemctl" if c == "systemctl" else None)
     assert sched.backend().__name__.endswith("systemd")
+
+
+def test_cron_block_roundtrip(monkeypatch):
+    from cleanix.scheduler import cron
+
+    monkeypatch.setattr(cron.shutil, "which", lambda c: "/usr/bin/" + c)
+    store = {"body": "MAILTO=me\n0 0 * * * echo hi\n"}
+    monkeypatch.setattr(cron, "_crontab_read", lambda: store["body"])
+    monkeypatch.setattr(cron, "_crontab_write",
+                        lambda body: (store.__setitem__("body", body), (0, ""))[1])
+    cron.install("daily")
+    assert cron.BEGIN in store["body"] and "scan --json" in store["body"]
+    assert "MAILTO=me" in store["body"]  # existing entries preserved
+    cron.uninstall()
+    assert cron.BEGIN not in store["body"]
+    assert "MAILTO=me" in store["body"]
+
+
+def test_config_numeric_errors_are_friendly():
+    from cleanix.config import coerce_value
+
+    with pytest.raises(ValueError, match="expected an integer"):
+        coerce_value("keep_kernels", "notanint")
+    with pytest.raises(ValueError, match="expected a number"):
+        coerce_value("temp_min_age_days", "abc")
 
 
 @pytest.mark.parametrize("freq,key", [
@@ -340,6 +391,7 @@ def test_scheduler_backend_per_os(monkeypatch):
 ])
 def test_launchd_plist_valid(freq, key):
     import plistlib
+
     from cleanix.scheduler import launchd
 
     # dumps() raises if the dict isn't a serializable plist; loads() round-trips.
@@ -417,6 +469,7 @@ def test_scan_all_users_dedupes_identical_commands(monkeypatch):
     # A per-user cleaner yielding a fixed command must appear once, not once
     # per target user, when running as root.
     import contextlib
+
     from cleanix.cleaners import base
 
     monkeypatch.setattr(base, "get_target_users", lambda: ["u1", "u2"])
@@ -429,6 +482,332 @@ def test_scan_all_users_dedupes_identical_commands(monkeypatch):
             yield self.command_item(["brew", "cleanup"], "x")
 
     assert len(C(Config())._scan_all_users()) == 1
+
+
+# ------------------------------------------------------ safety: symlink handling
+def test_safe_rmtree_never_follows_symlink_to_real_data(tmp_path):
+    # The C1 data-loss bug: deleting a symlinked "cache" wiped its target.
+    precious = tmp_path / "precious"
+    precious.mkdir()
+    (precious / "thesis.txt").write_text("keep me")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    link = cache / "app-cache"
+    link.symlink_to(precious)
+
+    safety.safe_rmtree(str(link))
+
+    assert precious.exists() and (precious / "thesis.txt").exists()  # survives
+    assert not link.exists()  # the link itself is gone
+
+
+def test_safe_rmtree_removes_broken_symlink(tmp_path):
+    # C1b: broken-symlink removal used to be a silent no-op.
+    link = tmp_path / "dead"
+    link.symlink_to(tmp_path / "does-not-exist")
+    safety.safe_rmtree(str(link))
+    assert not link.is_symlink() and not link.exists()
+
+
+def test_protected_home_includes_credentials(monkeypatch, tmp_path):
+    monkeypatch.setattr(safety, "_home_dirs", lambda: [tmp_path])
+    for name in (".ssh", ".gnupg", ".local/state", "Music", "Videos"):
+        assert not safety.is_safe_to_delete(tmp_path / name)
+    # but ordinary cache dirs stay deletable
+    assert safety.is_safe_to_delete(tmp_path / ".cache" / "app")
+
+
+def test_dollar_sign_filename_not_reexpanded(tmp_path):
+    # M2: a real file named with $VAR must be treated literally, not rewritten.
+    target = tmp_path / "foo$BAR"
+    target.mkdir()
+    resolved = safety._canonical(str(target))
+    assert resolved.name == "foo$BAR"
+
+
+# ------------------------------------------------------ toolchain versions
+def _mk_pyenv(tmp_path, versions, active):
+    import os as _os
+    import time as _time
+
+    root = tmp_path / ".pyenv" / "versions"
+    root.mkdir(parents=True)
+    for i, v in enumerate(versions):
+        (root / v).mkdir()
+        t = _time.time() - (100 - i) * 86400  # later in list => newer
+        _os.utime(root / v, (t, t))
+    if active is not None:
+        (tmp_path / ".pyenv" / "version").write_text(active + "\n")
+    return root
+
+
+def test_toolchains_protects_active_keeps_newest(tmp_path, monkeypatch):
+    from cleanix.cleaners import toolchains
+
+    _mk_pyenv(tmp_path, ["3.9.0", "3.10.0", "3.11.0", "3.12.0"], active="3.9.0")
+    monkeypatch.setattr(toolchains, "home", lambda: tmp_path)
+    cfg = Config()
+    cfg.keep_toolchain_versions = 1
+    items = list(toolchains.ToolchainVersionCleaner(cfg).find_items())
+    names = {os.path.basename(i.path) for i in items}
+    # active 3.9.0 protected; newest-1 (3.12.0) kept; prune 3.10.0 + 3.11.0
+    assert names == {"3.10.0", "3.11.0"}
+    assert all(not i.report_only for i in items)  # deletable (reversible via -q)
+
+
+def test_toolchains_fail_safe_when_active_unknown(tmp_path, monkeypatch):
+    from cleanix.cleaners import toolchains
+
+    _mk_pyenv(tmp_path, ["3.9.0", "3.10.0", "3.11.0"], active=None)  # no version file
+    monkeypatch.setattr(toolchains, "home", lambda: tmp_path)
+    assert list(toolchains.ToolchainVersionCleaner(Config()).find_items()) == []
+
+
+def test_toolchains_sdkman_asdf_fail_safe_when_active_unknown(tmp_path, monkeypatch):
+    # Regression: sdkman/asdf labels ("sdkman/x", "asdf/y") must also be
+    # skipped when their active version can't be determined — else the active
+    # (possibly older) version could be offered for deletion.
+    from cleanix.cleaners import toolchains
+
+    # sdkman candidate with installed versions but NO `current` symlink.
+    java = tmp_path / ".sdkman" / "candidates" / "java"
+    (java / "11.0.1").mkdir(parents=True)
+    (java / "8.0.1").mkdir()
+    # asdf tool installed but absent from .tool-versions (only python pinned).
+    node = tmp_path / ".asdf" / "installs" / "nodejs"
+    (node / "16.0.0").mkdir(parents=True)
+    (node / "18.0.0").mkdir()
+    (tmp_path / ".tool-versions").write_text("python 3.11.0\n")
+
+    monkeypatch.setattr(toolchains, "home", lambda: tmp_path)
+    cfg = Config()
+    cfg.keep_toolchain_versions = 1
+    offered = {os.path.basename(i.path)
+               for i in toolchains.ToolchainVersionCleaner(cfg).find_items()}
+    assert offered == set()  # both managers skipped entirely
+
+
+def test_toolchains_disabled_by_config(tmp_path, monkeypatch):
+    from cleanix.cleaners import toolchains
+
+    _mk_pyenv(tmp_path, ["3.9.0", "3.10.0", "3.11.0"], active="3.9.0")
+    monkeypatch.setattr(toolchains, "home", lambda: tmp_path)
+    cfg = Config()
+    cfg.prune_old_toolchains = False
+    assert list(toolchains.ToolchainVersionCleaner(cfg).find_items()) == []
+
+
+# ------------------------------------------------------ report-only finders
+def test_big_files_surfaces_only_large_report_only(tmp_path, monkeypatch):
+    from cleanix.cleaners import big_files
+
+    monkeypatch.setattr(big_files, "home", lambda: tmp_path)
+    (tmp_path / "big.bin").write_bytes(b"\xff" * 3 * 1024 * 1024)
+    (tmp_path / "small.txt").write_bytes(b"x" * 1024)
+    import os as _os
+    import time as _time
+    old = _time.time() - 3600
+    _os.utime(tmp_path / "big.bin", (old, old))
+    cfg = Config()
+    cfg.big_file_min_size_mb = 1.0
+    items = list(big_files.BigFileReporter(cfg).find_items())
+    assert [os.path.basename(i.path) for i in items] == ["big.bin"]
+    assert all(i.report_only for i in items)
+
+
+def test_downloads_surfaces_old_large_report_only(tmp_path, monkeypatch):
+    import os as _os
+    import time as _time
+
+    from cleanix.cleaners import downloads
+
+    dl = tmp_path / "Downloads"
+    dl.mkdir()
+    monkeypatch.setattr(downloads, "home", lambda: tmp_path)
+    big_old = dl / "ubuntu.iso"
+    big_old.write_bytes(b"x" * 60 * 1024 * 1024)
+    t = _time.time() - 120 * 86400
+    _os.utime(big_old, (t, t))
+    (dl / "recent.iso").write_bytes(b"x" * 60 * 1024 * 1024)  # too recent
+    items = list(downloads.DownloadsReporter(Config()).find_items())
+    assert [os.path.basename(i.path) for i in items] == ["ubuntu.iso"]
+    assert all(i.report_only for i in items)
+
+
+def test_project_cruft_reports_stale_only(tmp_path, monkeypatch):
+    import os as _os
+    import time as _time
+
+    from cleanix.cleaners.project_cruft import ProjectCruftCleaner
+
+    def mkproj(name, stale):
+        proj = tmp_path / name
+        (proj / "node_modules" / "sub").mkdir(parents=True)
+        (proj / "main.py").write_text("x")
+        if stale:
+            old = _time.time() - 300 * 86400
+            for dp, _dirs, files in _os.walk(proj):
+                _os.utime(dp, (old, old))
+                for f in files:
+                    _os.utime(_os.path.join(dp, f), (old, old))
+
+    mkproj("old", stale=True)
+    mkproj("fresh", stale=False)
+    cfg = Config()
+    cfg.project_scan_dirs = [str(tmp_path)]
+    cfg.project_stale_days = 120
+    items = list(ProjectCruftCleaner(cfg).find_items())
+    paths = [i.path for i in items]
+    assert any("old" in p and p.endswith("node_modules") for p in paths)
+    assert not any("fresh" in p for p in paths)
+    assert all(i.report_only for i in items)
+
+
+def test_duplicates_reported_as_group(tmp_path, monkeypatch):
+    import os as _os
+    import time as _time
+
+    from cleanix.cleaners import duplicates
+
+    monkeypatch.setattr(duplicates, "home", lambda: tmp_path)
+    old = _time.time() - 3600
+    blob = b"X" * (12 * 1024 * 1024)
+    for name in ("a.iso", "b.iso"):
+        (tmp_path / name).write_bytes(blob)
+        _os.utime(tmp_path / name, (old, old))
+    items = list(duplicates.DuplicateFileReporter(Config()).find_items())
+    assert len(items) == 1 and items[0].report_only
+    assert human_size(12 * 1024 * 1024) in items[0].description
+
+
+def test_duplicates_ignores_unique_small_and_symlinks(tmp_path, monkeypatch):
+    import os as _os
+    import time as _time
+
+    from cleanix.cleaners import duplicates
+
+    monkeypatch.setattr(duplicates, "home", lambda: tmp_path)
+    old = _time.time() - 3600
+    (tmp_path / "u1.bin").write_bytes(b"A" * (12 * 1024 * 1024))
+    (tmp_path / "u2.bin").write_bytes(b"B" * (12 * 1024 * 1024))  # same size, diff content
+    real = tmp_path / "real.bin"
+    real.write_bytes(b"Z" * (12 * 1024 * 1024))
+    (tmp_path / "link.bin").symlink_to(real)  # symlink, not a real dup
+    for p in (tmp_path / "u1.bin", tmp_path / "u2.bin", real):
+        _os.utime(p, (old, old))
+    assert list(duplicates.DuplicateFileReporter(Config()).find_items()) == []
+
+
+def test_browser_profiles_only_stale_nondefault(tmp_path, monkeypatch):
+    import os as _os
+    import time as _time
+
+    from cleanix.cleaners import browser_profiles as bp
+
+    def profile(root, name, idle_days):
+        p = root / name
+        p.mkdir(parents=True)
+        (p / "History").write_text("h")
+        (p / "Bookmarks").write_text("b" * 200)
+        if idle_days:
+            old = _time.time() - idle_days * 86400
+            for f in (p, p / "History"):
+                _os.utime(f, (old, old))
+
+    # Force the Linux/XDG layout so the test is deterministic on any host
+    # (on macOS the cleaner scans ~/Library/Application Support instead).
+    monkeypatch.setattr(bp, "is_macos", lambda: False)
+    chrome = tmp_path / ".config" / "google-chrome"
+    profile(chrome, "Default", 0)       # active
+    profile(chrome, "Profile 1", 200)   # stale, orphaned
+    profile(chrome, "Profile 2", 0)     # recently used
+    monkeypatch.setattr(bp, "home", lambda: tmp_path)
+    items = list(bp.BrowserProfileReporter(Config()).find_items())
+    prof_items = [i for i in items if "profile" in i.description.lower()]
+    assert len(prof_items) == 1 and "Profile 1" in prof_items[0].description
+    assert all(i.report_only for i in items)
+
+
+def test_dashboard_sparkline():
+    from cleanix.cli import _sparkline
+
+    assert _sparkline([]) == ""
+    assert len(_sparkline([1, 2, 3, 4])) == 4
+    assert _sparkline([0, 0, 0]) == "▁▁▁"
+
+
+# ------------------------------------------------------ containerd (nerdctl)
+def test_nerdctl_inherits_docker_itemization(monkeypatch):
+    from cleanix.cleaners import containerd, containers
+
+    monkeypatch.setattr(containers._ContainerCleaner, "_df_reclaimable",
+                        lambda self: {"Images": 8_000_000_000,
+                                      "Build Cache": 3_000_000_000})
+    monkeypatch.setattr(containers._ContainerCleaner, "_dangling_images_size",
+                        lambda self: 1_200_000_000)
+    monkeypatch.setattr(containers._ContainerCleaner, "_stopped_containers",
+                        lambda self: (2, 50_000_000))
+    monkeypatch.setattr(containers._ContainerCleaner, "_unused_networks",
+                        lambda self: 1)
+    by_cmd = {" ".join(i.command): i
+              for i in containerd.NerdctlCleaner(Config()).find_items()}
+    assert by_cmd["nerdctl image prune -f"].size == 1_200_000_000
+    assert by_cmd["nerdctl builder prune -f"].size == 3_000_000_000
+
+
+# ------------------------------------------------------ CLI features
+def test_cli_parse_size():
+    from cleanix.cli import _parse_size
+
+    assert _parse_size("100M") == 100 * 1024**2
+    assert _parse_size("1.5G") == int(1.5 * 1024**3)
+    assert _parse_size(None) == 0
+
+
+def test_cli_apply_profile():
+    from cleanix.cli import _apply_profile
+
+    agg = _apply_profile(Config(), "aggressive")
+    assert agg.docker_prune_all_images and agg.include_offline_repos
+    assert not agg.docker_prune_volumes  # volumes are never bundled
+    safe = _apply_profile(Config(), "safe")
+    assert not safe.remove_old_kernels and not safe.remove_backup_files
+
+
+def test_cli_min_size_filters_paths_not_commands():
+    from cleanix.cli import _apply_min_size
+
+    small = CleanableItem("t", "small", 10, ItemKind.PATH, "/tmp/a")
+    big = CleanableItem("t", "big", 10**9, ItemKind.PATH, "/tmp/b")
+    cmd = CleanableItem("t", "cmd", 0, ItemKind.COMMAND, command=["docker", "x"])
+    sr = ScanResult([CleanerReport("t", "t", "", [small, big, cmd])])
+    _apply_min_size(sr, 1000)
+    descs = {i.description for i in sr.all_items()}
+    assert descs == {"big", "cmd"}  # small path dropped, command kept
+
+
+def test_write_manifest_records_removed(tmp_path, monkeypatch):
+    from cleanix.core import history
+    from cleanix.core.models import CleanOutcome, CleanResult
+
+    monkeypatch.setattr(history, "state_dir", lambda: tmp_path)
+    item = CleanableItem("trash", "junk", 100, ItemKind.PATH, "/tmp/x")
+    res = CleanResult([CleanOutcome(item, removed=True, freed=100)], dry_run=False)
+    path = history.write_manifest(res)
+    assert path and Path(path).exists()
+    assert "trash" in Path(path).read_text()
+    # dry-runs write nothing
+    dry = CleanResult([CleanOutcome(item, removed=False)], dry_run=True)
+    assert history.write_manifest(dry) == ""
+
+
+def test_scan_to_dict_schema(monkeypatch):
+    from cleanix.core.report import scan_to_dict
+
+    d = scan_to_dict(ScanResult([]))
+    for key in ("schema_version", "cleanix_version", "cleanable_bytes",
+                "report_only_bytes", "generated_at", "os"):
+        assert key in d
 
 
 # --------------------------------------------------------------------------- utils

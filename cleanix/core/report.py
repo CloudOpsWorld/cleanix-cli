@@ -94,11 +94,34 @@ def render_clean_summary(result: CleanResult, console: Console) -> None:
         )
 
 
+SCHEMA_VERSION = 1
+
+
 def scan_to_dict(result: ScanResult) -> Dict[str, Any]:
+    import platform
+    import socket
+    import time
+
+    from cleanix import __version__
+    from cleanix.core.platform import os_label
+
     return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+        "cleanix_version": __version__,
+        "host": socket.gethostname(),
+        "os": os_label(),
+        "platform": platform.system().lower(),
         "total_items": result.total_items,
         "total_bytes": result.total_size,
         "total_human": human_size(result.total_size),
+        # Split totals: what cleanix would delete vs. what it only reports.
+        "cleanable_items": len(result.cleanable_items()),
+        "cleanable_bytes": result.cleanable_size,
+        "cleanable_human": human_size(result.cleanable_size),
+        "report_only_items": len(result.report_only_items()),
+        "report_only_bytes": result.report_only_size,
+        "report_only_human": human_size(result.report_only_size),
         "cleaners": [
             {
                 "id": r.cleaner_id,
