@@ -11,7 +11,8 @@ temp files, package-manager leftovers, orphaned packages, broken symlinks,
 package-update config residue, rotated logs, trash, thumbnails, browser/dev
 caches, container cruft — and only **removes** anything after you confirm.
 
-It can run on a **schedule** (via a systemd timer) to periodically analyze the
+It can run on a **schedule** (a systemd timer on Linux/BSD, a launchd agent on
+macOS) to periodically analyze the
 system and notify you. Scheduled runs *never delete anything*; they only produce
 a report so you can review and clean on your own terms.
 
@@ -86,6 +87,30 @@ last day is always left alone, so cleaning never disturbs a live agent session.
 
 Cleaners never offer the same path twice: dedicated cleaners own their
 directories and the generic `~/.cache` catch-all defers to them.
+
+## Container leftovers (Docker / Podman)
+
+A *leftover* is anything the engine keeps that **no existing container
+references** and can be regenerated. Each category is surfaced as its own item
+whose estimated size matches exactly what pruning it reclaims — so the number
+you see is the number you get (no more counting unused-but-tagged images or
+volumes you never asked to touch):
+
+- **Dangling (untagged) images** — `docker image prune -f`
+- **Stopped containers** (writable layers) — `docker container prune -f`
+- **Build cache** — `docker builder prune -f`
+- **Unused networks** — `docker network prune -f`
+
+Two categories stay **opt-in** because they can destroy real work:
+
+- `docker_prune_all_images` — also remove *tagged* images not used by any
+  container (`image prune -a`); frees more but forces a re-pull next time.
+- `docker_prune_volumes` — also remove unused anonymous volumes, which may hold
+  databases or other real data.
+
+> On macOS, Docker Desktop stores everything in a VM disk image. Pruning frees
+> space *inside* the VM; the host-side `Docker.raw` file may not shrink until
+> Docker Desktop compacts it.
 
 ## Shell completion
 
@@ -162,7 +187,9 @@ sudo cleanix clean --only memory_macos --execute   # macOS `purge`
   that declares the platforms it applies to.
 - **Root-aware.** Cleaners that need root are clearly flagged and skipped (with a
   note) when you run unprivileged.
-- **Scheduling.** Install a systemd timer that scans daily/weekly and reports.
+- **Scheduling.** Install a periodic read-only scan that reports (and notifies)
+  on a daily/weekly/monthly cadence — a **systemd user timer** on Linux/BSD, a
+  **launchd LaunchAgent** on macOS. Same `cleanix schedule` command on both.
 
 ## Install
 
@@ -199,7 +226,8 @@ cleanix clean --execute --yes --only trash,pip_cache
 # Emit the scan report as JSON (for tooling / notifications)
 cleanix scan --json
 
-# Install a systemd timer that scans weekly and notifies you
+# Install a weekly read-only scan that notifies you
+# (systemd timer on Linux/BSD, launchd agent on macOS)
 cleanix schedule install --frequency weekly
 
 # Check / remove the schedule
@@ -388,7 +416,9 @@ cleanix/
     # BSD
     bsd (freebsd pkg, distfiles/work dirs, pkgin)
   scheduler/
-    systemd.py        # install/uninstall/status of a user systemd timer
+    __init__.py       # backend() — picks systemd or launchd for the OS
+    systemd.py        # install/uninstall/status of a user systemd timer (Linux/BSD)
+    launchd.py        # install/uninstall/status of a launchd LaunchAgent (macOS)
 ```
 
 To add a cleaner: subclass `Cleaner`, set `id`/`name`/`platforms`/`requires_root`,
