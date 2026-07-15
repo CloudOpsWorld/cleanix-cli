@@ -88,7 +88,42 @@ last day is always left alone, so cleaning never disturbs a live agent session.
 Cleaners never offer the same path twice: dedicated cleaners own their
 directories and the generic `~/.cache` catch-all defers to them.
 
-## Container leftovers (Docker / Podman)
+## More reclamation & review
+
+- **Old toolchain versions** (`toolchains`). Version managers hoard
+  multi-gigabyte installed runtimes — old `~/.nvm` node builds, `~/.pyenv` /
+  `~/.rbenv` versions, `rustup` toolchains, SDKMAN candidates, `asdf` installs.
+  Cleanix keeps the **active** version (always protected) plus the newest
+  `keep_toolchain_versions` (default 2) and offers the rest for removal. It
+  *skips a manager entirely if it can't prove which version is active* — pair
+  with `clean --quarantine` to make removals reversible. Disable with
+  `prune_old_toolchains: false`.
+- **Stale project cruft** (`project_cruft`, report-only). Finds regenerable
+  `node_modules` / `.venv` / `target` / `.gradle` dirs in projects under
+  `project_scan_dirs` you haven't touched in `project_stale_days` (default 120).
+- **Large files** (`big_files`, report-only). The biggest files in `$HOME`, so
+  you can see what filled the disk. Never deletes — just a sized list + `rm` hint.
+- **Stale downloads** (`downloads`, report-only). Old, large installers/ISOs in
+  `~/Downloads` (which stays hard-protected from deletion).
+
+## Working with what a scan finds
+
+- `cleanix explain <id>` — read-only, shows the **exact** paths/commands one
+  cleaner would consider (with size, root, delete-vs-report), for building trust.
+- `cleanix clean --interactive` — pick individual items from a checklist before
+  removing (selection is per-item, not just per-cleaner).
+- `cleanix clean --simulate` — write the exact target list to a file, delete
+  nothing (stronger than the dry-run summary).
+- `cleanix clean --execute` — writes a **per-file audit manifest** to
+  `~/.local/state/cleanix/runs/` and prints the real `df` free-space change.
+- `--profile safe|balanced|aggressive` — one flag to bundle the opt-in settings
+  (aggressive enables offline-repo/backup/locale/all-image pruning; it never
+  bundles volume removal).
+- `--min-size 100M` — ignore items below a threshold to cut table noise.
+- `cleanix scan --json` emits a **versioned** schema (`schema_version`, host,
+  os, `cleanable_bytes` vs `report_only_bytes`) for CI/tooling.
+
+## Container leftovers (Docker / Podman / nerdctl / crictl)
 
 A *leftover* is anything the engine keeps that **no existing container
 references** and can be regenerated. Each category is surfaced as its own item
@@ -188,8 +223,9 @@ sudo cleanix clean --only memory_macos --execute   # macOS `purge`
 - **Root-aware.** Cleaners that need root are clearly flagged and skipped (with a
   note) when you run unprivileged.
 - **Scheduling.** Install a periodic read-only scan that reports (and notifies)
-  on a daily/weekly/monthly cadence — a **systemd user timer** on Linux/BSD, a
-  **launchd LaunchAgent** on macOS. Same `cleanix schedule` command on both.
+  on a daily/weekly/monthly cadence — a **systemd user timer** on Linux, a
+  **launchd LaunchAgent** on macOS, and a **cron job** on the BSDs (or any
+  system with `crontab` but no systemd). Same `cleanix schedule` command on all.
 
 ## Install
 
