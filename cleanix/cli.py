@@ -4,7 +4,8 @@ Subcommands:
     list      show available cleaners
     scan      analyze the system (read-only)
     clean     remove junk (dry-run unless --execute; confirmation required)
-    schedule  install/uninstall/status of the systemd analysis timer
+    schedule  install/uninstall/status of the periodic analysis job
+              (systemd timer on Linux/BSD, launchd agent on macOS)
 """
 
 from __future__ import annotations
@@ -606,15 +607,16 @@ def cmd_completion(args: argparse.Namespace, console: Console) -> int:
 
 
 def cmd_schedule(args: argparse.Namespace, console: Console) -> int:
-    from cleanix.scheduler import systemd
+    from cleanix.scheduler import backend
 
+    sched = backend()  # systemd on Linux/BSD, launchd on macOS
     try:
         if args.action == "install":
-            console.print(systemd.install(args.frequency))
+            console.print(sched.install(args.frequency))
         elif args.action == "uninstall":
-            console.print(systemd.uninstall())
+            console.print(sched.uninstall())
         else:  # status
-            console.print(systemd.status())
+            console.print(sched.status())
     except (RuntimeError, ValueError) as exc:
         console.print(f"[red]{exc}[/red]")
         return 1

@@ -25,6 +25,20 @@ SCOPE_USER = "user"
 SCOPE_SYSTEM = "system"
 
 
+def _path_present(p: Path) -> bool:
+    """True if ``p`` exists (or is a dangling symlink), never raising.
+
+    ``Path.exists()`` does *not* swallow ``EPERM`` — on macOS a SIP-protected
+    entry under ``/Library/Caches`` raises ``PermissionError`` — so a bare
+    ``p.exists()`` in a cleaner would abort the whole scan. We treat any
+    unreadable path as "not present" (we couldn't size or remove it anyway).
+    """
+    try:
+        return p.exists() or p.is_symlink()
+    except OSError:
+        return False
+
+
 class Cleaner(abc.ABC):
     """Base class for all cleaners.
 
@@ -76,7 +90,7 @@ class Cleaner(abc.ABC):
     ) -> Optional[CleanableItem]:
         """Build a PATH item for ``path`` if it exists and is non-empty."""
         p = Path(path)
-        if not p.exists() and not p.is_symlink():
+        if not _path_present(p):
             return None
         size = path_size(p)
         return CleanableItem(
@@ -100,7 +114,7 @@ class Cleaner(abc.ABC):
     ) -> Optional[CleanableItem]:
         """Build a *report-only* PATH item (surfaced with size, never deleted)."""
         p = Path(path)
-        if not p.exists() and not p.is_symlink():
+        if not _path_present(p):
             return None
         return CleanableItem(
             cleaner_id=self.id,
@@ -156,18 +170,28 @@ class Cleaner(abc.ABC):
         return report
 
     def _scan_all_users(self) -> List[CleanableItem]:
-        """Run a per-user cleaner once for each target user, de-duplicating
-        by path so shared/system directories are never offered twice."""
+        """Run a per-user cleaner once for each target user, de-duplicating so
+        shared directories and identical commands are never offered twice.
+
+        Command items are keyed by their argv: a per-user cleaner that yields a
+        fixed command (e.g. ``brew cleanup``) would otherwise appear once per
+        target user when running as root, yet the engine runs it only once."""
         items: List[CleanableItem] = []
-        seen: set = set()
+        seen_paths: set = set()
+        seen_commands: set = set()
         for user in get_target_users():
             with use_user(user):
                 for item in self.find_items():
                     if item is None:
                         continue
                     if item.path is not None:
-                        if item.path in seen:
+                        if item.path in seen_paths:
                             continue
-                        seen.add(item.path)
+                        seen_paths.add(item.path)
+                    elif item.command is not None:
+                        key = tuple(item.command)
+                        if key in seen_commands:
+                            continue
+                        seen_commands.add(key)
                     items.append(item)
         return items

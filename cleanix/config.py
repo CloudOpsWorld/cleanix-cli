@@ -62,6 +62,11 @@ class Config:
     # default because volumes can hold real data.
     docker_prune_volumes: bool = False
 
+    # By default only *dangling* (untagged) images are pruned — a truly safe
+    # leftover. Enable this to also remove tagged images not used by any
+    # container ("docker image prune -a"); it frees more but forces re-pulls.
+    docker_prune_all_images: bool = False
+
     # Offer removal of package-update leftovers (.rpmnew/.pacnew/.dpkg-old ...).
     remove_config_leftovers: bool = True
 
@@ -137,6 +142,7 @@ FIELD_HELP = {
     "browsers": "Browsers whose caches to clear",
     "symlink_scan_dirs": "Directories scanned for broken symlinks",
     "docker_prune_volumes": "Also prune unused Docker/Podman volumes",
+    "docker_prune_all_images": "Prune all unused images, not just dangling ones",
     "remove_config_leftovers": "Offer .rpmnew/.pacnew/.dpkg-old residue",
     "remove_apple_litter": "Remove .DS_Store / AppleDouble litter",
     "keep_backups": "AI CLI rolling backups to keep (newest N)",

@@ -258,6 +258,179 @@ def test_completion_generates(shell):
     assert "cleanix" in script and "scan" in script and len(script) > 100
 
 
+# --------------------------------------------------------------------------- containers
+def _fake_docker(monkeypatch, **cfg):
+    from cleanix.cleaners import containers
+
+    monkeypatch.setattr(containers._ContainerCleaner, "_df_reclaimable", lambda self: {
+        "Images": 8_000_000_000,       # 8 GB unused (incl. tagged, non-dangling)
+        "Containers": 50_000_000,
+        "Local Volumes": 2_000_000_000,
+        "Build Cache": 3_000_000_000,
+    })
+    monkeypatch.setattr(containers._ContainerCleaner, "_dangling_images_size",
+                        lambda self: 1_200_000_000)   # only 1.2 GB is dangling
+    monkeypatch.setattr(containers._ContainerCleaner, "_stopped_containers",
+                        lambda self: (2, 50_000_000))
+    monkeypatch.setattr(containers._ContainerCleaner, "_unused_networks",
+                        lambda self: 3)
+    cfg_obj = Config()
+    for k, v in cfg.items():
+        setattr(cfg_obj, k, v)
+    return list(containers.DockerCleaner(cfg_obj).find_items())
+
+
+def test_docker_default_prunes_only_dangling_images(monkeypatch):
+    items = _fake_docker(monkeypatch)
+    by_cmd = {" ".join(i.command): i for i in items}
+    # Default: dangling image prune, sized to dangling only — NOT the 8 GB
+    # "Reclaimable" total that plain prune would never remove.
+    assert "docker image prune -f" in by_cmd
+    assert by_cmd["docker image prune -f"].size == 1_200_000_000
+    assert "docker image prune -a -f" not in by_cmd
+    # Volumes are opt-in, so their 2 GB is not counted by default.
+    assert not any("volume" in c for c in by_cmd)
+    assert {"docker container prune -f", "docker builder prune -f",
+            "docker network prune -f"} <= set(by_cmd)
+
+
+def test_docker_opt_in_all_images_and_volumes(monkeypatch):
+    items = _fake_docker(monkeypatch, docker_prune_all_images=True,
+                         docker_prune_volumes=True)
+    by_cmd = {" ".join(i.command): i for i in items}
+    assert by_cmd["docker image prune -a -f"].size == 8_000_000_000
+    assert "docker image prune -f" not in by_cmd
+    assert by_cmd["docker volume prune -f"].size == 2_000_000_000
+
+
+def test_docker_nothing_to_clean_yields_no_items(monkeypatch):
+    from cleanix.cleaners import containers
+
+    monkeypatch.setattr(containers._ContainerCleaner, "_df_reclaimable", lambda self: {})
+    monkeypatch.setattr(containers._ContainerCleaner, "_dangling_images_size", lambda self: 0)
+    monkeypatch.setattr(containers._ContainerCleaner, "_stopped_containers", lambda self: (0, 0))
+    monkeypatch.setattr(containers._ContainerCleaner, "_unused_networks", lambda self: 0)
+    assert list(containers.DockerCleaner(Config()).find_items()) == []
+
+
+def test_docker_parse_size():
+    from cleanix.cleaners.containers import _parse_size
+
+    assert _parse_size("1.2GB") == int(1.2 * 1024**3)
+    assert _parse_size("45.6MB (virtual 1.2GB)") == int(45.6 * 1024**2)  # takes first token
+    assert _parse_size("0B") == 0
+    assert _parse_size("") == 0
+
+
+# --------------------------------------------------------------------------- scheduler
+def test_scheduler_backend_per_os(monkeypatch):
+    import cleanix.scheduler as sched
+
+    monkeypatch.setattr(sched, "is_macos", lambda: True)
+    assert sched.backend().__name__.endswith("launchd")
+    monkeypatch.setattr(sched, "is_macos", lambda: False)
+    assert sched.backend().__name__.endswith("systemd")
+
+
+@pytest.mark.parametrize("freq,key", [
+    ("hourly", "StartInterval"),
+    ("daily", "StartCalendarInterval"),
+    ("weekly", "StartCalendarInterval"),
+    ("monthly", "StartCalendarInterval"),
+])
+def test_launchd_plist_valid(freq, key):
+    import plistlib
+    from cleanix.scheduler import launchd
+
+    # dumps() raises if the dict isn't a serializable plist; loads() round-trips.
+    data = plistlib.loads(plistlib.dumps(launchd._plist(freq)))
+    assert data["Label"] == "com.cleanix.scan"
+    assert key in data
+    assert data["ProgramArguments"][0] == "/bin/sh"
+    assert data["RunAtLoad"] is False
+
+
+# ----------------------------------------------------- macOS field-report fixes
+def test_path_item_survives_permission_error():
+    # SIP-protected /Library/Caches entries make Path.exists() raise EPERM;
+    # a cleaner must skip them, not abort the whole scan.
+    from cleanix.cleaners import base
+
+    class Sip:
+        def exists(self):
+            raise PermissionError(1, "Operation not permitted")
+
+        def is_symlink(self):
+            raise PermissionError(1, "Operation not permitted")
+
+    assert base._path_present(Sip()) is False
+
+
+def test_sleepimage_reported_once(monkeypatch):
+    # /var -> /private/var symlink used to double-count the hibernation image.
+    from cleanix.cleaners import macos_extra
+
+    monkeypatch.setattr(macos_extra.Path, "exists", lambda self: True)
+    monkeypatch.setattr(macos_extra.os.path, "realpath",
+                        lambda p: "/private/var/vm/sleepimage")
+    items = list(macos_extra.MacSleepImageReporter(Config()).find_items())
+    assert len(items) == 1 and items[0].report_only
+
+
+def test_homebrew_skips_as_root(monkeypatch):
+    from cleanix.cleaners import macos
+
+    monkeypatch.setattr(macos, "which", lambda c: "/usr/bin/brew")
+    monkeypatch.setattr(macos.os, "geteuid", lambda: 0)
+    assert "root" in (macos.HomebrewCleaner(Config()).available() or "")
+    monkeypatch.setattr(macos.os, "geteuid", lambda: 501)
+    assert macos.HomebrewCleaner(Config()).available() is None
+
+
+def test_xcode_offers_simctl_only_when_present(monkeypatch):
+    from cleanix.cleaners import macos
+
+    monkeypatch.setattr(macos, "which",
+                        lambda c: "/usr/bin/xcrun" if c == "xcrun" else None)
+
+    def simctl(items):
+        return [i for i in items if i.command and "simctl" in i.command]
+
+    monkeypatch.setattr(macos, "run_command", lambda *a, **k: (1, "", "not found"))
+    assert not simctl(list(macos.XcodeCleaner(Config()).find_items()))
+
+    monkeypatch.setattr(macos, "run_command", lambda *a, **k: (0, "/x/simctl", ""))
+    assert simctl(list(macos.XcodeCleaner(Config()).find_items()))
+
+
+def test_container_skips_when_engine_down(monkeypatch):
+    from cleanix.cleaners import containers
+
+    monkeypatch.setattr(containers, "which", lambda c: "/usr/bin/docker")
+    monkeypatch.setattr(containers, "run_command", lambda *a, **k: (1, "", "no socket"))
+    assert "not running" in containers.DockerCleaner(Config()).available()
+    monkeypatch.setattr(containers, "run_command", lambda *a, **k: (0, "ok", ""))
+    assert containers.DockerCleaner(Config()).available() is None
+
+
+def test_scan_all_users_dedupes_identical_commands(monkeypatch):
+    # A per-user cleaner yielding a fixed command must appear once, not once
+    # per target user, when running as root.
+    import contextlib
+    from cleanix.cleaners import base
+
+    monkeypatch.setattr(base, "get_target_users", lambda: ["u1", "u2"])
+    monkeypatch.setattr(base, "use_user", lambda u: contextlib.nullcontext())
+
+    class C(base.Cleaner):
+        id = "c"; name = "c"; description = ""
+
+        def find_items(self):
+            yield self.command_item(["brew", "cleanup"], "x")
+
+    assert len(C(Config())._scan_all_users()) == 1
+
+
 # --------------------------------------------------------------------------- utils
 def test_human_size():
     assert human_size(0) == "0 B"

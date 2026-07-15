@@ -95,6 +95,11 @@ class HomebrewCleaner(Cleaner):
     def available(self):
         if not which("brew"):
             return "brew not found"
+        # Homebrew hard-refuses to run as root ("Running Homebrew as root is
+        # extremely dangerous"), so skip cleanly instead of emitting a command
+        # that will only error at execute time (e.g. under `sudo cleanix`).
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            return "skipped as root (Homebrew must run as the owning user)"
         return None
 
     def find_items(self) -> Iterable[CleanableItem]:
@@ -158,9 +163,16 @@ class XcodeCleaner(Cleaner):
                 item = self.path_item(path, label)
                 if item:
                     yield item
-        # Unavailable simulators (deleted OS runtimes) can waste many GB.
+        # Unavailable simulators (deleted OS runtimes) can waste many GB, but
+        # `simctl` ships only with full Xcode — not the Command Line Tools — so
+        # confirm it resolves before offering (else xcrun errors "unable to
+        # find utility simctl").
         if which("xcrun"):
-            yield self.command_item(
-                ["xcrun", "simctl", "delete", "unavailable"],
-                "Delete unavailable/obsolete iOS simulators",
+            code, _out, _err = run_command(
+                ["xcrun", "--find", "simctl"], timeout=15
             )
+            if code == 0:
+                yield self.command_item(
+                    ["xcrun", "simctl", "delete", "unavailable"],
+                    "Delete unavailable/obsolete iOS simulators",
+                )

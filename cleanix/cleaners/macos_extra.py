@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable, Tuple
 
@@ -114,12 +115,23 @@ class MacSleepImageReporter(Cleaner):
     scope = SCOPE_SYSTEM
 
     def find_items(self) -> Iterable[CleanableItem]:
+        # /var is a symlink to /private/var on macOS, so both candidates resolve
+        # to the same file — report it once, keyed by its canonical path.
+        seen: set = set()
         for base in ("/private/var/vm/sleepimage", "/var/vm/sleepimage"):
             p = Path(base)
-            if p.exists():
-                item = self.report_item(
-                    p, "macOS sleep/hibernation image",
-                    hint="managed by pmset; remove only if you understand hibernation impact",
-                )
-                if item:
-                    yield item
+            if not p.exists():
+                continue
+            try:
+                real = os.path.realpath(p)
+            except OSError:
+                real = str(p)
+            if real in seen:
+                continue
+            seen.add(real)
+            item = self.report_item(
+                p, "macOS sleep/hibernation image",
+                hint="managed by pmset; remove only if you understand hibernation impact",
+            )
+            if item:
+                yield item
