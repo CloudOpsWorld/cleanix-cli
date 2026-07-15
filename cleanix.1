@@ -1,0 +1,202 @@
+.TH CLEANIX 1 "2026-07-16" "cleanix 1.2.0" "User Commands"
+.SH NAME
+cleanix \- safe, thorough cross-platform *nix system cleaner
+.SH SYNOPSIS
+.B cleanix
+[\fICOMMAND\fR] [\fIOPTIONS\fR]
+.SH DESCRIPTION
+cleanix analyzes and reclaims disk space across Linux, macOS and the BSDs. It scans read\-only, previews every removal, funnels all deletions through a protected\-path safety guard, and only deletes after confirmation. Report\-only findings are surfaced but never auto\-deleted.
+.SH COMMANDS
+.SS list
+list available cleaners
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.TP
+.B \-\-all
+include cleaners for other operating systems
+.SS scan
+analyze the system (read\-only)
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.TP
+.B \-\-only IDS
+comma\-separated cleaner ids to include exclusively
+.TP
+.B \-\-exclude IDS
+comma\-separated cleaner ids to skip
+.TP
+.B \-\-all\-users
+scan every user's home + the whole system (default when root)
+.TP
+.B \-\-current\-user
+only scan the invoking user's home (even when running as root)
+.TP
+.B \-\-min\-uid N
+lowest uid treated as a real user when scanning all users
+.TP
+.B \-\-json
+emit JSON
+.TP
+.B \-\-output FILE
+write JSON report to FILE
+.TP
+.B \-\-quiet
+suppress the human\-readable table
+.TP
+.B \-\-summary
+print a one\-line summary (for notifications)
+.TP
+.B \-\-sort
+sort the results table
+.TP
+.B \-\-top N
+show only the N cleaners with the most to reclaim
+.TP
+.B \-\-min\-size SIZE
+ignore items smaller than SIZE (e.g. 100M, 1.5G)
+.TP
+.B \-\-input FILE
+with \-\-summary, summarize a previously written JSON report instead of re\-scanning
+.TP
+.B \-\-profile
+preset bundle of opt\-in settings: 'safe' disables aggressive cleaners, 'aggressive' enables offline\-repo/backup/locale/all\-image pruning (never volumes)
+.SS clean
+remove junk (dry\-run unless \-\-execute)
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.TP
+.B \-\-only IDS
+comma\-separated cleaner ids to include exclusively
+.TP
+.B \-\-exclude IDS
+comma\-separated cleaner ids to skip
+.TP
+.B \-\-all\-users
+scan every user's home + the whole system (default when root)
+.TP
+.B \-\-current\-user
+only scan the invoking user's home (even when running as root)
+.TP
+.B \-\-min\-uid N
+lowest uid treated as a real user when scanning all users
+.TP
+.B \-\-execute
+actually delete (default is a dry\-run preview)
+.TP
+.B \-\-yes
+skip the confirmation prompt (implies non\-interactive)
+.TP
+.B \-\-quarantine
+move items to a reversible quarantine instead of deleting (undo with `cleanix restore`)
+.TP
+.B \-\-min\-size SIZE
+only remove items at least SIZE (e.g. 100M, 1.5G)
+.TP
+.B \-\-simulate
+write the exact list of paths/commands that \-\-execute would act on to a file, without deleting anything
+.TP
+.B \-\-interactive
+pick individual items to remove from a checklist before cleaning
+.TP
+.B \-\-profile
+preset bundle of opt\-in settings: 'safe' disables aggressive cleaners, 'aggressive' enables offline\-repo/backup/locale/all\-image pruning (never volumes)
+.SS explain
+show exactly what one cleaner would consider (read\-only)
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.TP
+.B CLEANER_ID
+the cleaner id to explain
+.TP
+.B \-\-only IDS
+comma\-separated cleaner ids to include exclusively
+.TP
+.B \-\-exclude IDS
+comma\-separated cleaner ids to skip
+.TP
+.B \-\-all\-users
+scan every user's home + the whole system (default when root)
+.TP
+.B \-\-current\-user
+only scan the invoking user's home (even when running as root)
+.TP
+.B \-\-min\-uid N
+lowest uid treated as a real user when scanning all users
+.SS schedule
+manage the periodic analysis timer
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.TP
+.B ACTION
+
+.TP
+.B \-\-frequency
+how often to run the analysis (default: weekly)
+.SS config
+view and change configuration
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.SS completion
+print a shell\-completion script
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.TP
+.B SHELL
+
+.SS info
+show environment & cleanix status
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.SS stats
+show lifetime clean statistics
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.SS dashboard
+reclaim trend + last scan at a glance
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.SS restore
+undo a clean from quarantine
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.TP
+.B RUN_ID
+run id (default: latest)
+.SS quarantine
+manage the quarantine store
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.SS factory\-reset
+show a plan to restore the OS toward factory settings
+.TP
+.B \-h, \-\-help
+show this help message and exit
+.TP
+.B \-\-scope
+how much to reset (default: full)
+.TP
+.B \-\-execute
+run the reversible rollback (only on NixOS/rpm\-ostree/MicroOS/Guix; requires a typed confirmation)
+.SH FILES
+.TP
+.I ~/.config/cleanix/config.yaml
+User configuration (see \fBcleanix config\fR).
+.TP
+.I ~/.local/state/cleanix/
+History, quarantine, scheduled\-scan reports and audit logs.
+.SH SAFETY
+cleanix never deletes protected system paths or a user's home, credential, or media directories, never follows a symlink to delete its target, and runs external commands without a shell. Use \fB\-\-quarantine\fR for reversible removal and \fB\-\-simulate\fR to preview the exact target list.
+.SH SEE ALSO
+Project home: https://github.com/CloudOpsWorld/cleanix\-cli

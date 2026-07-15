@@ -1,0 +1,40 @@
+# Maintainer: CloudOpsWorld <dev@cloudopsworld.com>
+# AUR package for cleanix-cli. Publish to aur.git as `cleanix-cli`.
+# Regenerate .SRCINFO with `makepkg --printsrcinfo > .SRCINFO` after edits.
+pkgname=cleanix-cli
+pkgver=1.2.0
+pkgrel=1
+pkgdesc="Safe, thorough scheduled system cleaner for Linux, macOS and BSD"
+arch=('any')
+url="https://github.com/CloudOpsWorld/cleanix-cli"
+license=('MIT')
+depends=('python' 'python-rich' 'python-yaml')
+makedepends=('python-build' 'python-installer' 'python-wheel' 'python-setuptools')
+source=("https://files.pythonhosted.org/packages/source/c/cleanix-cli/cleanix_cli-${pkgver}.tar.gz")
+sha256sums=('SKIP')  # replace SKIP with the sdist sha256 for a reproducible build
+
+build() {
+  cd "cleanix_cli-${pkgver}"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "cleanix_cli-${pkgver}"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+
+  # Man page (generated from argparse; ship if present in the sdist).
+  if [ -f cleanix.1 ]; then
+    install -Dm644 cleanix.1 "$pkgdir/usr/share/man/man1/cleanix.1"
+  fi
+
+  # Shell completions.
+  ./dist_bin_completion() { python -m cleanix completion "$1"; }
+  install -dm755 "$pkgdir/usr/share/bash-completion/completions"
+  PYTHONPATH="$PWD" python -m cleanix completion bash > "$pkgdir/usr/share/bash-completion/completions/cleanix" || true
+  install -dm755 "$pkgdir/usr/share/zsh/site-functions"
+  PYTHONPATH="$PWD" python -m cleanix completion zsh > "$pkgdir/usr/share/zsh/site-functions/_cleanix" || true
+  install -dm755 "$pkgdir/usr/share/fish/vendor_completions.d"
+  PYTHONPATH="$PWD" python -m cleanix completion fish > "$pkgdir/usr/share/fish/vendor_completions.d/cleanix.fish" || true
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/${pkgname}/LICENSE" 2>/dev/null || true
+}

@@ -103,8 +103,13 @@ directories and the generic `~/.cache` catch-all defers to them.
   `project_scan_dirs` you haven't touched in `project_stale_days` (default 120).
 - **Large files** (`big_files`, report-only). The biggest files in `$HOME`, so
   you can see what filled the disk. Never deletes — just a sized list + `rm` hint.
+- **Duplicate files** (`duplicates`, report-only). Identical large files (same
+  size + SHA-256) grouped with the space reclaimable by keeping one copy.
 - **Stale downloads** (`downloads`, report-only). Old, large installers/ISOs in
   `~/Downloads` (which stays hard-protected from deletion).
+- **Orphaned browser profiles** (`browser_profiles`, report-only). Secondary
+  Chrome/Chromium/Firefox profiles idle for `browser_profile_stale_days`, with a
+  clear warning that a profile holds bookmarks/passwords/history.
 
 ## Working with what a scan finds
 
@@ -122,6 +127,20 @@ directories and the generic `~/.cache` catch-all defers to them.
 - `--min-size 100M` — ignore items below a threshold to cut table noise.
 - `cleanix scan --json` emits a **versioned** schema (`schema_version`, host,
   os, `cleanable_bytes` vs `report_only_bytes`) for CI/tooling.
+- `cleanix dashboard` — lifetime reclaim trend (sparkline) plus the last
+  scheduled scan's top sources, at a glance.
+
+## Install & packaging
+
+- **PyPI:** `pip install cleanix-cli` (or `pipx install cleanix-cli`).
+- **Standalone binaries** are attached to each [GitHub Release] alongside a
+  `SHA256SUMS` file and keyless **build-provenance attestations** — verify a
+  download with `gh attestation verify <file> --repo CloudOpsWorld/cleanix-cli`.
+- **Homebrew / AUR / Fedora** packaging lives under [`packaging/`](packaging/),
+  along with a `cleanix.1` **man page** generated from the CLI
+  (`python scripts/gen_manpage.py`).
+
+[GitHub Release]: https://github.com/CloudOpsWorld/cleanix-cli/releases
 
 ## Container leftovers (Docker / Podman / nerdctl / crictl)
 
