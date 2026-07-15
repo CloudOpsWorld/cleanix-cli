@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from cleanix.cleaners.base import Cleaner, SCOPE_SYSTEM
+from cleanix.cleaners.base import SCOPE_SYSTEM, Cleaner
 from cleanix.core.models import CleanableItem
 from cleanix.core.platform import DRAGONFLY, FREEBSD, NETBSD, SUNOS
 from cleanix.core.utils import path_size, run_command, which

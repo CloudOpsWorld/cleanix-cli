@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Iterable, Optional
 
-from cleanix.cleaners.base import Cleaner, SCOPE_SYSTEM
+from cleanix.cleaners.base import SCOPE_SYSTEM, Cleaner
 from cleanix.cleaners.containers import _ContainerCleaner
 from cleanix.core.models import CleanableItem
 from cleanix.core.platform import LINUX

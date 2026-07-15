@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem

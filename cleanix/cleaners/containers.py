@@ -29,7 +29,7 @@ import json
 import re
 from typing import Iterable, Optional
 
-from cleanix.cleaners.base import Cleaner, SCOPE_SYSTEM
+from cleanix.cleaners.base import SCOPE_SYSTEM, Cleaner
 from cleanix.core.models import CleanableItem
 from cleanix.core.utils import run_command, which
 

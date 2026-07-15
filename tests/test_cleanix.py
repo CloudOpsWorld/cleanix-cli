@@ -5,14 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from cleanix.cleaners.base import SCOPE_SYSTEM
-from cleanix.config import Config, coerce_value
 from cleanix import reset
+from cleanix.config import Config, coerce_value
 from cleanix.core import context, quarantine, safety
 from cleanix.core.context import TargetUser
 from cleanix.core.engine import Engine
 from cleanix.core.models import CleanableItem, CleanerReport, ItemKind, ScanResult
-from cleanix.core.platform import ALL, LINUX, MACOS, supports
+from cleanix.core.platform import ALL, supports
 from cleanix.core.registry import build_cleaners
 from cleanix.core.utils import human_size, surplus_after_keeping
 
@@ -145,7 +144,7 @@ def test_platform_supports():
 
 # --------------------------------------------------------------------------- context
 def test_multi_user_iteration_and_dedup(tmp_path):
-    from cleanix.cleaners.base import Cleaner, SCOPE_USER
+    from cleanix.cleaners.base import SCOPE_USER, Cleaner
 
     h1 = tmp_path / "u1"; (h1 / ".cache" / "j").mkdir(parents=True)
     h2 = tmp_path / "u2"; (h2 / ".cache" / "j").mkdir(parents=True)
@@ -392,6 +391,7 @@ def test_config_numeric_errors_are_friendly():
 ])
 def test_launchd_plist_valid(freq, key):
     import plistlib
+
     from cleanix.scheduler import launchd
 
     # dumps() raises if the dict isn't a serializable plist; loads() round-trips.
@@ -469,6 +469,7 @@ def test_scan_all_users_dedupes_identical_commands(monkeypatch):
     # A per-user cleaner yielding a fixed command must appear once, not once
     # per target user, when running as root.
     import contextlib
+
     from cleanix.cleaners import base
 
     monkeypatch.setattr(base, "get_target_users", lambda: ["u1", "u2"])
@@ -617,6 +618,7 @@ def test_big_files_surfaces_only_large_report_only(tmp_path, monkeypatch):
 def test_downloads_surfaces_old_large_report_only(tmp_path, monkeypatch):
     import os as _os
     import time as _time
+
     from cleanix.cleaners import downloads
 
     dl = tmp_path / "Downloads"
@@ -664,6 +666,7 @@ def test_project_cruft_reports_stale_only(tmp_path, monkeypatch):
 def test_duplicates_reported_as_group(tmp_path, monkeypatch):
     import os as _os
     import time as _time
+
     from cleanix.cleaners import duplicates
 
     monkeypatch.setattr(duplicates, "home", lambda: tmp_path)
@@ -680,6 +683,7 @@ def test_duplicates_reported_as_group(tmp_path, monkeypatch):
 def test_duplicates_ignores_unique_small_and_symlinks(tmp_path, monkeypatch):
     import os as _os
     import time as _time
+
     from cleanix.cleaners import duplicates
 
     monkeypatch.setattr(duplicates, "home", lambda: tmp_path)
@@ -697,6 +701,7 @@ def test_duplicates_ignores_unique_small_and_symlinks(tmp_path, monkeypatch):
 def test_browser_profiles_only_stale_nondefault(tmp_path, monkeypatch):
     import os as _os
     import time as _time
+
     from cleanix.cleaners import browser_profiles as bp
 
     def profile(root, name, idle_days):

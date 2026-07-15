@@ -112,10 +112,10 @@ class ToolchainVersionCleaner(Cleaner):
     # -- assembly ------------------------------------------------------------
     def _managers(self) -> Iterable[Tuple[str, Path, Set[str], bool]]:
         """Yield (label, versions_dir, protected_names, resolved_active)."""
-        vd, act = self._pyenv();  yield "pyenv", vd, act, bool(act)
-        vd, act = self._rbenv();  yield "rbenv", vd, act, bool(act)
-        vd, act = self._rustup(); yield "rustup", vd, act, bool(act)
-        vd, act = self._nvm();    yield "nvm", vd, act, bool(act)
+        for name, fn in (("pyenv", self._pyenv), ("rbenv", self._rbenv),
+                         ("rustup", self._rustup), ("nvm", self._nvm)):
+            vd, act = fn()
+            yield name, vd, act, bool(act)
         for cand, act in self._sdkman():
             yield f"sdkman/{cand.name}", cand, act, bool(act)
         for tool, act in self._asdf():

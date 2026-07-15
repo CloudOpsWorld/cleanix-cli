@@ -525,7 +525,6 @@ def cmd_config(args: argparse.Namespace, console: Console) -> int:
     if action == "list":
         overrides = cfgmod.read_user_overrides()
         effective = Config.load()
-        defaults = Config()
         table = Table(title=f"Cleanix configuration ({path})")
         table.add_column("key", style="cyan")
         table.add_column("value", style="green")
@@ -722,12 +721,13 @@ def cmd_info(args: argparse.Namespace, console: Console) -> int:
 
     from rich.table import Table
 
-    from cleanix import __version__, config as cfgmod
+    from cleanix import __version__
+    from cleanix import config as cfgmod
+    from cleanix.cleaners.base import SCOPE_SYSTEM
     from cleanix.core import context, history, quarantine
-    from cleanix.core.platform import current_distro, os_label
+    from cleanix.core.platform import os_label
     from cleanix.core.registry import describe_all
     from cleanix.core.utils import is_root, which
-    from cleanix.cleaners.base import SCOPE_SYSTEM
 
     config = _load_config()
     cleaners = describe_all(config)
