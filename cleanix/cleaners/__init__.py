@@ -25,6 +25,11 @@ from cleanix.cleaners.dev_caches import DevCacheCleaner
 from cleanix.cleaners.pip_cache import PipCacheCleaner
 from cleanix.cleaners.npm_cache import NpmCacheCleaner
 from cleanix.cleaners.containers import DockerCleaner, PodmanCleaner
+from cleanix.cleaners.containerd import CrictlCleaner, NerdctlCleaner
+from cleanix.cleaners.toolchains import ToolchainVersionCleaner
+from cleanix.cleaners.project_cruft import ProjectCruftCleaner
+from cleanix.cleaners.big_files import BigFileReporter
+from cleanix.cleaners.downloads import DownloadsReporter
 
 # Logs / crashes
 from cleanix.cleaners.logs import JournalCleaner, RotatedLogCleaner
@@ -171,6 +176,10 @@ ALL_CLEANERS: List[Type[Cleaner]] = [
     NpmCacheCleaner,
     DockerCleaner,
     PodmanCleaner,
+    NerdctlCleaner,
+    CrictlCleaner,
+    # Language / toolchain versions
+    ToolchainVersionCleaner,
     # Logs & crashes
     RotatedLogCleaner,
     JournalCleaner,
@@ -247,6 +256,9 @@ ALL_CLEANERS: List[Type[Cleaner]] = [
     SnapshotReporter,
     TimeMachineReporter,
     DeviceBackupReporter,
+    ProjectCruftCleaner,
+    BigFileReporter,
+    DownloadsReporter,
     # macOS extras
     MacExtraCachesCleaner,
     MacContainerCacheCleaner,

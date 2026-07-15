@@ -11,6 +11,8 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -40,6 +42,144 @@ def _split_csv(value: Optional[str]) -> Optional[List[str]]:
 
 def _load_config() -> Config:
     return Config.load()
+
+
+def _add_profile(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--profile",
+        choices=["safe", "balanced", "aggressive"],
+        default=None,
+        help="preset bundle of opt-in settings: 'safe' disables aggressive "
+        "cleaners, 'aggressive' enables offline-repo/backup/locale/all-image "
+        "pruning (never volumes)",
+    )
+
+
+def _apply_profile(config: Config, profile: Optional[str]) -> Config:
+    """Layer a named profile over the loaded config (CLI > profile > file)."""
+    if not profile or profile == "balanced":
+        return config
+    if profile == "safe":
+        config.docker_prune_all_images = False
+        config.docker_prune_volumes = False
+        config.remove_backup_files = False
+        config.purge_unused_locales = False
+        config.include_offline_repos = False
+        config.remove_old_kernels = False
+    elif profile == "aggressive":
+        # Enable the safe-but-thorough opt-ins. Volumes stay OFF even here —
+        # they can hold real data and must be an explicit, separate choice.
+        config.docker_prune_all_images = True
+        config.remove_backup_files = True
+        config.purge_unused_locales = True
+        config.include_offline_repos = True
+        config.remove_old_kernels = True
+        config.keep_kernels = min(config.keep_kernels, 1)
+        config.keep_backups = min(config.keep_backups, 1)
+    return config
+
+
+_SIZE_UNITS = {"": 1, "B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+
+
+def _parse_size(text: Optional[str]) -> int:
+    """Parse a human size like ``100M`` / ``1.5G`` into bytes (0 if None)."""
+    if not text:
+        return 0
+    m = re.fullmatch(r"\s*([\d.]+)\s*([KMGT]?)i?[Bb]?\s*", text, re.IGNORECASE)
+    if not m:
+        raise SystemExit(f"invalid --min-size {text!r}; use e.g. 100M, 1.5G")
+    return int(float(m.group(1)) * _SIZE_UNITS[m.group(2).upper()])
+
+
+def _apply_min_size(result: ScanResult, min_bytes: int) -> None:
+    """Drop PATH items below ``min_bytes`` in place (command items are kept,
+    since their reclaim isn't a single measurable file)."""
+    if min_bytes <= 0:
+        return
+    from cleanix.core.models import ItemKind
+
+    for r in result.reports:
+        r.items = [
+            i for i in r.items
+            if i.kind is not ItemKind.PATH or i.size >= min_bytes
+        ]
+
+
+def _require_nonempty_selection(args: argparse.Namespace) -> None:
+    """Reject `--only ''` / `--exclude ''` (a blank filter is almost always a
+    scripting typo, and silently means 'no filter')."""
+    for flag in ("only", "exclude"):
+        raw = getattr(args, flag, None)
+        if raw is not None and not _split_csv(raw):
+            raise SystemExit(f"--{flag} was given but empty; omit it to select all")
+
+
+def _disk_free(path: str = "/") -> Optional[int]:
+    import shutil as _shutil
+
+    try:
+        return _shutil.disk_usage(path).free
+    except OSError:
+        return None
+
+
+def _interactive_select(items: list, console: Console) -> list:
+    """Let the user drop individual items from a numbered checklist."""
+    if not console.is_terminal:
+        return items
+    ordered = sorted(items, key=lambda i: i.size, reverse=True)
+    console.print("\n[bold]Select items to remove[/bold] "
+                  "(all selected by default):")
+    for idx, i in enumerate(ordered, 1):
+        console.print(f"  [cyan]{idx:>3}[/cyan]  {human_size(i.size):>10}  "
+                      f"{i.description}")
+    raw = Prompt.ask(
+        "Enter numbers to SKIP (comma/space/ranges, e.g. 1,3-5), "
+        "or press Enter to remove all",
+        default="",
+    )
+    skip: set = set()
+    for tok in raw.replace(",", " ").split():
+        if "-" in tok:
+            try:
+                a, b = tok.split("-", 1)
+                skip.update(range(int(a), int(b) + 1))
+            except ValueError:
+                continue
+        elif tok.isdigit():
+            skip.add(int(tok))
+    kept = [i for idx, i in enumerate(ordered, 1) if idx not in skip]
+    console.print(f"[dim]Keeping {len(kept)} of {len(ordered)} item(s).[/dim]")
+    return kept
+
+
+def _write_simulation(items: list, console: Console) -> int:
+    """Write the exact paths/commands a real clean would act on, delete nothing."""
+    from cleanix.core.history import state_dir
+
+    lines = []
+    for i in sorted(items, key=lambda x: x.size, reverse=True):
+        target = i.path or ("$ " + " ".join(i.command or []))
+        root = " [root]" if i.requires_root else ""
+        lines.append(f"{human_size(i.size):>10}  {target}{root}")
+    body = "\n".join(lines) + "\n"
+    out = state_dir() / "last-simulation.txt"
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(body)
+        where = str(out)
+    except OSError:
+        where = None
+    console.print(
+        f"[cyan]Simulation:[/cyan] {len(items)} item(s), "
+        f"{human_size(sum(i.size for i in items))} would be reclaimed. "
+        "[dim]Nothing was deleted.[/dim]"
+    )
+    console.print(body.rstrip())
+    if where:
+        console.print(f"[dim]Written to {where}[/dim]")
+    return 0
 
 
 def _configure_scope(args: argparse.Namespace) -> None:
@@ -153,13 +293,30 @@ def cmd_list(args: argparse.Namespace, console: Console) -> int:
 
 
 def _run_scan(args: argparse.Namespace, console: Console) -> ScanResult:
+    _require_nonempty_selection(args)
     _configure_scope(args)
-    config = _load_config()
+    config = _apply_profile(_load_config(), getattr(args, "profile", None))
     engine = _make_engine(config, _split_csv(args.only), _split_csv(args.exclude))
-    return _scan(engine, console, quiet=args.summary or args.json)
+    result = _scan(engine, console, quiet=args.summary or args.json)
+    _apply_min_size(result, _parse_size(getattr(args, "min_size", None)))
+    return result
 
 
 def cmd_scan(args: argparse.Namespace, console: Console) -> int:
+    # Fast path: summarize a previously-written JSON report instead of
+    # re-scanning the whole system (used by the scheduled-run notification so a
+    # niced background job scans exactly once).
+    if args.summary and getattr(args, "input", None):
+        try:
+            data = json.loads(Path(args.input).expanduser().read_text())
+            items = data.get("cleanable_items", data.get("total_items", 0))
+            human = data.get("cleanable_human", data.get("total_human", "0 B"))
+            print(f"{items} item(s), {human} reclaimable")
+            return 0
+        except (OSError, ValueError):
+            print("scan complete")
+            return 0
+
     result = _run_scan(args, console)
 
     if not args.summary and not args.json:
@@ -200,13 +357,60 @@ def cmd_scan(args: argparse.Namespace, console: Console) -> int:
     return 0
 
 
-def cmd_clean(args: argparse.Namespace, console: Console) -> int:
+def cmd_explain(args: argparse.Namespace, console: Console) -> int:
+    """Show exactly which paths/commands one cleaner would consider, and why
+    it is safe — a read-only, per-item view for building trust."""
+    from rich.table import Table
+
+    cid = args.cleaner_id
+    if unknown_ids([cid]):
+        console.print(f"[red]unknown cleaner id: {cid}[/red] "
+                      "(run `cleanix list`)")
+        return 1
+    _require_nonempty_selection(args)
     _configure_scope(args)
     config = _load_config()
+    engine = _make_engine(config, only=[cid], exclude=None)
+    report = _scan(engine, console, quiet=True).reports[0]
+
+    console.print(f"[bold cyan]{report.name}[/bold cyan] — {report.description}")
+    if not report.ran:
+        console.print(f"[yellow]skipped: {report.skipped_reason}[/yellow]")
+        return 0
+    if not report.items:
+        console.print("[green]nothing found — clean.[/green]")
+        return 0
+    table = Table(show_lines=False)
+    table.add_column("Size", justify="right", style="green")
+    table.add_column("Kind", style="magenta")
+    table.add_column("Root?", justify="center")
+    table.add_column("Delete?", justify="center")
+    table.add_column("Path / command", style="cyan", overflow="fold")
+    for i in sorted(report.items, key=lambda x: x.size, reverse=True):
+        target = i.path or " ".join(i.command or [])
+        table.add_row(
+            human_size(i.size),
+            i.kind.value,
+            "yes" if i.requires_root else "no",
+            "[yellow]report-only[/yellow]" if i.report_only else "yes",
+            target,
+        )
+    console.print(table)
+    console.print(f"[dim]{report.count} item(s), "
+                  f"{human_size(report.total_size)} total. This was read-only; "
+                  f"nothing was removed.[/dim]")
+    return 0
+
+
+def cmd_clean(args: argparse.Namespace, console: Console) -> int:
+    _require_nonempty_selection(args)
+    _configure_scope(args)
+    config = _apply_profile(_load_config(), getattr(args, "profile", None))
     engine = _make_engine(config, _split_csv(args.only), _split_csv(args.exclude))
 
     _scope_note(console)
     scan = _scan(engine, console)
+    _apply_min_size(scan, _parse_size(getattr(args, "min_size", None)))
 
     if scan.total_items == 0:
         console.print("[green]Nothing to clean — system is tidy.[/green]")
@@ -231,6 +435,17 @@ def cmd_clean(args: argparse.Namespace, console: Console) -> int:
             f"\n[yellow]{len(root_items)} item(s) require root and will be "
             f"skipped. Re-run with sudo to include them.[/yellow]"
         )
+
+    # --simulate: write the exact target list without touching anything.
+    if getattr(args, "simulate", False):
+        return _write_simulation(items, console)
+
+    # --interactive: let the user curate the set before anything is removed.
+    if getattr(args, "interactive", False) and not args.yes:
+        items = _interactive_select(items, console)
+        if not items:
+            console.print("Nothing selected. Nothing was deleted.")
+            return 0
 
     dry_run = not args.execute
     if dry_run:
@@ -260,15 +475,30 @@ def cmd_clean(args: argparse.Namespace, console: Console) -> int:
         from cleanix.core import quarantine as qmod
         quarantine = qmod.new_run()
 
+    free_before = _disk_free()
     with console.status("Cleaning..."):
         result = engine.clean(items, dry_run=False, quarantine=quarantine)
     console.print()
     render_clean_summary(result, console)
 
-    # Record history and finalize quarantine.
+    # Show the real filesystem free-space change (an honest cross-check against
+    # the estimated bytes — e.g. Docker's VM disk not shrinking on macOS).
+    free_after = _disk_free()
+    if free_before is not None and free_after is not None:
+        gained = free_after - free_before
+        console.print(
+            f"[dim]Disk free on / : {human_size(free_before)} → "
+            f"{human_size(free_after)} ({'+' if gained >= 0 else ''}"
+            f"{human_size(gained)}).[/dim]"
+        )
+
+    # Record history, write a per-file audit manifest, and finalize quarantine.
     from cleanix.core import history
     history.record(result.freed, result.removed_count,
                    mode="quarantine" if quarantine else "delete")
+    manifest = history.write_manifest(result)
+    if manifest:
+        console.print(f"[dim]Audit log: {manifest}[/dim]")
     if quarantine is not None and quarantine.items:
         quarantine.save()
         console.print(
@@ -699,6 +929,20 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="show only the N cleaners with the most to reclaim",
     )
+    p_scan.add_argument(
+        "--min-size",
+        metavar="SIZE",
+        default=None,
+        help="ignore items smaller than SIZE (e.g. 100M, 1.5G)",
+    )
+    p_scan.add_argument(
+        "--input",
+        metavar="FILE",
+        default=None,
+        help="with --summary, summarize a previously written JSON report "
+        "instead of re-scanning",
+    )
+    _add_profile(p_scan)
     p_scan.set_defaults(func=cmd_scan)
 
     p_clean = sub.add_parser(
@@ -721,7 +965,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="move items to a reversible quarantine instead of deleting "
         "(undo with `cleanix restore`)",
     )
+    p_clean.add_argument(
+        "--min-size",
+        metavar="SIZE",
+        default=None,
+        help="only remove items at least SIZE (e.g. 100M, 1.5G)",
+    )
+    p_clean.add_argument(
+        "--simulate",
+        action="store_true",
+        help="write the exact list of paths/commands that --execute would act "
+        "on to a file, without deleting anything",
+    )
+    p_clean.add_argument(
+        "--interactive",
+        action="store_true",
+        help="pick individual items to remove from a checklist before cleaning",
+    )
+    _add_profile(p_clean)
     p_clean.set_defaults(func=cmd_clean)
+
+    p_explain = sub.add_parser(
+        "explain", help="show exactly what one cleaner would consider (read-only)"
+    )
+    p_explain.add_argument("cleaner_id", help="the cleaner id to explain")
+    add_selection(p_explain)
+    p_explain.set_defaults(func=cmd_explain)
 
     p_sched = sub.add_parser(
         "schedule", help="manage the periodic analysis timer"
