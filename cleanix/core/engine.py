@@ -19,6 +19,7 @@ from cleanix.core.models import (
     ItemKind,
     ScanResult,
 )
+from cleanix.core import platform as plat
 from cleanix.core.utils import is_root, path_size, run_command
 
 ProgressCB = Optional[Callable[[str], None]]
@@ -99,7 +100,11 @@ class Engine:
             return CleanOutcome(
                 item=item,
                 removed=False,
-                error="requires root (re-run with sudo)",
+                error=(
+                    "requires root (run from an elevated (Administrator) terminal)"
+                    if plat.is_windows()
+                    else "requires root (re-run with sudo)"
+                ),
                 dry_run=dry_run,
             )
 

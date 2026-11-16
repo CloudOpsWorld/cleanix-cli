@@ -11,6 +11,11 @@ from cleanix.core.context import invoking_user
 
 
 def state_dir() -> Path:
+    from cleanix.core import platform as plat
+    from cleanix.core import winenv
+
+    if plat.is_windows():
+        return winenv.local_appdata() / "cleanix"
     return invoking_user().home / ".local" / "state" / "cleanix"
 
 

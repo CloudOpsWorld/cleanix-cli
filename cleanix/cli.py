@@ -115,8 +115,23 @@ def _require_nonempty_selection(args: argparse.Namespace) -> None:
             raise SystemExit(f"--{flag} was given but empty; omit it to select all")
 
 
-def _disk_free(path: str = "/") -> Optional[int]:
+def _elevate_text() -> str:
+    """How to get elevated rights, worded for the current OS."""
+    from cleanix.core import platform as plat
+
+    if plat.is_windows():
+        return "run from an elevated (Administrator) terminal"
+    return "re-run with sudo"
+
+
+def _disk_free(path: Optional[str] = None) -> Optional[int]:
     import shutil as _shutil
+
+    if path is None:
+        from cleanix.core import platform as plat
+        from cleanix.core import winenv
+
+        path = winenv.system_drive() + "\\" if plat.is_windows() else "/"
 
     try:
         return _shutil.disk_usage(path).free
@@ -433,7 +448,7 @@ def cmd_clean(args: argparse.Namespace, console: Console) -> int:
     if root_items and not is_root():
         console.print(
             f"\n[yellow]{len(root_items)} item(s) require root and will be "
-            f"skipped. Re-run with sudo to include them.[/yellow]"
+            f"skipped. {_elevate_text().capitalize()} to include them.[/yellow]"
         )
 
     # --simulate: write the exact target list without touching anything.
@@ -621,7 +636,7 @@ def _execute_reset(args: argparse.Namespace, console: Console, plan) -> int:
     needs_root = any(a.requires_root for a in plan.actions)
     if needs_root and not is_root():
         console.print(
-            "[red]These actions require root — re-run with sudo.[/red]"
+            f"[red]These actions require root — {_elevate_text()}.[/red]"
         )
         return 1
 
@@ -659,6 +674,15 @@ def _execute_reset(args: argparse.Namespace, console: Console, plan) -> int:
 
 def cmd_factory_reset(args: argparse.Namespace, console: Console) -> int:
     from rich.panel import Panel
+
+    from cleanix.core import platform as plat
+
+    if plat.is_windows():
+        console.print(
+            "[red]factory-reset is not supported on Windows.[/red] Use "
+            "Settings > System > Recovery (Reset this PC) instead."
+        )
+        return 1
 
     from cleanix.reset import build_plan
 

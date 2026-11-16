@@ -14,6 +14,11 @@ from typing import List
 
 
 def _config_path() -> Path:
+    from cleanix.core import platform as plat
+    from cleanix.core import winenv
+
+    if plat.is_windows():
+        return winenv.roaming_appdata() / "cleanix" / "config.yaml"
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     return Path(base) / "cleanix" / "config.yaml"
 
