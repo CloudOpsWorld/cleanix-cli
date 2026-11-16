@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -98,6 +99,8 @@ class PowerView(QWidget):
         self._clean_factory = clean_worker_factory or self._default_clean_worker
         self._result: Optional[ScanResult] = None
         self._worker = None
+        self._shutting_down = False
+        self._removed_keys: set = set()
 
         self.tabs = QTabWidget()
         self.scan_tab = QWidget()
@@ -288,9 +291,12 @@ class PowerView(QWidget):
 
     def shutdown(self) -> None:
         """Cancel any running worker; safe to call repeatedly."""
-        worker, self._worker = self._worker, None
-        if worker is not None:
-            worker.cancel()
+        # Keep _worker set: the thread may still run until its terminal signal,
+        # so the start guard must stay up. _shutting_down blocks new work.
+        already = self._shutting_down
+        self._shutting_down = True
+        if self._worker is not None and not already:
+            self._worker.cancel()
 
     def _run(self, worker) -> None:
         self._worker = worker
@@ -300,7 +306,7 @@ class PowerView(QWidget):
 
     # ----- scan -----
     def start_scan(self) -> None:
-        if self._worker is not None:
+        if self._worker is not None or self._shutting_down:
             return
         only = self.cleaner_model.enabled_ids()
         if not only:
@@ -319,6 +325,7 @@ class PowerView(QWidget):
     def _on_scan_finished(self, result) -> None:
         self._worker = None
         self._result = result
+        self._removed_keys = set()
         infos = {self.cleaner_model.info_at(r).id: self.cleaner_model.info_at(r)
                  for r in range(self.cleaner_model.rowCount())}
 
@@ -369,7 +376,7 @@ class PowerView(QWidget):
         return answer == QMessageBox.StandardButton.Yes
 
     def start_clean(self) -> None:
-        if self._worker is not None:
+        if self._worker is not None or self._shutting_down:
             return
         items = self.visible_checked_items()
         if not items:
@@ -405,6 +412,8 @@ class PowerView(QWidget):
             # Done rows leave the table; a rescan is needed for fresh state.
             done = {item_key(o.item) for o in summary.result.outcomes if o.removed}
             self.item_model.remove_keys(done)
+            self._removed_keys |= done
+            self._on_current_changed(self.table.currentIndex())
         self.show_results(summary, text)
         self.clean_finished.emit(summary)
 
@@ -418,7 +427,13 @@ class PowerView(QWidget):
     def export_scan_json(self, path: Path) -> None:
         if self._result is None:
             raise ValueError("no scan result to export")
-        Path(path).write_text(report.scan_to_json(self._result), encoding="utf-8")
+        result = self._result
+        if self._removed_keys:  # leave already-deleted items out of the export
+            result = ScanResult(reports=[
+                dataclasses.replace(r, items=[
+                    i for i in r.items if item_key(i) not in self._removed_keys])
+                for r in result.reports])
+        Path(path).write_text(report.scan_to_json(result), encoding="utf-8")
 
     def _on_export_clicked(self) -> None:
         name, _ = QFileDialog.getSaveFileName(
