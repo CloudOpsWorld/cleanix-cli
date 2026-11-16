@@ -151,7 +151,7 @@ class Config:
             return cfg
 
         try:
-            data = yaml.safe_load(cfg_path.read_text()) or {}
+            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig")) or {}
         except (OSError, yaml.YAMLError):
             return cfg
 
@@ -244,7 +244,7 @@ def read_user_overrides(path: str | os.PathLike | None = None) -> dict:
     try:
         import yaml
 
-        return yaml.safe_load(cfg_path.read_text()) or {}
+        return yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig")) or {}
     except Exception:  # noqa: BLE001
         return {}
 
@@ -259,7 +259,10 @@ def write_user_override(key: str, value, path: str | os.PathLike | None = None) 
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     data = read_user_overrides(cfg_path)
     data[key] = value
-    cfg_path.write_text(yaml.safe_dump(data, default_flow_style=False, sort_keys=True))
+    cfg_path.write_text(
+        yaml.safe_dump(data, default_flow_style=False, sort_keys=True),
+        encoding="utf-8",
+    )
     return cfg_path
 
 
@@ -272,7 +275,10 @@ def remove_user_override(key: str, path: str | os.PathLike | None = None) -> boo
     if key not in data:
         return False
     del data[key]
-    cfg_path.write_text(yaml.safe_dump(data, default_flow_style=False, sort_keys=True))
+    cfg_path.write_text(
+        yaml.safe_dump(data, default_flow_style=False, sort_keys=True),
+        encoding="utf-8",
+    )
     return True
 
 

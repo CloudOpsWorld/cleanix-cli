@@ -55,7 +55,8 @@ class Quarantine:
             json.dumps(
                 {"run_id": self.run_id, "created": time.time(), "items": self.items},
                 indent=2,
-            )
+            ),
+            encoding="utf-8",
         )
 
     @property
@@ -73,7 +74,7 @@ def _read_manifest(run_dir: Path) -> Optional[Dict]:
     if not mf.exists():
         return None
     try:
-        return json.loads(mf.read_text())
+        return json.loads(mf.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
 

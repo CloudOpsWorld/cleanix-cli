@@ -182,7 +182,7 @@ def _write_simulation(items: list, console: Console) -> int:
     out = state_dir() / "last-simulation.txt"
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(body)
+        out.write_text(body, encoding="utf-8")
         where = str(out)
     except OSError:
         where = None
@@ -323,7 +323,7 @@ def cmd_scan(args: argparse.Namespace, console: Console) -> int:
     # niced background job scans exactly once).
     if args.summary and getattr(args, "input", None):
         try:
-            data = json.loads(Path(args.input).expanduser().read_text())
+            data = json.loads(Path(args.input).expanduser().read_text(encoding="utf-8-sig"))
             items = data.get("cleanable_items", data.get("total_items", 0))
             human = data.get("cleanable_human", data.get("total_human", "0 B"))
             print(f"{items} item(s), {human} reclaimable")
@@ -348,7 +348,7 @@ def cmd_scan(args: argparse.Namespace, console: Console) -> int:
     if args.json:
         payload = scan_to_json(result)
         if args.output:
-            Path(args.output).expanduser().write_text(payload)
+            Path(args.output).expanduser().write_text(payload, encoding="utf-8")
             if not args.quiet:
                 console.print(f"[green]Wrote report to {args.output}[/green]")
         else:
@@ -845,7 +845,7 @@ def cmd_dashboard(args: argparse.Namespace, console: Console) -> int:
     report = state_dir() / "last-scan.json"
     if report.exists():
         try:
-            data = json.loads(report.read_text())
+            data = json.loads(report.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             data = None
         if data:
