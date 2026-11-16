@@ -11,7 +11,7 @@ from cleanix.core import safety
 from cleanix.core.engine import Engine
 from cleanix.core.models import CleanableItem
 
-pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only")
+pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="needs real NTFS behaviour: 8.3 names, junctions, reparse points, case folding")
 
 
 def test_drive_root_refused():

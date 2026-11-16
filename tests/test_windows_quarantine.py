@@ -16,7 +16,7 @@ from cleanix.core import quarantine, safety
 from cleanix.core.engine import Engine
 from cleanix.core.models import CleanableItem
 
-pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows quarantine")
+pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows quarantine uses WinAPI rename/junction semantics and winerror codes")
 
 
 def _item(p, size=1):

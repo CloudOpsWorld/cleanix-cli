@@ -34,14 +34,14 @@ def test_system_paths_from_env(monkeypatch):
     assert winenv.system_drive() == "D:"
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="non-Windows behaviour")
+@pytest.mark.skipif(sys.platform == "win32", reason="asserts the POSIX fallback of the Windows env helpers")
 def test_helpers_are_safe_off_windows():
     assert winenv.is_admin() is False
     assert winenv.recycle_bin_size() == 0
     assert winenv.relaunch_elevated(["x"]) is False
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
+@pytest.mark.skipif(sys.platform != "win32", reason="needs the real Windows environment (GetSystemDirectoryW, drive letters)")
 def test_is_admin_returns_bool_on_windows():
     assert isinstance(winenv.is_admin(), bool)
     assert utils.is_root() is winenv.is_admin()

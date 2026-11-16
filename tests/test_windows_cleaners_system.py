@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
+
+import pytest
 
 from cleanix.cleaners import windows_system as ws
 from cleanix.cleaners.windows_system import (
@@ -19,6 +22,16 @@ from cleanix.core import safety_windows, winenv
 from cleanix.core.models import ItemKind
 
 NS = "ServiceProfiles/NetworkService/AppData/Local/Microsoft/Windows/DeliveryOptimization/Cache"
+
+
+def _winify(path) -> str:
+    """Spell a fake_win path as a Windows absolute path on every host.
+
+    On Windows tmp_path already is one; elsewhere a POSIX path gets a ``C:``
+    prefix and backslash separators so the pure string guard can judge it.
+    """
+    s = str(path)
+    return s if os.name == "nt" else "C:" + s.replace("/", "\\")
 
 
 def _mk(path, data=b"x" * 10, days=0):
@@ -84,15 +97,17 @@ def test_every_path_item_passes_windows_guard(fake_win):
     _populate(fake_win)
     sr = fake_win.system_root
     env = {
-        "SystemRoot": str(sr),
+        "SystemRoot": _winify(sr),
         "SystemDrive": sr.drive or "C:",
-        "ProgramData": str(fake_win.programdata),
+        "ProgramData": _winify(fake_win.programdata),
     }
     items = _deletable(fake_win)
     assert len(items) >= 7
     for item in items:
         assert item.kind is ItemKind.PATH
-        assert safety_windows.violation(item.path, env, [str(fake_win.home)]) is None, item.path
+        assert safety_windows.violation(
+            _winify(item.path), env, [_winify(fake_win.home)]
+        ) is None, item.path
 
 
 def test_prefetch_and_windows_old_are_report_only(fake_win, monkeypatch):
@@ -112,7 +127,18 @@ def test_windows_old_path_uses_system_drive(fake_win, monkeypatch):
     _mk(drive / "Windows.old" / "f")
     monkeypatch.setattr(winenv, "system_drive", lambda: str(drive))
     (item,) = WindowsOldReporter(Config()).find_items()
-    assert item.path == str(drive) + r"\Windows.old"
+    assert item.path == os.path.join(str(drive) + os.sep, "Windows.old")
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="asserts the literal drive-letter spelling of the Windows.old path under the C: drive")
+def test_windows_old_path_for_drive_letter(fake_win, monkeypatch):
+    monkeypatch.setattr(winenv, "system_drive", lambda: "C:")
+    seen = []
+    monkeypatch.setattr(WindowsOldReporter, "report_item",
+                        lambda self, path, *a, **k: seen.append(path))
+    list(WindowsOldReporter(Config()).find_items())
+    assert seen == ["C:" + chr(92) + "Windows.old"]
 
 
 def test_component_store_is_opt_in(fake_win, monkeypatch):

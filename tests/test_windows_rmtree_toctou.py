@@ -14,7 +14,7 @@ import pytest
 
 from cleanix.core import safety
 
-pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows remover")
+pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="tests the Windows-only _win_rmtree remover (reparse points, file ids)")
 
 REPARSE = 0x400
 

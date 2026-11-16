@@ -8,6 +8,7 @@ Cleaners yield *children* of directories, never the directories themselves
 
 from __future__ import annotations
 
+import os
 from typing import Iterable
 
 from cleanix.cleaners.base import Cleaner, SCOPE_SYSTEM
@@ -122,7 +123,9 @@ class WindowsOldReporter(Cleaner):
 
     def find_items(self) -> Iterable[CleanableItem]:
         item = self.report_item(
-            winenv.system_drive() + "\\Windows.old",
+            # "C:" -> "C:\Windows.old" on Windows (identical to before);
+            # os.sep keeps the join host-correct when the drive is a tmp dir.
+            os.path.join(winenv.system_drive() + os.sep, "Windows.old"),
             "Previous Windows installation (Windows.old)",
             hint="Remove it via Settings > System > Storage > Temporary files, or run cleanmgr.",
         )

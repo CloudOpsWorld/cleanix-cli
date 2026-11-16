@@ -15,7 +15,7 @@ import pytest
 
 from cleanix.core import utils
 
-win_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows process creation")
+win_only = pytest.mark.skipif(sys.platform != "win32", reason="exercises Windows CreateProcess cwd/PATH lookup and System32 tools")
 
 
 def _plant(d, name):

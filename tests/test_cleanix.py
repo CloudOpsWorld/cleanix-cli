@@ -17,7 +17,7 @@ from cleanix.core.registry import build_cleaners
 from cleanix.core.utils import human_size, surplus_after_keeping
 
 
-posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX paths")
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="asserts POSIX path conventions (~/.config, POSIX protected roots)")
 
 
 def _symlink(link, target, **kw):

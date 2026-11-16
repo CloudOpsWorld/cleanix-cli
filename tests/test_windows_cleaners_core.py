@@ -13,7 +13,7 @@ from cleanix.cleaners.windows_core import (
     WinThumbnailCleaner,
 )
 from cleanix.config import Config
-from cleanix.core import platform, winenv
+from cleanix.core import platform, utils, winenv
 from cleanix.core.models import ItemKind
 
 
@@ -26,7 +26,10 @@ def _paths(items):
     return {i.path for i in items}
 
 
-def test_win_temp_offers_old_files_only(fake_win):
+def test_win_temp_offers_old_files_only(fake_win, monkeypatch):
+    # Windows sizes files by st_size; POSIX hosts use allocated blocks (4096
+    # on ext4), so pin the seam to apparent size to test the cleaner itself.
+    monkeypatch.setattr(utils, "_allocated_bytes", lambda st: st.st_size)
     temp = winenv.user_temp()
     temp.mkdir(parents=True)
     old = temp / "old.tmp"

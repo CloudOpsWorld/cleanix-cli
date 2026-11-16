@@ -112,7 +112,7 @@ def test_extra_roots_protected():
 
 # -- integration on Windows ----------------------------------------------------
 
-win_only = pytest.mark.skipif(sys.platform != "win32", reason="real junctions / profiles")
+win_only = pytest.mark.skipif(sys.platform != "win32", reason="needs real NTFS junctions and real user profiles under the system drive")
 
 
 def _junction(link: Path, target: Path) -> None:

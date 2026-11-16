@@ -139,7 +139,9 @@ def test_ai_cleaners_work_on_windows(fake_win, monkeypatch):
     assert str(rollout) in codex
 
 
-def test_walk_pruned_skips_appdata(fake_win):
+def test_walk_pruned_skips_appdata(fake_win, monkeypatch):
+    # The AppData prune is Windows-only behaviour gated on is_windows().
+    monkeypatch.setattr(platform, "is_windows", lambda: True)
     (fake_win.home / "AppData" / "Local").mkdir(parents=True, exist_ok=True)
     (fake_win.home / "AppData" / "hidden.bin").write_bytes(b"x")
     (fake_win.home / "AppData" / "Local" / "deep.bin").write_bytes(b"x")

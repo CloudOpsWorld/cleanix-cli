@@ -3,6 +3,7 @@ gate, classic Teams caches, wording, and the guard over all Windows cleaners."""
 
 from __future__ import annotations
 
+import ntpath
 import os
 import subprocess
 import sys
@@ -19,7 +20,7 @@ from cleanix.core import platform, safety_windows, utils
 from cleanix.core.models import ItemKind
 from cleanix.core.registry import build_cleaners
 
-win_only = pytest.mark.skipif(sys.platform != "win32", reason="real junctions")
+win_only = pytest.mark.skipif(sys.platform != "win32", reason="needs real NTFS junctions (mklink /J)")
 
 
 def _junction(link, target):
@@ -189,8 +190,12 @@ def _populate_user(fw):
     _mk(fw.roaming / "Microsoft" / "Teams" / "Cache")
 
 
-@pytest.mark.skipif(sys.platform != "win32",
-                    reason="the Windows path model needs drive-letter temp paths")
+def _winify(path) -> str:
+    """Windows-style spelling of a fake_win path on any host (identity on Windows)."""
+    s = str(path)
+    return s if os.name == "nt" else "C:" + s.replace("/", chr(92))
+
+
 def test_every_windows_cleaner_path_passes_guard(fake_win, monkeypatch):
     monkeypatch.setattr(platform, "is_windows", lambda: True)
     monkeypatch.delenv("SCOOP", raising=False)
@@ -198,11 +203,11 @@ def test_every_windows_cleaner_path_passes_guard(fake_win, monkeypatch):
     _populate_user(fake_win)
     sr = fake_win.system_root
     env = {
-        "SystemRoot": str(sr),
+        "SystemRoot": _winify(sr),
         "SystemDrive": sr.drive or "C:",
-        "ProgramData": str(fake_win.programdata),
+        "ProgramData": _winify(fake_win.programdata),
     }
-    home = str(fake_win.home)
+    home = _winify(fake_win.home)
     cfg = Config()
     cfg.browsers = ["chrome", "firefox"]
     classes = [
@@ -216,13 +221,13 @@ def test_every_windows_cleaner_path_passes_guard(fake_win, monkeypatch):
     for cls in classes:
         for item in cls(cfg).find_items():
             if item.kind is ItemKind.PATH and not item.report_only:
-                paths.append(item.path)
+                paths.append(_winify(item.path))
     assert len(paths) >= 12
-    refuse = {os.path.normcase(os.path.join(home, s)) if s else os.path.normcase(home)
+    refuse = {ntpath.normcase(ntpath.join(home, s)) if s else ntpath.normcase(home)
               for s in MUST_REFUSE_SUFFIXES}
     for p in paths:
         assert safety_windows.violation(p, env, [home], profiles=[home]) is None, p
-        assert os.path.normcase(p) not in refuse, p
+        assert ntpath.normcase(p) not in refuse, p
     # and the must-refuse table really is refused for this home
     for s in MUST_REFUSE_SUFFIXES:
         target = home + ("\\" + s if s else "")
