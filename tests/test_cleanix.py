@@ -1,6 +1,7 @@
 """Cleanix test suite — core safety, engine, config, reset and quarantine."""
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,17 +12,30 @@ from cleanix.core import context, quarantine, safety
 from cleanix.core.context import TargetUser
 from cleanix.core.engine import Engine
 from cleanix.core.models import CleanableItem, CleanerReport, ItemKind, ScanResult
-from cleanix.core.platform import ALL, supports
+from cleanix.core.platform import ALL, is_windows, supports
 from cleanix.core.registry import build_cleaners
 from cleanix.core.utils import human_size, surplus_after_keeping
 
 
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX paths")
+
+
+def _symlink(link, target, **kw):
+    """Create a symlink or skip when the OS withholds the privilege."""
+    try:
+        os.symlink(str(target), str(link), **kw)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted on this host")
+
+
 # --------------------------------------------------------------------------- safety
+@posix_only  # Windows equivalents: tests/test_windows_safety_integration.py
 @pytest.mark.parametrize("bad", ["/", "/etc", "/usr", "/boot", "/System", "/Library"])
 def test_protected_system_paths_refused(bad):
     assert not safety.is_safe_to_delete(bad)
 
 
+@posix_only  # ~/.config is a POSIX convention; Windows home rules live in safety_windows
 def test_home_and_config_protected():
     home = os.path.expanduser("~")
     assert not safety.is_safe_to_delete(home)
@@ -29,6 +43,7 @@ def test_home_and_config_protected():
     assert safety.is_safe_to_delete(home + "/.cache/some-app")
 
 
+@posix_only  # POSIX root-ancestor semantics; Windows drive-root is tested in the Windows file
 def test_ancestor_of_protected_refused(tmp_path):
     # A path that contains a protected root must be refused.
     assert not safety.is_safe_to_delete("/")
@@ -43,6 +58,7 @@ def test_protected_globs(tmp_path):
         safety.set_protected_globs([])
 
 
+@posix_only  # /etc does not exist on Windows
 def test_safe_rmtree_refuses_protected():
     with pytest.raises(safety.UnsafePathError):
         safety.safe_rmtree("/etc")
@@ -78,6 +94,7 @@ def test_root_item_skipped_without_privilege(tmp_path):
     assert d.exists() and "root" in (res.outcomes[0].error or "")
 
 
+@posix_only  # /etc does not exist on Windows
 def test_protected_path_item_refused():
     res = Engine([]).clean([_item("/etc", size=0)], dry_run=False)
     assert not res.outcomes[0].removed and os.path.isdir("/etc")
@@ -137,7 +154,10 @@ def test_config_override_roundtrip(tmp_path):
 def test_platform_supports():
     from cleanix.core.platform import current_os
 
-    assert supports((ALL,))
+    if is_windows():
+        assert not supports((ALL,))  # Windows is opt-in by design
+    else:
+        assert supports((ALL,))
     assert supports((current_os(),))
     assert not supports(("nonexistent-os",))
 
@@ -429,6 +449,7 @@ def test_sleepimage_reported_once(monkeypatch):
     assert len(items) == 1 and items[0].report_only
 
 
+@posix_only  # os.geteuid does not exist on Windows
 def test_homebrew_skips_as_root(monkeypatch):
     from cleanix.cleaners import macos
 
@@ -493,7 +514,7 @@ def test_safe_rmtree_never_follows_symlink_to_real_data(tmp_path):
     cache = tmp_path / "cache"
     cache.mkdir()
     link = cache / "app-cache"
-    link.symlink_to(precious)
+    _symlink(link, precious, target_is_directory=True)
 
     safety.safe_rmtree(str(link))
 
@@ -504,11 +525,12 @@ def test_safe_rmtree_never_follows_symlink_to_real_data(tmp_path):
 def test_safe_rmtree_removes_broken_symlink(tmp_path):
     # C1b: broken-symlink removal used to be a silent no-op.
     link = tmp_path / "dead"
-    link.symlink_to(tmp_path / "does-not-exist")
+    _symlink(link, tmp_path / "does-not-exist")
     safety.safe_rmtree(str(link))
     assert not link.is_symlink() and not link.exists()
 
 
+@posix_only  # dot-dir protection is POSIX home layout
 def test_protected_home_includes_credentials(monkeypatch, tmp_path):
     monkeypatch.setattr(safety, "_home_dirs", lambda: [tmp_path])
     for name in (".ssh", ".gnupg", ".local/state", "Music", "Videos"):
@@ -692,7 +714,7 @@ def test_duplicates_ignores_unique_small_and_symlinks(tmp_path, monkeypatch):
     (tmp_path / "u2.bin").write_bytes(b"B" * (12 * 1024 * 1024))  # same size, diff content
     real = tmp_path / "real.bin"
     real.write_bytes(b"Z" * (12 * 1024 * 1024))
-    (tmp_path / "link.bin").symlink_to(real)  # symlink, not a real dup
+    _symlink(tmp_path / "link.bin", real)  # symlink, not a real dup
     for p in (tmp_path / "u1.bin", tmp_path / "u2.bin", real):
         _os.utime(p, (old, old))
     assert list(duplicates.DuplicateFileReporter(Config()).find_items()) == []

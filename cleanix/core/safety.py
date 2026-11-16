@@ -9,8 +9,14 @@ user's home directory.
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 from typing import Iterable
+
+from cleanix.core import platform as _platform
+from cleanix.core import safety_windows
+
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 class UnsafePathError(Exception):
@@ -129,6 +135,20 @@ def _protected_roots() -> set:
     return roots
 
 
+def is_reparse_point(path: str | os.PathLike) -> bool:
+    """True for a symlink or (on Windows) a junction/other reparse point.
+
+    Never follows the final component. Missing or unreadable paths are False.
+    """
+    if os.name == "nt":
+        try:
+            attrs = os.lstat(str(path)).st_file_attributes
+        except (OSError, AttributeError):
+            return False
+        return bool(attrs & _FILE_ATTRIBUTE_REPARSE_POINT)
+    return os.path.islink(str(path))
+
+
 def assert_safe_to_delete(target: str | os.PathLike) -> Path:
     """Return the resolved path if it is safe to delete, else raise.
 
@@ -137,13 +157,21 @@ def assert_safe_to_delete(target: str | os.PathLike) -> Path:
     """
     resolved = _canonical(target)
 
-    if str(resolved) in ("", "/"):
+    if str(resolved) == "" or resolved.parent == resolved:
         raise UnsafePathError(f"refusing to delete filesystem root: {resolved}")
 
     if _matches_extra_glob(resolved):
         raise UnsafePathError(
             f"refusing to delete {resolved}: matches a user protected_globs entry"
         )
+
+    if _platform.is_windows():
+        reason = safety_windows.violation(
+            str(resolved), os.environ, [str(h) for h in _home_dirs()]
+        )
+        if reason:
+            raise UnsafePathError(reason)
+        return resolved
 
     protected = _protected_roots()
     if resolved in protected:
@@ -170,36 +198,98 @@ def is_safe_to_delete(target: str | os.PathLike) -> bool:
         return False
 
 
+def _remove_link(path: str) -> None:
+    """Remove a symlink/junction itself, never its target."""
+    try:
+        is_dir = os.path.isdir(path) or bool(
+            os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_DIRECTORY
+        )
+    except (OSError, AttributeError):
+        is_dir = False
+    if os.name == "nt" and is_dir:
+        os.rmdir(path)          # directory symlink or junction
+    else:
+        os.unlink(path)
+
+
+def _clear_readonly(path: str) -> None:
+    os.chmod(path, stat.S_IWRITE)
+
+
+def _win_unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except PermissionError:
+        _clear_readonly(path)   # one retry; a truly locked file still raises
+        os.unlink(path)
+
+
+def _win_rmdir(path: str) -> None:
+    try:
+        os.rmdir(path)
+    except PermissionError:
+        _clear_readonly(path)
+        os.rmdir(path)
+
+
+def _win_rmtree(path: str) -> None:
+    """Depth-first removal that never follows junctions/symlinks.
+
+    Errors propagate (locked files are reported, not forced).
+    """
+    with os.scandir(path) as it:
+        entries = list(it)
+    for entry in entries:
+        if is_reparse_point(entry.path):
+            _remove_link(entry.path)
+        elif entry.is_dir(follow_symlinks=False):
+            _win_rmtree(entry.path)
+        else:
+            _win_unlink(entry.path)
+    _win_rmdir(path)
+
+
 def safe_unlink(target: str | os.PathLike) -> None:
     """Delete a single file/symlink after the safety check.
 
-    A symlink is unlinked as the *link* — its target is never touched.
+    A symlink/junction is removed as the *link* — its target is never touched.
     """
     resolved = _canonical(target)
     assert_safe_to_delete(resolved)
-    if os.path.islink(str(resolved)):
-        os.unlink(str(resolved))
+    if is_reparse_point(resolved):
+        _remove_link(str(resolved))
         return
     if resolved.is_dir():
         raise UnsafePathError(f"{resolved} is a directory; use safe_rmtree")
+    if os.name == "nt":
+        try:
+            _win_unlink(str(resolved))
+        except FileNotFoundError:
+            pass
+        return
     resolved.unlink(missing_ok=True)
 
 
 def safe_rmtree(target: str | os.PathLike) -> None:
     """Recursively delete a directory (or file) after the safety check.
 
-    Critically, a symlink is removed as the *link itself* and its target is
-    never followed — otherwise a symlinked cache pointing at real data (or a
-    planted ``/tmp/x -> /etc/shadow``) would have its target wiped. This also
-    makes broken-symlink removal work: ``os.path.islink`` is true for a dangling
-    link even though ``is_file``/``is_dir`` are not.
+    Critically, a symlink or junction is removed as the *link itself* and its
+    target is never followed — otherwise a symlinked cache pointing at real data
+    would have its target wiped. This also makes broken-symlink removal work.
+    On Windows, errors (e.g. a locked file) propagate as ``OSError``.
     """
     import shutil
 
     resolved = _canonical(target)
     assert_safe_to_delete(resolved)
-    if os.path.islink(str(resolved)):
-        os.unlink(str(resolved))
+    path = str(resolved)
+    if is_reparse_point(path):
+        _remove_link(path)
+    elif os.name == "nt":
+        if resolved.is_dir():
+            _win_rmtree(path)
+        elif resolved.exists():
+            _win_unlink(path)
     elif resolved.is_file():
         resolved.unlink(missing_ok=True)
     elif resolved.is_dir():
