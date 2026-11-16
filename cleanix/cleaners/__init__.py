@@ -163,6 +163,14 @@ from cleanix.cleaners.bsd import (
     PkginCleaner,
 )
 
+# Windows
+from cleanix.cleaners.windows_core import (
+    WinErrorReportingCleaner,
+    WinRecycleBinCleaner,
+    WinTempCleaner,
+    WinThumbnailCleaner,
+)
+
 ALL_CLEANERS: List[Type[Cleaner]] = [
     # Cross-platform user junk
     TrashCleaner,
@@ -276,6 +284,11 @@ ALL_CLEANERS: List[Type[Cleaner]] = [
     HomebrewCleaner,
     MacPortsCleaner,
     XcodeCleaner,
+    # Windows
+    WinTempCleaner,
+    WinThumbnailCleaner,
+    WinErrorReportingCleaner,
+    WinRecycleBinCleaner,
     # BSD
     FreeBsdPkgCleaner,
     BsdDistfilesCleaner,
