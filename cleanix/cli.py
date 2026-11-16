@@ -935,6 +935,17 @@ def cmd_quarantine(args: argparse.Namespace, console: Console) -> int:
     return 1 if errors else 0
 
 
+def cmd_gui(args: argparse.Namespace, console: Console) -> int:
+    from cleanix.gui import app
+
+    try:
+        app.require_qt()
+    except app.GuiUnavailable as exc:
+        console.print(str(exc), markup=False, highlight=False)
+        return 1
+    return app.main([sys.argv[0]])
+
+
 def cmd_completion(args: argparse.Namespace, console: Console) -> int:
     from cleanix.completion import generate
 
@@ -1173,6 +1184,9 @@ def build_parser() -> argparse.ArgumentParser:
         "requires a typed confirmation)",
     )
     p_reset.set_defaults(func=cmd_factory_reset)
+
+    p_gui = sub.add_parser("gui", help="launch the desktop GUI (requires the gui extra)")
+    p_gui.set_defaults(func=cmd_gui)
 
     return parser
 

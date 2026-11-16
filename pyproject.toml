@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cleanix-cli"
-version = "1.3.0"
+version = "1.4.0"
 description = "A safe, thorough scheduled system cleaner for every *nix (Linux, macOS, BSD) and Windows."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -40,10 +40,15 @@ Repository = "https://github.com/CloudOpsWorld/cleanix-cli"
 Issues = "https://github.com/CloudOpsWorld/cleanix-cli/issues"
 
 [project.optional-dependencies]
+gui = ["PySide6>=6.6,<7"]
+gui-test = ["PySide6>=6.6,<7", "pytest-qt>=4.4"]
 dev = ["pytest>=9.1.1", "ruff>=0.15.21", "mypy>=2.3.0", "build>=1.5.1"]
 
 [project.scripts]
 cleanix = "cleanix.cli:main"
+
+[project.gui-scripts]
+cleanix-gui = "cleanix.gui.app:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
