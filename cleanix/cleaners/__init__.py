@@ -170,6 +170,14 @@ from cleanix.cleaners.windows_core import (
     WinTempCleaner,
     WinThumbnailCleaner,
 )
+from cleanix.cleaners.windows_system import (
+    WinComponentStoreCleaner,
+    WinPrefetchReporter,
+    WinSystemDumpsCleaner,
+    WinSystemTempCleaner,
+    WinUpdateCacheCleaner,
+    WindowsOldReporter,
+)
 
 ALL_CLEANERS: List[Type[Cleaner]] = [
     # Cross-platform user junk
@@ -289,6 +297,12 @@ ALL_CLEANERS: List[Type[Cleaner]] = [
     WinThumbnailCleaner,
     WinErrorReportingCleaner,
     WinRecycleBinCleaner,
+    WinSystemTempCleaner,
+    WinUpdateCacheCleaner,
+    WinSystemDumpsCleaner,
+    WinPrefetchReporter,
+    WindowsOldReporter,
+    WinComponentStoreCleaner,
     # BSD
     FreeBsdPkgCleaner,
     BsdDistfilesCleaner,
