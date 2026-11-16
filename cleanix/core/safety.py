@@ -195,6 +195,53 @@ def _protected_roots() -> set:
     return roots
 
 
+def _win_canonical_dir(path: str) -> str:
+    """realpath + 8.3 long-name expansion of a directory ("" on failure)."""
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        return ""
+    return _long_path(real) if os.name == "nt" else real
+
+
+def _windows_home_forms(homes) -> list:
+    """Each home in its raw spelling AND its canonical (junction-resolved,
+    long-name) spelling: the delete target is canonicalised, so a home reached
+    through a junction must be protected under its real path too."""
+    out = []
+    for h in homes:
+        raw = str(h)
+        if raw and raw not in out:
+            out.append(raw)
+        canon = _win_canonical_dir(raw) if raw else ""
+        if canon and canon not in out:
+            out.append(canon)
+    return out
+
+
+def _windows_profiles() -> list:
+    """Every directory directly under ``<SystemDrive>\\Users`` (raw and
+    canonical spellings), enumerated at call time; [] on any error."""
+    drives = []
+    for d in (safety_windows._env(os.environ, "SystemDrive"), "C:"):
+        if d.upper() not in (x.upper() for x in drives):
+            drives.append(d)
+    found = []
+    for drive in drives:
+        users = drive + "\\Users"
+        try:
+            with os.scandir(users) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False) or is_reparse_point(entry.path):
+                            found.append(entry.path)
+                    except OSError:
+                        found.append(entry.path)
+        except OSError:
+            continue
+    return _windows_home_forms(found)
+
+
 def _lstat(path: str):
     return os.lstat(path)
 
@@ -249,7 +296,8 @@ def assert_safe_to_delete(target: str | os.PathLike) -> Path:
 
     if _platform.is_windows():
         reason = safety_windows.violation(
-            str(resolved), os.environ, [str(h) for h in _home_dirs()]
+            str(resolved), os.environ, _windows_home_forms(_home_dirs()),
+            profiles=_windows_profiles(),
         )
         if reason:
             raise UnsafePathError(reason)
