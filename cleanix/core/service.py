@@ -30,6 +30,7 @@ class CleanSummary:
     freed: int = 0
     removed: int = 0
     errors: List[CleanOutcome] = field(default_factory=list)
+    cancelled: bool = False
 
 
 def scan(
@@ -40,6 +41,8 @@ def scan(
     progress: Optional[Callable[[str, int, int], None]] = None,
     cancel: CancelCB = None,
 ) -> ScanResult:
+    """Scan the selected cleaners. ``cancel`` must be thread-safe: the parallel
+    engine path calls it from worker threads."""
     safety.set_protected_globs(config.protected_globs)
     cleaners = build_cleaners(config, only=only, exclude=exclude)
     total = len(cleaners)
@@ -65,6 +68,8 @@ def clean(
     progress: Optional[Callable[[str, int, int], None]] = None,
     cancel: CancelCB = None,
 ) -> CleanSummary:
+    """Clean ``items``. ``cancel`` must be thread-safe: it may be called from
+    worker threads."""
     safety.set_protected_globs(config.protected_globs)
     items = list(items)
     total = len(items)
@@ -88,7 +93,7 @@ def clean(
 
     manifest: Optional[str] = None
     run_id: Optional[str] = None
-    if not dry_run:
+    if not dry_run and result.outcomes:
         history.record(result.freed, result.removed_count,
                        mode="quarantine" if quarantine else "delete")
         manifest = history.write_manifest(result) or None
@@ -103,4 +108,5 @@ def clean(
         freed=result.freed,
         removed=result.removed_count,
         errors=result.errors,
+        cancelled=bool(cancel is not None and cancel()),
     )
