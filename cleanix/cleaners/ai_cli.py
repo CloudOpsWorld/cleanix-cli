@@ -23,6 +23,7 @@ from typing import Iterable, List
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
+from cleanix.core.platform import ALL, WINDOWS
 from cleanix.core.utils import data_dir
 from cleanix.core.utils import (
     home,
@@ -37,6 +38,8 @@ class _AgentCleaner(Cleaner):
     """Shared helpers for AI-CLI cleaners."""
 
     requires_root = False
+    # Home-relative state dirs (~/.claude, ~/.codex, ...) work on Windows too.
+    platforms = (ALL, WINDOWS)
 
     def _ephemeral_children(
         self, directory: Path, label: str, guard_minutes: float | None = None

@@ -21,7 +21,7 @@ from typing import Iterable, Optional
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
-from cleanix.core.platform import ALL
+from cleanix.core.platform import ALL, WINDOWS
 from cleanix.core.utils import expand
 
 
@@ -34,7 +34,7 @@ class ProjectCruftCleaner(Cleaner):
     )
     requires_root = False
     # Developer cruft looks the same everywhere.
-    platforms = (ALL,)
+    platforms = (ALL, WINDOWS)
 
     # Directory names we treat as regenerable build/dependency output. Note
     # ``__pycache__`` is intentionally excluded — it is ubiquitous and noisy,

@@ -16,7 +16,7 @@ from typing import Iterable, List, Tuple
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
-from cleanix.core.platform import ALL
+from cleanix.core.platform import ALL, WINDOWS
 from cleanix.core.utils import (
     _allocated_bytes,
     home,
@@ -36,7 +36,7 @@ class BigFileReporter(Cleaner):
     name = "Large files"
     description = "Biggest files in your home directory (report only)"
     requires_root = False
-    platforms = (ALL,)
+    platforms = (ALL, WINDOWS)
 
     def find_items(self) -> Iterable[CleanableItem]:
         min_bytes = int(

@@ -144,13 +144,26 @@ def is_broken_symlink(path: str | os.PathLike) -> bool:
 _PRUNE_DIRS = {
     ".git", ".hg", ".svn", "node_modules", ".cache", "Library",
     ".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "Photos Library.photoslibrary",
+    "AppData",
 }
 
 
 def walk_pruned(root: str | os.PathLike, prune: Optional[set] = None):
     """os.walk a tree, skipping large/irrelevant subdirectories and errors."""
     prune = prune if prune is not None else _PRUNE_DIRS
+    # On Windows junctions are not symlinks, so os.path.islink misses them;
+    # skip every reparse point to avoid loops such as ``Application Data``.
+    from cleanix.core import platform as _plat
+
+    win = _plat.is_windows()
+    if win:
+        from cleanix.core import safety as _safety
     for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+        if win:
+            dirnames[:] = [
+                d for d in dirnames
+                if not _safety.is_reparse_point(os.path.join(dirpath, d))
+            ]
         dirnames[:] = [
             d
             for d in dirnames

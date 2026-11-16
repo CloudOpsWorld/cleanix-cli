@@ -739,6 +739,7 @@ def test_browser_profiles_only_stale_nondefault(tmp_path, monkeypatch):
     # Force the Linux/XDG layout so the test is deterministic on any host
     # (on macOS the cleaner scans ~/Library/Application Support instead).
     monkeypatch.setattr(bp, "is_macos", lambda: False)
+    monkeypatch.setattr(bp.platform, "is_windows", lambda: False)
     chrome = tmp_path / ".config" / "google-chrome"
     profile(chrome, "Default", 0)       # active
     profile(chrome, "Profile 1", 200)   # stale, orphaned

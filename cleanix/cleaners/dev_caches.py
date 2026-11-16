@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Iterable, List, Tuple
 
 from cleanix.cleaners.base import Cleaner
+from cleanix.core import platform, winenv
 from cleanix.core.models import CleanableItem
+from cleanix.core.platform import ALL, WINDOWS
 from cleanix.core.utils import home, path_size
 
 
@@ -20,9 +22,20 @@ class DevCacheCleaner(Cleaner):
     name = "Developer caches"
     description = "Regenerable caches for cargo, go, gradle, ccache, composer…"
     requires_root = False
+    platforms = (ALL, WINDOWS)
 
     def _candidates(self) -> Iterable[Tuple[Path, str]]:
         h = home()
+        if platform.is_windows():
+            # pip (local/pip/Cache) and npm (local/npm-cache) are owned by
+            # their dedicated cleaners; only offer the rest here.
+            local = winenv.local_appdata()
+            yield local / "go-build", "Go build cache"
+            yield local / "uv" / "cache", "uv (Python) cache"
+            yield h / ".cargo" / "registry" / "cache", "Cargo registry cache"
+            yield h / ".gradle" / "caches", "Gradle cache"
+            yield h / ".cache" / "pre-commit", "pre-commit hook cache"
+            return
         cache = h / ".cache"
         yield cache / "go-build", "Go build cache"
         yield h / ".cargo" / "registry" / "cache", "Cargo registry cache"

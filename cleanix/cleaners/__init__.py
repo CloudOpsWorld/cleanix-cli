@@ -178,6 +178,7 @@ from cleanix.cleaners.windows_system import (
     WinUpdateCacheCleaner,
     WindowsOldReporter,
 )
+from cleanix.cleaners.windows_wsl import WslDiskReporter
 from cleanix.cleaners.windows_apps import (
     WinBrowserCacheCleaner,
     WinPackageCacheCleaner,
@@ -313,6 +314,7 @@ ALL_CLEANERS: List[Type[Cleaner]] = [
     WinShaderCacheCleaner,
     WinPackageCacheCleaner,
     WinVisualStudioCleaner,
+    WslDiskReporter,
     # BSD
     FreeBsdPkgCleaner,
     BsdDistfilesCleaner,
