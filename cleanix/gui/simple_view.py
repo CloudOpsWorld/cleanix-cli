@@ -116,7 +116,7 @@ class CategoryCard(QFrame):
 
     def __init__(self, category: str, label: str, items: List[CleanableItem], *,
                  mode: str = "select", checked: bool = False,
-                 hint: Optional[str] = None,
+                 admin_blocked: bool = False,
                  parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.category = category
@@ -143,10 +143,17 @@ class CategoryCard(QFrame):
         outer.addLayout(row)
 
         self.hint_label: Optional[ElidedLabel] = None
-        hints = [i.hint for i in self.items if i.hint]
         if mode == "readonly":
-            text = hint or (hints[0] if hints else
-                            "Shown for review; not cleaned from Simple mode.")
+            # Each item contributes its own reason (distinct, in order).
+            reasons: List[str] = []
+            for i in self.items:
+                if i.requires_root and admin_blocked and not i.report_only:
+                    r = "Needs administrator permission"
+                else:
+                    r = i.hint or "Shown for review; not cleaned from Simple mode."
+                if r not in reasons:
+                    reasons.append(r)
+            text = "; ".join(reasons)
             self.hint_label = ElidedLabel(text)
             outer.addWidget(self.hint_label)
 
@@ -169,6 +176,7 @@ class ConfirmCleanDialog(QDialog):
         self._count = info.count
         self._size = info.size
         self._irreversible = info.irreversible
+        self._trash_items = info.trash_items
         self.summary_label = QLabel(
             f"Clean {info.count} item{'s' if info.count != 1 else ''} "
             f"({human_size(info.size)})?")
@@ -215,6 +223,11 @@ class ConfirmCleanDialog(QDialog):
                          + "this clean can be undone.")
         else:
             parts.append("The files will be deleted and this cannot be undone.")
+        t = self._trash_items
+        if t:
+            parts.append(
+                f"Including {t} item{'s' if t != 1 else ''} from Trash / Recycle Bin "
+                "which are removed permanently.")
         self.warning_label.setText(" ".join(parts))
 
     def keep_copy(self) -> bool:
@@ -488,12 +501,9 @@ class SimpleView(QWidget):
                 label = catalog.CATEGORIES[category]
                 if mode == "readonly":
                     label += " (review only)"
-                hint = None
-                if mode == "readonly" and not self._allow_admin and any(
-                        i.requires_root for i in items):
-                    hint = "Needs administrator permission"
                 card = CategoryCard(category, label, items, mode=mode,
-                                    checked=(mode == "select"), hint=hint)
+                                    checked=(mode == "select"),
+                                    admin_blocked=not self._allow_admin)
                 card.toggled.connect(self._refresh_clean_button)
                 self._cards.append(card)
                 (self._main_cards_layout if mode == "select" else self._also_layout

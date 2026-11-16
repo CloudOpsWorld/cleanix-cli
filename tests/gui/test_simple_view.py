@@ -318,6 +318,8 @@ def test_long_unicode_and_rtl_labels_are_elided_with_tooltip(qtbot):
         lbl = card.label_widget
         assert lbl.toolTip() == text and lbl.fullText() == text
         assert lbl.elidedText() != text
+        assert lbl.width() <= card.width()
+        assert card.rect().contains(lbl.geometry())
         assert card.minimumSizeHint().width() < 400
     lbl = ElidedLabel("short")
     qtbot.addWidget(lbl)
@@ -518,3 +520,42 @@ def test_late_cancel_with_uncancelled_summary_is_not_stopped_early(qtbot):
     v.cancel_clean_button.click()
     qtbot.waitUntil(lambda: v.state() is SimpleState.DONE, timeout=3000)
     assert "Stopped" not in v.done_label.text()
+
+
+def test_unticked_command_card_does_not_count_as_irreversible(qtbot):
+    infos = []
+    v = make_view(qtbot, confirm=lambda info: infos.append(info) or (False, True))
+    v.set_scan_result(result(item("temp", 10), cmd_item()))
+    v.clean_button.click()
+    assert infos[0].irreversible == 0 and infos[0].count == 1
+    d = ConfirmCleanDialog(infos[0])
+    qtbot.addWidget(d)
+    assert "cannot be undone" not in d.warning_label.text()
+
+
+def test_confirm_dialog_mentions_trash_items(qtbot):
+    d = ConfirmCleanDialog(ConfirmInfo(3, 10, trash_items=2))
+    qtbot.addWidget(d)
+    assert "2 items from Trash / Recycle Bin which are removed permanently" in (
+        d.warning_label.text())
+    infos = []
+    v = make_view(qtbot, confirm=lambda info: infos.append(info) or (False, True))
+    v.set_scan_result(result(item("temp", 10), item("trash", 5)))
+    v.also_found_toggle.setChecked(True)
+    next(c for c in v.cards() if c.category == "trash").checkbox.setChecked(True)
+    v.clean_button.click()
+    assert infos[0].trash_items == 1
+
+
+def test_readonly_card_shows_each_items_own_hint(qtbot):
+    v = make_view(qtbot)
+    v.set_scan_result(result(
+        item("temp", 1, report_only=True, hint="Review by hand"),
+        item("temp", 2, requires_root=True)))
+    card = next(c for c in v.cards() if c.mode == "readonly")
+    text = card.hint_label.fullText()
+    assert "Review by hand" in text and "Needs administrator permission" in text
+    # a report-only item that also needs root keeps its own report-only hint
+    v.set_scan_result(result(item("big_files", 1, report_only=True, requires_root=True,
+                                  hint="Delete manually")))
+    assert v.cards()[0].hint_label.fullText() == "Delete manually"
