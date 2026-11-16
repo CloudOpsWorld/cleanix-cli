@@ -52,6 +52,13 @@ class CleanableItem:
             raise ValueError("COMMAND item requires a command")
 
 
+def item_key(item: CleanableItem) -> str:
+    """A stable, unique key for an item (used by UIs to track selection)."""
+    if item.kind is ItemKind.COMMAND:
+        return f"{item.cleaner_id}|cmd|" + "".join(item.command or [])
+    return f"{item.cleaner_id}|path|{item.path}"
+
+
 @dataclass
 class CleanerReport:
     """The result of scanning with a single cleaner."""

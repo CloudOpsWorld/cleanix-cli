@@ -24,6 +24,7 @@ from cleanix.core import platform as plat
 from cleanix.core.utils import is_root, path_size, run_command
 
 ProgressCB = Optional[Callable[[str], None]]
+CancelCB = Optional[Callable[[], bool]]
 
 
 class Engine:
@@ -31,29 +32,61 @@ class Engine:
         self.cleaners = list(cleaners)
 
     # -- scanning ------------------------------------------------------------
-    def scan(self, progress: ProgressCB = None, parallel: bool = True) -> ScanResult:
+    def scan(
+        self,
+        progress: ProgressCB = None,
+        parallel: bool = True,
+        cancel: CancelCB = None,
+    ) -> ScanResult:
         """Scan all cleaners. Cleaners are I/O-bound (directory walks, external
-        commands), so running them on a thread pool is a large speed-up."""
+        commands), so running them on a thread pool is a large speed-up.
+
+        ``cancel`` (optional) is polled between cleaners; once it returns true
+        no further cleaner is started and the partial result is returned.
+        """
         n = len(self.cleaners)
         if not parallel or n <= 1:
             reports: List[CleanerReport] = []
             for cleaner in self.cleaners:
+                if cancel is not None and cancel():
+                    break
                 reports.append(cleaner.scan())
                 if progress:
                     progress(cleaner.name)
             return ScanResult(reports=reports)
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
         results: List[Optional[CleanerReport]] = [None] * n
         workers = min(16, n)
+
+        def run(idx: int) -> Optional[CleanerReport]:
+            if cancel is not None and cancel():
+                return None
+            return self.cleaners[idx].scan()
+
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(c.scan): i for i, c in enumerate(self.cleaners)}
-            for fut in as_completed(futures):
-                idx = futures[fut]
-                results[idx] = fut.result()
-                if progress:
-                    progress(self.cleaners[idx].name)
+            pending = {}
+            next_idx = 0
+            while next_idx < n or pending:
+                # Keep at most ``workers`` in flight so a cancel stops new work.
+                while next_idx < n and len(pending) < workers:
+                    if cancel is not None and cancel():
+                        next_idx = n
+                        break
+                    pending[pool.submit(run, next_idx)] = next_idx
+                    next_idx += 1
+                if not pending:
+                    break
+                done, _ = wait(list(pending), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    idx = pending.pop(fut)
+                    report = fut.result()
+                    if report is None:
+                        continue
+                    results[idx] = report
+                    if progress:
+                        progress(self.cleaners[idx].name)
         return ScanResult(reports=[r for r in results if r is not None])
 
     # -- cleaning ------------------------------------------------------------
@@ -65,6 +98,7 @@ class Engine:
         allow_root_items: Optional[bool] = None,
         progress: ProgressCB = None,
         quarantine=None,
+        cancel: CancelCB = None,
     ) -> CleanResult:
         """Remove (or simulate removing) the given items.
 
@@ -78,6 +112,8 @@ class Engine:
 
         result = CleanResult(dry_run=dry_run)
         for item in items:
+            if cancel is not None and cancel():
+                break
             if progress:
                 progress(item.description)
             result.outcomes.append(
