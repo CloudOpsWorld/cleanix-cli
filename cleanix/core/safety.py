@@ -73,7 +73,53 @@ def _canonical(p: str | os.PathLike) -> Path:
         parent = Path(os.path.realpath(str(raw.parent)))
     except OSError:
         parent = raw.parent
-    return parent / raw.name if raw.name else parent
+    if os.name != "nt":
+        return parent / raw.name if raw.name else parent
+    # Windows: expand 8.3 short names (DOCUME~1) so neither the built-in guard
+    # nor user globs can be bypassed by a short spelling.
+    parent = Path(_long_path(str(parent)))
+    if not raw.name:
+        return parent
+    cand = parent / raw.name
+    try:
+        is_link = _is_link_strict(str(cand))
+    except OSError:
+        return cand                      # cannot tell: keep literal, never follow
+    if is_link:
+        return cand                      # never expand through a link
+    expanded = _long_path(str(cand))     # no-op if it does not exist
+    return Path(expanded)
+
+
+_EXT = "\\\\?\\"  # extended-length path prefix
+
+
+def _long_path(path: str) -> str:
+    """GetLongPathNameW expansion; returns ``path`` unchanged on any failure."""
+    try:
+        import ctypes
+
+        fn = ctypes.windll.kernel32.GetLongPathNameW
+        fn.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+        fn.restype = ctypes.c_uint
+        src = path
+        if not src.startswith(_EXT):
+            src = _EXT + src
+        size = 1024
+        for _ in range(2):
+            buf = ctypes.create_unicode_buffer(size)
+            n = fn(src, buf, size)
+            if n == 0:
+                return path
+            if n < size:
+                out = buf.value
+                if out.startswith(_EXT) and not out.startswith(_EXT + "UNC"):
+                    out = out[4:]
+                return out
+            size = n + 1
+    except Exception:  # noqa: BLE001
+        pass
+    return path
 
 
 # Absolute paths that must never be deleted, nor have their *contents* wiped as
@@ -133,6 +179,26 @@ def _protected_roots() -> set:
         for rel in _HOME_PROTECTED:
             roots.add(home_path / rel)
     return roots
+
+
+def _lstat(path: str):
+    return os.lstat(path)
+
+
+def _entry_stat(entry):
+    return entry.stat(follow_symlinks=False)
+
+
+def _is_link_strict(path: str) -> bool:
+    """Like is_reparse_point but fails closed: raises OSError if undeterminable.
+
+    A missing path is simply not a link (False).
+    """
+    try:
+        st = _lstat(path)
+    except FileNotFoundError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)         if os.name == "nt" else stat.S_ISLNK(st.st_mode)
 
 
 def is_reparse_point(path: str | os.PathLike) -> bool:
@@ -240,9 +306,11 @@ def _win_rmtree(path: str) -> None:
     with os.scandir(path) as it:
         entries = list(it)
     for entry in entries:
-        if is_reparse_point(entry.path):
+        # Fail closed: if the reparse state is unknown, raise and never recurse.
+        attrs = _entry_stat(entry).st_file_attributes
+        if attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
             _remove_link(entry.path)
-        elif entry.is_dir(follow_symlinks=False):
+        elif attrs & stat.FILE_ATTRIBUTE_DIRECTORY:
             _win_rmtree(entry.path)
         else:
             _win_unlink(entry.path)
@@ -256,7 +324,7 @@ def safe_unlink(target: str | os.PathLike) -> None:
     """
     resolved = _canonical(target)
     assert_safe_to_delete(resolved)
-    if is_reparse_point(resolved):
+    if _is_link_strict(str(resolved)):
         _remove_link(str(resolved))
         return
     if resolved.is_dir():
@@ -283,7 +351,7 @@ def safe_rmtree(target: str | os.PathLike) -> None:
     resolved = _canonical(target)
     assert_safe_to_delete(resolved)
     path = str(resolved)
-    if is_reparse_point(path):
+    if _is_link_strict(path):
         _remove_link(path)
     elif os.name == "nt":
         if resolved.is_dir():
