@@ -41,6 +41,9 @@ class CleanableItem:
     # review and remove deliberately. ``hint`` explains how to remove manually.
     report_only: bool = False
     hint: Optional[str] = None
+    # COMMAND items only: seconds before the command is killed. ``None`` keeps
+    # run_command's default (120 s); long jobs such as DISM set their own.
+    timeout: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.kind is ItemKind.PATH and not self.path:

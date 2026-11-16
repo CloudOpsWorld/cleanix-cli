@@ -136,8 +136,9 @@ class Cleaner(abc.ABC):
         *,
         size: int = 0,
         requires_root: Optional[bool] = None,
+        timeout: Optional[int] = None,
     ) -> CleanableItem:
-        """Build a COMMAND item."""
+        """Build a COMMAND item (``timeout`` in seconds; None = default)."""
         return CleanableItem(
             cleaner_id=self.id,
             description=description,
@@ -147,6 +148,7 @@ class Cleaner(abc.ABC):
             requires_root=self.requires_root
             if requires_root is None
             else requires_root,
+            timeout=timeout,
         )
 
     # -- engine entry point --------------------------------------------------

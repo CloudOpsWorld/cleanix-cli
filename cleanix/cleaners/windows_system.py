@@ -16,6 +16,8 @@ from cleanix.core.models import CleanableItem
 from cleanix.core.platform import WINDOWS
 from cleanix.core.utils import iter_children, modified_within, older_than, which
 
+DISM_TIMEOUT = 3600  # seconds
+
 
 class WinSystemTempCleaner(Cleaner):
     id = "win_system_temp"
@@ -141,4 +143,6 @@ class WinComponentStoreCleaner(Cleaner):
             ["Dism.exe", "/Online", "/Cleanup-Image", "/StartComponentCleanup"],
             "Clean up the Windows component store (DISM)",
             size=0,
+            # StartComponentCleanup routinely takes 5-30 minutes.
+            timeout=DISM_TIMEOUT,
         )

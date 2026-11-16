@@ -150,7 +150,12 @@ class Engine:
             return CleanOutcome(
                 item=item, removed=False, freed=item.size, dry_run=True
             )
-        code, _out, err = run_command(list(item.command or []))
+        if item.timeout is None:
+            code, _out, err = run_command(list(item.command or []))
+        else:
+            code, _out, err = run_command(
+                list(item.command or []), timeout=item.timeout
+            )
         if code != 0:
             return CleanOutcome(
                 item=item,
