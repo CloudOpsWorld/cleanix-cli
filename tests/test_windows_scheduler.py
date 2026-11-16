@@ -74,6 +74,7 @@ def _record(monkeypatch, code=0, stdout="", stderr=""):
 
 
 def test_install_calls_schtasks(monkeypatch, tmp_path):
+    monkeypatch.setattr(schtasks.shutil, "which", lambda n: EXE)
     monkeypatch.setattr(schtasks.history, "state_dir", lambda: tmp_path)
     calls = _record(monkeypatch)
     msg = schtasks.install("daily")
@@ -84,6 +85,7 @@ def test_install_calls_schtasks(monkeypatch, tmp_path):
 
 
 def test_install_failure_raises_with_stderr(monkeypatch, tmp_path):
+    monkeypatch.setattr(schtasks.shutil, "which", lambda n: EXE)
     monkeypatch.setattr(schtasks.history, "state_dir", lambda: tmp_path)
     _record(monkeypatch, code=1, stderr="ERROR: Access is denied.")
     with pytest.raises(RuntimeError, match="Access is denied"):
@@ -102,3 +104,42 @@ def test_uninstall_and_status_when_present(monkeypatch):
     _record(monkeypatch, code=0)
     assert "installed (Task Scheduler)" in schtasks.status()
     assert "Removed" in schtasks.uninstall()
+
+
+def test_cleanix_exe_falls_back_to_python_module(monkeypatch, tmp_path):
+    import sys
+
+    monkeypatch.setattr(schtasks.shutil, "which", lambda n: None)
+    assert schtasks._cleanix_exe() == (sys.executable, True)
+    monkeypatch.setattr(schtasks.shutil, "which", lambda n: r"C:\x\cleanix.exe")
+    assert schtasks._cleanix_exe() == (r"C:\x\cleanix.exe", False)
+
+    monkeypatch.setattr(schtasks.shutil, "which", lambda n: None)
+    monkeypatch.setattr(schtasks.history, "state_dir", lambda: tmp_path)
+    fake_py = r"C:\Py\python.exe"
+    monkeypatch.setattr(schtasks.sys, "executable", fake_py)
+    calls = _record(monkeypatch)
+    schtasks.install("daily")
+    tr = _arg_after(calls[0], "/TR")
+    assert tr == (
+        f'"{fake_py}" -m cleanix scan --json --output '
+        f'"{tmp_path / "last-scan.json"}"'
+    )
+
+
+def test_module_fallback_still_length_guarded():
+    long_py = "C:\\" + "a" * 300 + r"\python.exe"
+    with pytest.raises(ValueError, match="261"):
+        schtasks.build_create_args("daily", long_py, REPORT, as_module=True)
+
+
+def test_subprocess_decodes_with_errors_replace(monkeypatch):
+    seen = []
+
+    def fake_run(argv, *a, **k):
+        seen.append(k)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    schtasks.status()
+    assert seen[0]["errors"] == "replace" and seen[0]["text"] is True

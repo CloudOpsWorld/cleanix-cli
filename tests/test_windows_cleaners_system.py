@@ -112,7 +112,7 @@ def test_windows_old_path_uses_system_drive(fake_win, monkeypatch):
     _mk(drive / "Windows.old" / "f")
     monkeypatch.setattr(winenv, "system_drive", lambda: str(drive))
     (item,) = WindowsOldReporter(Config()).find_items()
-    assert item.path == str(drive) + "\Windows.old"
+    assert item.path == str(drive) + r"\Windows.old"
 
 
 def test_component_store_is_opt_in(fake_win, monkeypatch):
@@ -120,7 +120,7 @@ def test_component_store_is_opt_in(fake_win, monkeypatch):
     monkeypatch.setattr(ws, "which", lambda name: None)
     reason = WinComponentStoreCleaner(Config()).available()
     assert isinstance(reason, str) and reason
-    monkeypatch.setattr(ws, "which", lambda name: "C:\Windows\System32\Dism.exe")
+    monkeypatch.setattr(ws, "which", lambda name: r"C:\Windows\System32\Dism.exe")
     assert WinComponentStoreCleaner(Config()).available() is None
     (item,) = WinComponentStoreCleaner(Config()).find_items()
     assert item.kind is ItemKind.COMMAND

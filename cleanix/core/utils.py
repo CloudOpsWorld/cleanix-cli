@@ -144,12 +144,12 @@ def is_broken_symlink(path: str | os.PathLike) -> bool:
 _PRUNE_DIRS = {
     ".git", ".hg", ".svn", "node_modules", ".cache", "Library",
     ".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "Photos Library.photoslibrary",
-    "AppData",
 }
 
 
 def walk_pruned(root: str | os.PathLike, prune: Optional[set] = None):
     """os.walk a tree, skipping large/irrelevant subdirectories and errors."""
+    default_prune = prune is None
     prune = prune if prune is not None else _PRUNE_DIRS
     # On Windows junctions are not symlinks, so os.path.islink misses them;
     # skip every reparse point to avoid loops such as ``Application Data``.
@@ -158,6 +158,11 @@ def walk_pruned(root: str | os.PathLike, prune: Optional[set] = None):
     win = _plat.is_windows()
     if win:
         from cleanix.core import safety as _safety
+
+        if default_prune:
+            # Windows-only: AppData holds app state, not user files. Kept out
+            # of _PRUNE_DIRS so POSIX walks (e.g. a Wine prefix) are unchanged.
+            prune = prune | {"AppData"}
     for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
         if win:
             dirnames[:] = [

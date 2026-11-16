@@ -129,7 +129,14 @@ def test_ai_cleaners_work_on_windows(fake_win, monkeypatch):
     assert str(f) in paths
     (fake_win.home / ".codex" / "log").mkdir(parents=True)
     assert CodexCleaner(Config()).supported()
-    list(CodexCleaner(Config()).find_items())
+    sess = fake_win.home / ".codex" / "sessions" / "2025" / "01" / "01"
+    sess.mkdir(parents=True)
+    rollout = sess / "rollout-1.jsonl"
+    rollout.write_bytes(b"x" * 64)
+    t = rollout.stat().st_mtime - 90 * 86400
+    os.utime(rollout, (t, t))
+    codex = {str(i.path) for i in CodexCleaner(Config()).find_items()}
+    assert str(rollout) in codex
 
 
 def test_walk_pruned_skips_appdata(fake_win):
@@ -200,3 +207,169 @@ def test_browser_profiles_windows_roots(fake_win, monkeypatch):
     paths = {str(i.path) for i in BrowserProfileReporter(Config()).find_items()}
     assert str(prof) in paths and str(ff) in paths
     assert str(active) not in paths
+
+
+def test_walk_pruned_appdata_windows_only(tmp_path, monkeypatch):
+    (tmp_path / "AppData").mkdir()
+    (tmp_path / "AppData" / "in.bin").write_bytes(b"x")
+    (tmp_path / "keep.bin").write_bytes(b"x")
+
+    monkeypatch.setattr(platform, "is_windows", lambda: False)
+    seen = {n for _d, _dn, fn in walk_pruned(tmp_path) for n in fn}
+    assert seen == {"in.bin", "keep.bin"}
+
+    monkeypatch.setattr(platform, "is_windows", lambda: True)
+    seen = {n for _d, _dn, fn in walk_pruned(tmp_path) for n in fn}
+    assert seen == {"keep.bin"}
+    # A caller-supplied prune set is honoured verbatim (no implicit AppData).
+    seen = {n for _d, _dn, fn in walk_pruned(tmp_path, prune={"x"}) for n in fn}
+    assert seen == {"in.bin", "keep.bin"}
+
+
+def test_project_cruft_skips_junctions_on_windows(tmp_path, monkeypatch):
+    from cleanix.core import safety
+
+    proj = tmp_path / "proj"
+    (proj / "junc" / "node_modules").mkdir(parents=True)
+    (proj / "junc" / "node_modules" / "f").write_bytes(b"x")
+    (proj / "real" / "node_modules").mkdir(parents=True)
+    (proj / "real" / "node_modules" / "f").write_bytes(b"x")
+    old = 1_000_000_000
+    for d in (proj, proj / "junc", proj / "real",
+              proj / "junc" / "node_modules", proj / "real" / "node_modules"):
+        os.utime(d, (old, old))
+    cfg = Config()
+    cfg.project_scan_dirs = [str(proj)]
+    monkeypatch.setattr(
+        safety, "is_reparse_point", lambda p: os.path.basename(str(p)) == "junc"
+    )
+
+    def paths():
+        return {str(i.path) for i in ProjectCruftCleaner(cfg).find_items()}
+
+    monkeypatch.setattr(platform, "is_windows", lambda: True)
+    assert paths() == {str(proj / "real" / "node_modules")}
+    monkeypatch.setattr(platform, "is_windows", lambda: False)
+    assert str(proj / "junc" / "node_modules") in paths()
+
+
+def _age(*paths, days=400):
+    for p in paths:
+        t = p.stat().st_mtime - days * 86400
+        os.utime(p, (t, t))
+
+
+def _put(path, data=b"x" * 64, days=400):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    _age(path, days=days)
+    return path
+
+
+def _setup_ollama(w, cfg):
+    models = w.home / ".ollama" / "models"
+    (models / "manifests" / "reg" / "lib" / "m").mkdir(parents=True)
+    (models / "manifests" / "reg" / "lib" / "m" / "latest").write_text(
+        '{"config": {"digest": "sha256:aaa"}, "layers": []}'
+    )
+    _put(models / "blobs" / "sha256-aaa")
+    return [str(_put(models / "blobs" / "sha256-dangling")),
+            str(_put(w.home / ".ollama" / "logs" / "server.log"))]
+
+
+def _setup_hf(w, cfg):
+    return [str(_put(
+        w.home / ".cache" / "huggingface" / "hub" / "models--x" / "blobs" /
+        "abc.incomplete"
+    ))]
+
+
+def _setup_compile_cache(w, cfg):
+    _put(w.home / ".triton" / "cache" / "k.bin")
+    return [str(w.home / ".triton" / "cache")]
+
+
+def _setup_ai_client(w, cfg):
+    _put(w.home / ".continue" / "logs" / "core.log")
+    return [str(w.home / ".continue" / "logs")]
+
+
+def _setup_aider(w, cfg):
+    return [str(_put(w.home / "proj" / ".aider.chat.history.md"))]
+
+
+def _setup_gemini(w, cfg):
+    d = _put(w.home / ".gemini" / "tmp" / "hash1" / "logs.json").parent
+    _age(d)
+    return [str(d)]
+
+
+def _setup_opencode(w, cfg):
+    return [str(_put(w.home / ".local" / "share" / "opencode" / "log" / "a.log"))]
+
+
+def _setup_big(w, cfg):
+    cfg.big_file_min_size_mb = 0.0001
+    return [str(_put(w.home / "vids" / "big.bin", b"b" * 4096))]
+
+
+def _setup_downloads(w, cfg):
+    cfg.downloads_min_size_mb = 0.0001
+    return [str(_put(w.home / "Downloads" / "setup.exe", b"d" * 4096))]
+
+
+def _setup_duplicates(w, cfg):
+    cfg.dup_min_size_mb = 0.0001
+    a = _put(w.home / "a" / "same.bin", b"s" * 4096)
+    _put(w.home / "b" / "same.bin", b"s" * 4096)
+    return [str(a)]  # representative is the sorted-first copy
+
+
+def _setup_project_cruft(w, cfg):
+    proj = w.home / "Projects" / "app"
+    nm = proj / "node_modules"
+    _put(nm / "m.js")
+    _put(proj / "src.js")
+    _age(nm, proj)
+    return [str(nm)]
+
+
+WIN_OFFERS = [
+    (OllamaCleaner, _setup_ollama),
+    (HuggingFaceCleaner, _setup_hf),
+    (AICompileCacheCleaner, _setup_compile_cache),
+    (AIClientCleaner, _setup_ai_client),
+    (AiderLitterCleaner, _setup_aider),
+    (GeminiCliCleaner, _setup_gemini),
+    (OpenCodeCleaner, _setup_opencode),
+    (BigFileReporter, _setup_big),
+    (DownloadsReporter, _setup_downloads),
+    (DuplicateFileReporter, _setup_duplicates),
+    (ProjectCruftCleaner, _setup_project_cruft),
+]
+
+
+@pytest.mark.parametrize(
+    "cls,setup", WIN_OFFERS, ids=[c.__name__ for c, _ in WIN_OFFERS]
+)
+def test_opted_in_cleaner_offers_home_relative_items_on_windows(
+    fake_win, monkeypatch, cls, setup
+):
+    _win(monkeypatch)
+    for var in ("OLLAMA_MODELS", "HF_HOME", "CODEX_HOME", "XDG_DATA_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    cfg = Config()
+    expected = setup(fake_win, cfg)
+    offered = {str(i.path) for i in cls(cfg).find_items()}
+    for path in expected:
+        assert path in offered, (cls.__name__, path, offered)
+    # Items must not leak into the AppData tree.
+    appdata = str(fake_win.home / "AppData")
+    assert not any(p.startswith(appdata) for p in offered)
+
+
+def test_docker_has_no_offline_path_on_windows(monkeypatch):
+    # DockerCleaner is command-driven (needs the docker binary), so only its
+    # platform opt-in can be checked offline.
+    _win(monkeypatch)
+    assert supports(DockerCleaner.platforms) is True

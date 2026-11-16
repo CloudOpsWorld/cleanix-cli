@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from typing import List, Tuple
 
 from cleanix.core import history
@@ -27,11 +28,21 @@ FREQUENCIES = {
 }
 
 
-def _cleanix_exe() -> str:
-    return shutil.which("cleanix") or "cleanix"
+def _cleanix_exe() -> Tuple[str, bool]:
+    """Return ``(path, as_module)``.
+
+    Falls back to ``sys.executable`` run as ``-m cleanix`` when no ``cleanix``
+    is on PATH, so the task does not depend on PATH at run time.
+    """
+    exe = shutil.which("cleanix")
+    if exe:
+        return exe, False
+    return sys.executable, True
 
 
-def build_create_args(frequency: str, exe: str, report_file: str) -> List[str]:
+def build_create_args(
+    frequency: str, exe: str, report_file: str, as_module: bool = False
+) -> List[str]:
     spec = FREQUENCIES.get(frequency)
     if spec is None:
         raise ValueError(
@@ -39,7 +50,8 @@ def build_create_args(frequency: str, exe: str, report_file: str) -> List[str]:
             f"{', '.join(FREQUENCIES)}"
         )
     sc, extra = spec
-    command = f'"{exe}" scan --json --output "{report_file}"'
+    prefix = f'"{exe}" -m cleanix' if as_module else f'"{exe}"'
+    command = f'{prefix} scan --json --output "{report_file}"'
     if len(command) > MAX_TR_LEN:
         raise ValueError(
             f"scheduled command is {len(command)} characters; Task Scheduler "
@@ -54,7 +66,7 @@ def build_create_args(frequency: str, exe: str, report_file: str) -> List[str]:
 def _run(argv: List[str]) -> Tuple[int, str, str]:
     try:
         proc = subprocess.run(
-            argv, capture_output=True, text=True, check=False
+            argv, capture_output=True, text=True, errors="replace", check=False
         )
     except FileNotFoundError:
         return 127, "", "schtasks not found"
@@ -64,7 +76,8 @@ def _run(argv: List[str]) -> Tuple[int, str, str]:
 def install(frequency: str = "weekly") -> str:
     state = history.state_dir()
     report_file = state / "last-scan.json"
-    args = build_create_args(frequency, _cleanix_exe(), str(report_file))
+    exe, as_module = _cleanix_exe()
+    args = build_create_args(frequency, exe, str(report_file), as_module)
     state.mkdir(parents=True, exist_ok=True)
     code, out, err = _run(args)
     if code != 0:

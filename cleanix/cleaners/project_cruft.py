@@ -21,6 +21,7 @@ from typing import Iterable, Optional
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
+from cleanix.core import platform
 from cleanix.core.platform import ALL, WINDOWS
 from cleanix.core.utils import expand
 
@@ -89,6 +90,9 @@ class ProjectCruftCleaner(Cleaner):
     ) -> Iterable[CleanableItem]:
         root_str = str(root)
         base_depth = root_str.rstrip(os.sep).count(os.sep)
+        win = platform.is_windows()
+        if win:
+            from cleanix.core import safety
 
         for dirpath, dirs, _files in os.walk(
             root_str, onerror=lambda _e: None, followlinks=False
@@ -140,6 +144,8 @@ class ProjectCruftCleaner(Cleaner):
                     if os.path.islink(os.path.join(dirpath, d)):
                         continue
                 except OSError:
+                    continue
+                if win and safety.is_reparse_point(os.path.join(dirpath, d)):
                     continue
                 pruned.append(d)
             dirs[:] = pruned
