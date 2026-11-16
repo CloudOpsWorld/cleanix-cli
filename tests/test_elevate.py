@@ -82,6 +82,15 @@ def env(tmp_path, monkeypatch):
         monkeypatch.setenv(var, str(home / sub) if sub else str(home))
     monkeypatch.setattr(engine, "is_root", lambda: True)
     monkeypatch.delenv("PKEXEC_UID", raising=False)
+    # Fake cleaner ids the helper accepts on every platform (the real
+    # allowlist is platform-dependent and tested separately).
+    monkeypatch.setattr(elevated, "admin_cleaner_ids",
+                        lambda: frozenset({"logs", "temp", "journal"}))
+    # tmp_path lives under directories owned by the test runner, which the
+    # real parent-chain policy rightly distrusts; the OWNER/GROUP part of the
+    # policy is unit-tested separately, symlink and mode checks stay real.
+    monkeypatch.setattr(elevated, "_trusted_owner", lambda st, uid: True)
+    monkeypatch.setattr(elevated, "_untrusted_group", lambda st, groups: False)
 
     cleaners = []
     built = []
@@ -731,13 +740,40 @@ def test_planted_state_symlink_is_never_followed(env):
 # --------------------------------------------------------------------------
 # C2 / I3: allowlist and requires_root relative to the requesting user
 # --------------------------------------------------------------------------
-def test_allowlist_contains_system_cleaners_and_temp_only():
-    from cleanix.core import catalog
+_NEVER_ADMIN = {"user_cache", "broken_symlinks", "docker", "podman", "nerdctl",
+                "flatpak", "nix_gc", "homebrew", "memory", "swap", "memory_macos"}
+
+
+def test_allowlist_rules_hold_for_this_platform():
+    from cleanix.config import Config
+    from cleanix.core import catalog, registry
+    from cleanix.core import platform as plat
 
     ids = elevated.admin_cleaner_ids()
-    assert "temp" in ids and "logs" in ids and "journal" in ids
-    assert "user_cache" not in ids and "broken_symlinks" not in ids
-    assert all(catalog.category_of(i) == "system" for i in ids - {"temp"})
+    assert ids and not ids & _NEVER_ADMIN
+    by_id = {c.id: c for c in registry.ALL_CLEANERS}
+    for cid in ids:
+        cls = by_id[cid]
+        inst = cls(Config())
+        assert inst.supported()
+        assert catalog.category_of(cid) == "system" or cid == "temp"
+        assert cls.requires_root or cid in elevated.PER_ITEM_ROOT_IDS
+        assert inst.default_enabled or cid in elevated.EXPLICIT_ADMIN_IDS
+        assert cid.startswith("win_") == plat.is_windows()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows allowlist")
+def test_allowlist_on_windows():
+    ids = elevated.admin_cleaner_ids()
+    assert {"win_system_temp", "win_component_store"} <= ids
+    assert "temp" not in ids and "logs" not in ids
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux allowlist")
+def test_allowlist_on_linux():
+    ids = elevated.admin_cleaner_ids()
+    assert {"temp", "logs", "journal", "crash_spool", "apt"} <= ids
+    assert "win_component_store" not in ids
 
 
 def test_root_item_from_non_allowlisted_cleaner_is_refused_and_never_scanned(env):
@@ -772,7 +808,7 @@ def test_non_allowlisted_item_in_scan_is_refused_even_if_flagged_root(env):
 ])
 def test_eligibility_rule(cid, root, report_only, ok):
     item = _item("/x/y", cid=cid, root=root, report_only=report_only)
-    assert elevated._eligible(item, elevated.admin_cleaner_ids()) is ok
+    assert elevated._eligible(item, frozenset({"logs", "temp"})) is ok
 
 
 def test_user_owned_temp_entry_is_not_eligible(env):
@@ -820,13 +856,32 @@ def test_posix_environment_is_sanitized(monkeypatch):
     for k, v in {"PATH": "/evil", "PYTHONPATH": "/evil", "PYTHONHOME": "/x",
                  "PYTHONSTARTUP": "/x", "LD_PRELOAD": "/evil.so",
                  "LD_LIBRARY_PATH": "/evil", "DYLD_INSERT_LIBRARIES": "/x",
-                 "BASH_ENV": "/x", "IFS": "x"}.items():
+                 "BASH_ENV": "/x", "IFS": "x", "HOME": "/home/evil",
+                 "XDG_CONFIG_HOME": "/x", "APT_CONFIG": "/x", "DOCKER_HOST": "x",
+                 "GIT_DIR": "/x", "DPKG_ROOT": "/x", "PAGER": "x",
+                 "SOMETHING_NEW": "x", "LANG": "C.UTF-8", "LC_ALL": "C"}.items():
         monkeypatch.setenv(k, v)
     elevated._sanitize_environment()
+    # built from an allowlist: only locale variables survive, PATH is fixed
+    keys = {k.upper() for k in os.environ}
+    assert keys <= {"PATH", "LANG", "LC_ALL", "LANGUAGE", "PKEXEC_UID"} | {
+        k for k in keys if k.startswith("LC_")}
     assert os.environ["PATH"] == "/usr/sbin:/usr/bin:/sbin:/bin"
-    for k in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "LD_PRELOAD",
-              "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "IFS"):
-        assert k not in os.environ
+    assert os.environ["LANG"] == "C.UTF-8"
+
+
+def test_trusted_environment_is_an_allowlist():
+    src = {"PATH": "/evil", "HOME": "/h", "LANG": "C", "LC_TIME": "C", "X": "1",
+           "PKEXEC_UID": "1000", "PYTHONPATH": "/e"}
+    assert elevated._trusted_environment(src, True) == {
+        "PATH": elevated.POSIX_PATH, "LANG": "C", "LC_TIME": "C", "PKEXEC_UID": "1000"}
+    win = elevated._trusted_environment(
+        {"USERNAME": "u", "USERPROFILE": r"C:\Users\u", "ComSpec": r"C:\evil.exe",
+         "TEMP": r"C:\evil", "PSModulePath": r"C:\evil"}, False,
+        (r"C:\Windows", r"C:\Windows\System32", r"C:\ProgramData"))
+    assert win["ComSpec"] == r"C:\Windows\System32\cmd.exe"
+    assert win["TEMP"] == win["TMP"] == r"C:\Windows\Temp"
+    assert win["USERNAME"] == "u" and "PSModulePath" not in win
 
 
 def test_windows_environment_comes_from_api(monkeypatch):
@@ -843,6 +898,8 @@ def test_windows_environment_comes_from_api(monkeypatch):
     assert env_["systemdrive"] == "D:" and env_["programdata"] == r"D:\PD"
     assert env_["path"].split(";")[0] == r"D:\Win\System32"
     assert "evil" not in env_["path"] and "pythonpath" not in env_
+    assert env_["comspec"] == r"D:\Win\System32\cmd.exe"
+    assert env_["temp"] == r"D:\Win\Temp"
 
 
 def test_windows_api_failure_refuses_run(env, monkeypatch):
@@ -1015,3 +1072,279 @@ def test_config_check_does_not_allow_root_owner():
     st = SimpleNamespace(st_uid=0, st_mode=0o100644)
     with pytest.raises(ValueError):
         elevate._check_secure(st, FAKE_UID, "config")
+
+
+# --------------------------------------------------------------------------
+# N1: planted symlinks / untrusted parent directories
+# --------------------------------------------------------------------------
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks/modes")
+
+
+def _stand_in_etc(env):
+    etc = env.tmp / "etc"
+    shadow = _file(etc, "shadow", b"secret")
+    sudoers = _file(etc / "sudoers.d", "x", b"secret")
+    return etc, shadow, sudoers
+
+
+@posix_only
+def test_crash_spool_cleaner_ignores_symlinked_base(env, monkeypatch):
+    """Cleaner layer: /var/tmp/abrt planted as a symlink to /etc yields nothing."""
+    from cleanix.cleaners import sys_extras
+    from cleanix.config import Config
+
+    etc, _shadow, _ = _stand_in_etc(env)
+    var_tmp = env.tmp / "var_tmp"
+    var_tmp.mkdir()
+    (var_tmp / "abrt").symlink_to(etc)
+    monkeypatch.setattr(sys_extras, "older_than", lambda p, d: True)
+    cleaner = sys_extras.CrashSpoolCleaner(Config())
+    monkeypatch.setattr(cleaner, "BASES", (str(var_tmp / "abrt"),))
+    assert list(cleaner.find_items()) == []
+
+
+@posix_only
+def test_trusted_system_dir_requires_real_root_owned_dir(env):
+    from cleanix.core.utils import is_trusted_system_dir
+
+    assert is_trusted_system_dir("/")
+    real = env.tmp / "real"
+    real.mkdir()
+    link = env.tmp / "link"
+    link.symlink_to("/")
+    assert not is_trusted_system_dir(link)          # a symlink, even to /
+    assert is_trusted_system_dir(real) is (os.getuid() == 0)  # not root-owned
+
+
+@posix_only
+def test_helper_refuses_items_under_symlinked_base(env):
+    """Helper layer: even if a cleaner lists a symlinked base, nothing is deleted."""
+    etc, shadow, sudoers = _stand_in_etc(env)
+    var_tmp = env.tmp / "var_tmp"
+    var_tmp.mkdir()
+    os.chmod(var_tmp, 0o1777)
+    (var_tmp / "abrt").symlink_to(etc)
+    items = [_item(var_tmp / "abrt" / "shadow"), _item(var_tmp / "abrt" / "sudoers.d")]
+    env.cleaners.append(FakeCleaner("logs", items))
+    rc, _ = _run(env, _selection([item_key(i) for i in items]))
+    assert rc == 0
+    assert shadow.exists() and sudoers.exists()
+    res = elevate.read_result(env.result)
+    assert res.removed == 0 and res.refused == 2
+    assert "symbolic link" in res.errors[0]
+
+
+@posix_only
+def test_helper_refuses_symlinked_intermediate_component(env):
+    real = env.tmp / "real"
+    victim = _file(real / "sub", "victim")
+    a = env.tmp / "a"
+    a.mkdir()
+    (a / "link").symlink_to(real)
+    it = _item(a / "link" / "sub" / "victim")
+    env.cleaners.append(FakeCleaner("logs", [it]))
+    rc, _ = _run(env, _selection([item_key(it)]))
+    assert rc == 0 and victim.exists()
+    assert elevate.read_result(env.result).refused == 1
+
+
+@posix_only
+def test_helper_refuses_world_writable_non_sticky_parent(env):
+    d = env.tmp / "open"
+    f = _file(d, "f")
+    os.chmod(d, 0o777)
+    it = _item(f)
+    env.cleaners.append(FakeCleaner("logs", [it]))
+    rc, _ = _run(env, _selection([item_key(it)]))
+    assert rc == 0 and f.exists()
+    assert "writable by everyone" in elevate.read_result(env.result).errors[0]
+
+
+@posix_only
+def test_helper_allows_sticky_world_writable_base(env):
+    d = env.tmp / "sticky"
+    f = _file(d, "f")
+    os.chmod(d, 0o1777)
+    it = _item(f)
+    env.cleaners.append(FakeCleaner("logs", [it]))
+    rc, _ = _run(env, _selection([item_key(it)]))
+    assert rc == 0 and not f.exists()
+    assert elevate.read_result(env.result).removed == 1
+
+
+@posix_only
+def test_recheck_catches_component_swapped_between_scan_and_clean(env, monkeypatch):
+    f1 = _file(env.tmp / "d1", "f1")
+    f2 = _file(env.tmp / "d2", "f2")
+    items = [_item(f1), _item(f2)]
+    env.cleaners.append(FakeCleaner("logs", items))
+    real_rmtree = safety.safe_rmtree
+
+    def rmtree_then_swap(p):
+        real_rmtree(p)
+        if Path(p).name == "f1":  # after the scan, before item 2 is cleaned
+            (env.tmp / "d2").rename(env.tmp / "d2_real")
+            (env.tmp / "d2").symlink_to(env.tmp / "d2_real")
+
+    monkeypatch.setattr(safety, "safe_rmtree", rmtree_then_swap)
+    rc, _ = _run(env, _selection([item_key(i) for i in items]))
+    assert rc == 0
+    assert not f1.exists()
+    assert (env.tmp / "d2_real" / "f2").exists()
+    res = elevate.read_result(env.result)
+    assert res.removed == 1 and res.refused == 1
+
+
+def test_windows_reparse_point_in_item_parent_chain_is_refused(env, monkeypatch):
+    monkeypatch.setattr(elevated, "_is_posix", lambda: False)
+    monkeypatch.setattr(elevated, "_win_known_dirs",
+                        lambda: (r"C:\Windows", r"C:\Windows\System32", r"C:\ProgramData"))
+    f = _file(env.junk / "sub", "f")
+    real_is_reparse = safety.is_reparse_point
+    monkeypatch.setattr(safety, "is_reparse_point",
+                        lambda p: Path(p) == env.junk or real_is_reparse(p))
+    it = _item(f)
+    env.cleaners.append(FakeCleaner("logs", [it]))
+    rc, _ = _run(env, _selection([item_key(it)]))
+    assert rc == 0 and f.exists()
+    res = elevate.read_result(env.result)
+    assert res.refused == 1 and "junction" in res.errors[0]
+
+
+def _st(mode, uid=0, gid=0):
+    return SimpleNamespace(st_mode=mode, st_uid=uid, st_gid=gid)
+
+
+@pytest.mark.parametrize("st, groups, problem", [
+    (_st(0o040755), set(), None),                         # root dir
+    (_st(0o041777), set(), None),                         # sticky /tmp
+    (_st(0o120777), set(), "symbolic link"),
+    (_st(0o100644), set(), "not a directory"),
+    (_st(0o040755, uid=1000), set(), "non-system user"),   # human owner
+    (_st(0o040755, uid=50), set(), "non-system user"),     # == requesting uid
+    (_st(0o040755, uid=104), set(), None),                 # system account
+    (_st(0o040777), set(), "everyone"),                    # world, no sticky
+    (_st(0o040775, gid=1000), set(), "non-system group"),
+    (_st(0o040775, gid=4), set(), None),                   # e.g. root:syslog 0775
+    (_st(0o040775, gid=4), {4}, "non-system group"),       # user is in that group
+])
+def test_component_policy(st, groups, problem):
+    got = elevated._component_problem(st, 50, frozenset(groups))
+    if problem is None:
+        assert got is None
+    else:
+        assert got and problem in got
+
+
+@posix_only
+def test_rotated_log_walk_does_not_follow_symlinked_dirs(tmp_path):
+    from cleanix.cleaners import logs
+
+    outside = tmp_path / "outside"
+    _file(outside, "secret.1")
+    root = tmp_path / "log"
+    _file(root / "app", "app.log.1")
+    (root / "evil").symlink_to(outside)
+    names = sorted(p.name for p in logs._walk_files(root))
+    assert names == ["app.log.1"]
+
+
+@posix_only
+def test_temp_cleaner_skips_symlinked_base(env, monkeypatch):
+    from cleanix.cleaners import temp_files
+    from cleanix.config import Config
+
+    etc, _shadow, _ = _stand_in_etc(env)
+    link = env.tmp / "faketmp"
+    link.symlink_to(etc)
+    cleaner = temp_files.TempFilesCleaner(Config())
+    monkeypatch.setattr(cleaner, "BASES", (str(link),))
+    monkeypatch.setattr(temp_files, "older_than", lambda p, d: True)
+    assert list(cleaner.find_items()) == []
+
+
+# --------------------------------------------------------------------------
+# N3 / N5: per-item deadline, watchdog tally, completed run never exits 3
+# --------------------------------------------------------------------------
+def test_each_command_timeout_uses_time_left_when_it_starts(env, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(elevated, "_monotonic", lambda: clock[0])
+    calls = []
+
+    def sleepy(cmd, timeout=120):
+        calls.append(timeout)
+        clock[0] += 40  # each command "takes" 40 s
+        return 0, "", ""
+
+    monkeypatch.setattr(engine, "run_command", sleepy)
+    cmds = [CleanableItem(cleaner_id="logs", description=f"c{i}", kind=ItemKind.COMMAND,
+                          command=["true", str(i)], requires_root=True, size=5)
+            for i in range(2)]
+    env.cleaners.append(FakeCleaner("logs", cmds))
+    rc, _ = _run(env, _selection([item_key(c) for c in cmds]), deadline=100)
+    assert rc == 0
+    assert calls == [100, 60]
+    res = elevate.read_result(env.result)
+    assert res.removed == 2 and res.freed == 10  # totals as before
+
+
+def test_watchdog_reports_work_done_so_far(env, monkeypatch):
+    import threading
+
+    done_file = _file(env.junk, "a.bin")
+    release = threading.Event()
+
+    def blocking(cmd, timeout=120):
+        release.wait(10)
+        return 0, "", ""
+
+    monkeypatch.setattr(engine, "run_command", blocking)
+    path_item = _item(done_file)
+    cmd = CleanableItem(cleaner_id="logs", description="slow", kind=ItemKind.COMMAND,
+                        command=["true"], requires_root=True)
+    env.cleaners.append(FakeCleaner("logs", [path_item, cmd]))
+    exits = []
+
+    def fake_exit(code):
+        exits.append(code)
+        release.set()
+
+    monkeypatch.setattr(os, "_exit", fake_exit)
+    rc, _ = _run(env, _selection([item_key(path_item), item_key(cmd)]),
+                 deadline=0.3, grace=0.2)
+    assert exits == [3] and rc == 3
+    res = elevate.read_result(env.result)
+    assert res.deadline_hit and res.removed == 1 and res.freed == 10
+    assert "1 of 2" in res.errors[0]
+
+
+def test_completed_run_never_exits_3_when_watchdog_fires_late(tmp_path, monkeypatch):
+    exits = []
+    monkeypatch.setattr(os, "_exit", lambda code: exits.append(code))
+    written = []
+    rdir = SimpleNamespace(write_result=lambda r: written.append(r))
+    session = elevated._Session(rdir)
+    assert session.finish()            # main path completed
+    session.abort_after_deadline()     # watchdog fires before done.set()
+    assert exits == [] and len(written) == 1 and not session.aborted
+
+
+def test_watchdog_exits_even_if_lock_is_stuck(monkeypatch):
+    exits = []
+    monkeypatch.setattr(os, "_exit", lambda code: exits.append(code))
+    monkeypatch.setattr(elevated, "WATCHDOG_LOCK_TIMEOUT", 0.05)
+    session = elevated._Session(SimpleNamespace(write_result=lambda r: None))
+    session.lock.acquire()
+    try:
+        session.abort_after_deadline()
+    finally:
+        session.lock.release()
+    assert exits == [3]
+
+
+def test_run_accepts_deadline_as_string(env):
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    rc, _ = _run(env, _selection([item_key(ia)]), deadline="5")
+    assert rc == 0 and not a.exists()

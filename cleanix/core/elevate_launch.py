@@ -46,7 +46,12 @@ def _invoker_uid() -> int:
 
 def elevated_command(request_path: Path, result_path: Path,
                      config_path: Optional[str] = None) -> List[str]:
-    cmd = [sys.executable, "-m", "cleanix.elevated",
+    """argv for the helper. ``-I`` (isolated mode) makes the elevated
+    interpreter ignore PYTHONPATH/PYTHONHOME/PYTHONSTARTUP, the user site
+    directory and the current directory on sys.path, before the helper gets
+    a chance to sanitise its environment. Frozen builds (Plan 2B) have no
+    ``-I``/``-m`` and will use a dedicated helper entry point instead."""
+    cmd = [sys.executable, "-I", "-m", "cleanix.elevated",
            "--request", str(request_path), "--result", str(result_path)]
     if config_path:
         cmd += ["--config", str(config_path)]

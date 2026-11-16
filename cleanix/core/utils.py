@@ -11,6 +11,41 @@ from pathlib import Path
 from typing import Iterator, Optional, Sequence
 
 
+# macOS: these top-level names are standard symlinks into /private.
+_MACOS_PRIVATE_LINKS = ("/tmp", "/var", "/etc")
+
+
+def canonical_system_path(path: str) -> str:
+    """On macOS map ``/tmp``, ``/var`` and ``/etc`` (standard symlinks into
+    ``/private``) to their real location; unchanged elsewhere."""
+    if sys.platform != "darwin":
+        return path
+    for top in _MACOS_PRIVATE_LINKS:
+        if path == top or path.startswith(top + "/"):
+            return "/private" + path
+    return path
+
+
+def is_trusted_system_dir(path: str | os.PathLike) -> bool:
+    """True if ``path`` is a real directory (not a symlink) owned by root.
+
+    System cleaners call this before listing a base directory that lives in a
+    world-writable tree (``/tmp``, ``/var/tmp``, ``/var/crash`` ...): there an
+    unprivileged user could have created the base as a symlink to, say,
+    ``/etc``, and listing it as root would offer ``/etc/*`` for deletion.
+    """
+    if os.name == "nt":
+        return Path(path).is_dir()
+    import stat as _stat
+
+    p = canonical_system_path(os.path.abspath(str(path)))
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    return _stat.S_ISDIR(st.st_mode) and st.st_uid == 0
+
+
 def human_size(num_bytes: int) -> str:
     """Format a byte count like ``1.4 GiB``."""
     size = float(num_bytes)

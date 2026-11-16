@@ -8,7 +8,7 @@ from typing import Iterable
 from cleanix.cleaners.base import Cleaner, SCOPE_SYSTEM
 from cleanix.core.models import CleanableItem
 from cleanix.core.platform import LINUX
-from cleanix.core.utils import iter_children, older_than
+from cleanix.core.utils import is_trusted_system_dir, iter_children, older_than
 
 
 class SystemCacheCleaner(Cleaner):
@@ -75,10 +75,14 @@ class CrashSpoolCleaner(Cleaner):
     platforms = (LINUX,)
     scope = SCOPE_SYSTEM
 
+    BASES = ("/var/spool/abrt", "/var/tmp/abrt", "/var/spool/apport")
+
     def find_items(self) -> Iterable[CleanableItem]:
-        for base in ("/var/spool/abrt", "/var/tmp/abrt", "/var/spool/apport"):
+        for base in self.BASES:
             root = Path(base)
-            if not root.is_dir():
+            # /var/tmp is world-writable: a user can create /var/tmp/abrt as a
+            # symlink (e.g. to /etc). Only list a real, root-owned directory.
+            if not is_trusted_system_dir(root):
                 continue
             for child in iter_children(root):
                 if not older_than(child, 0.02):  # ~30 min, may be mid-write

@@ -27,7 +27,7 @@ def _os(monkeypatch, name):
 def test_elevated_command_shape(monkeypatch):
     _os(monkeypatch, plat.WINDOWS)
     cmd = el.elevated_command(Path("req.json"), Path("res.json"), "cfg.yml")
-    assert cmd == [sys.executable, "-m", "cleanix.elevated", "--request", "req.json",
+    assert cmd == [sys.executable, "-I", "-m", "cleanix.elevated", "--request", "req.json",
                    "--result", "res.json", "--config", "cfg.yml"]
     assert "--config" not in el.elevated_command(Path("a"), Path("b"))
 

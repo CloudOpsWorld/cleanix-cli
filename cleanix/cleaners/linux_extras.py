@@ -9,7 +9,7 @@ from typing import Iterable
 from cleanix.cleaners.base import Cleaner, SCOPE_SYSTEM
 from cleanix.core.models import CleanableItem
 from cleanix.core.platform import LINUX
-from cleanix.core.utils import home, iter_children, older_than
+from cleanix.core.utils import home, is_trusted_system_dir, iter_children, older_than
 
 # Files a package manager leaves next to config it couldn't safely overwrite.
 # Removing these discards the *packaged* copy; your edited config is untouched.
@@ -63,10 +63,14 @@ class CrashReportCleaner(Cleaner):
     requires_root = True
     platforms = (LINUX,)
 
+    BASES = ("/var/crash", "/var/lib/apport/coredump")
+
     def find_items(self) -> Iterable[CleanableItem]:
-        for base in ("/var/crash", "/var/lib/apport/coredump"):
+        for base in self.BASES:
             root = Path(base)
-            if not root.exists():
+            # /var/crash is world-writable (sticky): only list a real,
+            # root-owned directory, never a planted symlink.
+            if not is_trusted_system_dir(root):
                 continue
             for child in iter_children(root):
                 # Leave very fresh reports in case they are being written.

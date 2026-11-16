@@ -142,6 +142,15 @@ def test_service_clean_without_history_writes_no_state(tmp_path, state):
     assert not (state / "q").exists()
 
 
+def test_service_clean_without_history_refuses_quarantine(tmp_path, state):
+    paths = _files(tmp_path, 1)
+    with pytest.raises(ValueError):
+        service.clean(_items(paths), Config(), dry_run=False, use_quarantine=True,
+                      record_history=False)
+    assert paths[0].exists()
+    assert not (state / "q").exists()
+
+
 def test_service_clean_with_quarantine_is_restorable(tmp_path, state):
     paths = _files(tmp_path, 1)
     summary = service.clean(
