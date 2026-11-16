@@ -332,16 +332,29 @@ def _stub_real_clean(monkeypatch, texts, seen):
     return factory
 
 
-def test_initial_checked_set_equals_preselect_set(view):
-    _load(view)
-    m = view.item_model
-    infos = {view.cleaner_model.info_at(r).id: view.cleaner_model.info_at(r)
-             for r in range(view.cleaner_model.rowCount())}
-    expected = [i for i in _result().all_items()
-                if catalog.preselect(i, infos[i.cleaner_id])]
-    assert [i.path for i in m.checked_items()] == [i.path for i in expected]
-    assert not any(i.requires_root or i.kind is ItemKind.COMMAND or i.report_only
-                   for i in m.checked_items())
+def test_initial_checked_set_equals_preselect_set(qtbot, monkeypatch, sync_workers):
+    import dataclasses
+    infos = [_info("temp", "Temp"),
+             _info("trashy", "Trash", category="trash"),
+             dataclasses.replace(_info("unsafe", "Unsafe"), safe_default=False)]
+    monkeypatch.setattr(catalog, "list_cleaners", lambda cfg, **k: infos)
+    res = ScanResult(reports=[
+        CleanerReport("temp", "Temp", "t", items=[
+            CleanableItem("temp", "plain", size=1, path="/t/a"),
+            CleanableItem("temp", "cmd", size=1, kind=ItemKind.COMMAND, command=["x"]),
+        ]),
+        CleanerReport("trashy", "Trash", "t", items=[
+            CleanableItem("trashy", "bin", size=1, path="/t/trash")]),
+        CleanerReport("unsafe", "Unsafe", "t", items=[
+            CleanableItem("unsafe", "u", size=1, path="/t/u")]),
+    ])
+    v = pv.PowerView(Config(), allow_admin_items=True)
+    qtbot.addWidget(v)
+    v._on_scan_finished(res)
+    assert [i.description for i in v.item_model.checked_items()] == ["plain"]
+    m = v.item_model
+    assert all(m.flags(m.index(r, 0)) & Qt.ItemFlag.ItemIsUserCheckable
+               for r in range(m.rowCount()))
 
 
 def test_unknown_cleaner_starts_unchecked(qtbot, monkeypatch, sync_workers):
@@ -441,7 +454,7 @@ def test_shutdown_cancels_worker_and_is_idempotent(qtbot, monkeypatch):
 
     v = pv.PowerView(Config(), scan_worker_factory=lambda only: W())
     qtbot.addWidget(v)
-    v.shutdown()  # nothing running
+    pv.PowerView(Config()).shutdown()  # nothing running: no error
     v.start_scan()
     v.shutdown()
     v.shutdown()
@@ -503,3 +516,102 @@ def test_confirm_text_keep_copy_and_permanent():
     assert "permanently removed" in perm and "cannot be undone" in perm
     assert "2 more checked" in perm
     assert "hidden" not in pv.PowerView.confirm_text([path], 0, False)
+
+
+def _two_item_view(qtbot, monkeypatch, outcome_removed):
+    from cleanix.core.models import CleanOutcome, CleanResult
+    from cleanix.core.service import CleanSummary
+
+    class W(FakeScan):
+        def __init__(self, items, dry_run=False):
+            super().__init__()
+            self.items = list(items)
+            self.dry_run = dry_run
+
+        def run(self):
+            outs = [CleanOutcome(i, removed=outcome_removed(i), freed=i.size)
+                    for i in self.items]
+            self.finished.emit(CleanSummary(result=CleanResult(outcomes=outs, dry_run=self.dry_run),
+                                            freed=1, removed=1))
+
+    texts, seen = [], []
+    monkeypatch.setattr(pv.PowerView, "confirm_clean",
+                        lambda self, text: texts.append(text) or True)
+
+    def factory(items, *, dry_run, use_quarantine):
+        seen.append((list(items), dry_run, use_quarantine))
+        return W(items, dry_run)
+    v = pv.PowerView(Config(), clean_worker_factory=factory)
+    qtbot.addWidget(v)
+    _load(v)
+    v.dry_run_check.setChecked(False)
+    return v, texts, seen
+
+
+def test_failed_rows_stay_after_real_clean(qtbot, monkeypatch, sync_workers):
+    v, _t, seen = _two_item_view(qtbot, monkeypatch, lambda i: i.path == "/tmp/a")
+    before = list(v.item_model.checked_items())
+    assert len(before) == 3
+    v.clean_button.click()
+    left = v.item_model.checked_items()
+    assert "/tmp/a" not in [i.path for i in left]
+    assert [i.path for i in left] == [i.path for i in before if i.path != "/tmp/a"]
+    assert v.item_model.rowCount() == 4
+
+
+def test_keep_copy_reflected_in_confirm_and_factory(qtbot, monkeypatch, sync_workers):
+    v, texts, seen = _two_item_view(qtbot, monkeypatch, lambda i: False)
+    v.clean_button.click()
+    assert seen[-1][2] is True and "restore" in texts[-1]
+    v.quarantine_check.setChecked(False)
+    v.clean_button.click()
+    assert seen[-1][2] is False
+    assert "permanently removed" in texts[-1] and "restore" not in texts[-1]
+
+
+def test_detail_pane_reset_after_rows_removed(qtbot, monkeypatch, sync_workers):
+    v, _t, _s = _two_item_view(qtbot, monkeypatch, lambda i: True)
+    _select(v, lambda i: i.path == "/tmp/a")
+    assert "/tmp/a" in v.detail_label.toPlainText()
+    v.clean_button.click()
+    assert "/tmp/a" not in v.detail_label.toPlainText()
+    assert "/tmp/a" not in v.detail_label.toolTip()
+
+
+def _paths_in(path):
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return [(i["path"] or "").replace("\\", "/")
+            for r in data["cleaners"] for i in r["items"]]
+
+
+def test_export_after_real_clean_excludes_removed_but_dry_run_keeps(
+        qtbot, monkeypatch, sync_workers, tmp_path):
+    monkeypatch.setattr(time, "strftime", lambda *a, **k: "2026-01-01T00:00:00")
+    v, _t, _s = _two_item_view(qtbot, monkeypatch, lambda i: i.path == "/tmp/a")
+    v.dry_run_check.setChecked(True)
+    v.clean_button.click()  # dry run: nothing deleted, rows stay
+    out = tmp_path / "dry.json"
+    v.export_scan_json(out)
+    assert "/tmp/a" in _paths_in(out)
+    v.dry_run_check.setChecked(False)
+    v.clean_button.click()
+    out2 = tmp_path / "real.json"
+    v.export_scan_json(out2)
+    paths = _paths_in(out2)
+    assert "/tmp/a" not in paths and "/x/huge.iso" in paths
+    assert any(i.path == "/tmp/a" for i in v._result.all_items())
+
+
+def test_shutdown_keeps_start_guard_up(qtbot, monkeypatch):
+    monkeypatch.setattr(workers, "start_worker", lambda w: None)
+    n = []
+    v = pv.PowerView(Config(), scan_worker_factory=lambda only: n.append(1) or FakeScan(_result()))
+    qtbot.addWidget(v)
+    v.start_scan()
+    v.shutdown()
+    v.start_scan()
+    v.start_clean()
+    assert n == [1]
+    v._on_cancelled()  # old worker finishes; still no new work
+    v.start_scan()
+    assert n == [1]
