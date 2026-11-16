@@ -362,11 +362,40 @@ def _win_rmdir(path: str) -> None:
         os.rmdir(path)
 
 
-def _win_rmtree(path: str) -> None:
+def _entry_inode(entry) -> int:
+    """File id of a scandir entry (never follows a link; 0 if unknown)."""
+    return entry.inode()
+
+
+def _recheck_dir(path: str, expected_ino) -> None:
+    """Raise OSError unless ``path`` is still the same plain directory.
+
+    Called immediately before each ``os.scandir`` in :func:`_win_rmtree`: an
+    entry classified as a directory from its listing may have been swapped
+    for a junction (e.g. by a standard user in a world-writable system temp
+    folder) before an elevated run descends into it.
+    """
+    st = _lstat(path)
+    attrs = getattr(st, "st_file_attributes", 0)
+    if attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
+        raise OSError(f"refusing to descend: {path} changed into a reparse point")
+    if not attrs & stat.FILE_ATTRIBUTE_DIRECTORY:
+        raise OSError(f"refusing to descend: {path} changed (no longer a directory)")
+    ino = getattr(st, "st_ino", 0)
+    if expected_ino and ino and ino != expected_ino:
+        raise OSError(f"refusing to descend: {path} changed (different directory)")
+
+
+def _win_rmtree(path: str, expected_ino: int = 0) -> None:
     """Depth-first removal that never follows junctions/symlinks.
 
-    Errors propagate (locked files are reported, not forced).
+    Errors propagate (locked files are reported, not forced). Each directory
+    is re-checked by lstat (still a non-reparse directory with the same file
+    id) right before it is listed. Residual limit: the window between that
+    check and the listing/unlinks is not closed (that needs handle-relative
+    NT APIs); see the README Windows notes.
     """
+    _recheck_dir(path, expected_ino)
     with os.scandir(path) as it:
         entries = list(it)
     for entry in entries:
@@ -375,7 +404,7 @@ def _win_rmtree(path: str) -> None:
         if attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
             _remove_link(entry.path)
         elif attrs & stat.FILE_ATTRIBUTE_DIRECTORY:
-            _win_rmtree(entry.path)
+            _win_rmtree(entry.path, _entry_inode(entry))
         else:
             _win_unlink(entry.path)
     _win_rmdir(path)

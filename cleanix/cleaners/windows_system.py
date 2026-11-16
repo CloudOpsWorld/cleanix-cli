@@ -28,6 +28,12 @@ class WinSystemTempCleaner(Cleaner):
     requires_root = True
 
     def find_items(self) -> Iterable[CleanableItem]:
+        # Windows\Temp is writable by standard users while this cleaner runs
+        # elevated. The remover re-checks every directory for a junction swap
+        # right before descending (safety._win_rmtree), but entries are NOT
+        # filtered by owner: doing that reliably needs security-descriptor
+        # APIs beyond what we use without new dependencies. Residual limit,
+        # documented in the README Windows notes.
         for child in iter_children(winenv.system_root() / "Temp"):
             if not older_than(child, self.config.temp_min_age_days):
                 continue
