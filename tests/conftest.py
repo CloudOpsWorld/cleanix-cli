@@ -33,3 +33,14 @@ def fake_win(tmp_path, monkeypatch):
         home=home, local=local, roaming=roaming,
         programdata=programdata, system_root=system_root,
     )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_windows_profiles_cache():
+    """The guard caches the users-directory listing for a few seconds;
+    tests that create or remove profile dirs must always see a fresh one."""
+    from cleanix.core import safety
+
+    safety._windows_profiles_cache_clear()
+    yield
+    safety._windows_profiles_cache_clear()

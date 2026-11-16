@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import stat
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -219,16 +220,37 @@ def _windows_home_forms(homes) -> list:
     return out
 
 
+# Listing <SystemDrive>\Users (plus realpath/long-name expansion per profile)
+# costs ~10 ms, and a clean calls the guard several times per item, so the
+# result is cached for a few seconds, keyed on the directories listed.
+# SAFETY: a stale entry can only make the guard see a profile list that is up
+# to _WINDOWS_PROFILES_TTL seconds old (a profile created or removed within
+# that window is not yet known). The per-home rules and the home dirs from
+# context are not cached, so the invoking user is always protected; a clean
+# that runs longer than the TTL re-lists. Tests reset it with
+# _windows_profiles_cache_clear().
+_WINDOWS_PROFILES_TTL = 5.0
+_windows_profiles_cache: dict = {}
+
+
+def _windows_profiles_cache_clear() -> None:
+    _windows_profiles_cache.clear()
+
+
 def _windows_profiles() -> list:
     """Every directory directly under ``<SystemDrive>\\Users`` (raw and
-    canonical spellings), enumerated at call time; [] on any error."""
+    canonical spellings); [] on any error. Cached for _WINDOWS_PROFILES_TTL s."""
     drives = []
     for d in (safety_windows._env(os.environ, "SystemDrive"), "C:"):
         if d.upper() not in (x.upper() for x in drives):
             drives.append(d)
+    key = tuple(drive + "\\Users" for drive in drives)
+    now = time.monotonic()
+    hit = _windows_profiles_cache.get(key)
+    if hit is not None and 0 <= now - hit[0] < _WINDOWS_PROFILES_TTL:
+        return list(hit[1])
     found = []
-    for drive in drives:
-        users = drive + "\\Users"
+    for users in key:
         try:
             with os.scandir(users) as it:
                 for entry in it:
@@ -239,7 +261,9 @@ def _windows_profiles() -> list:
                         found.append(entry.path)
         except OSError:
             continue
-    return _windows_home_forms(found)
+    result = _windows_home_forms(found)
+    _windows_profiles_cache[key] = (now, result)
+    return list(result)
 
 
 def _lstat(path: str):
