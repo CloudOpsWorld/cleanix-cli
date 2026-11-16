@@ -209,13 +209,18 @@ def safe_which(
     and the cwd itself are skipped); ``PATHEXT`` is honoured. A ``cmd`` that
     contains a directory separator is returned as an absolute path only if it is
     already absolute. Pure apart from ``isfile``; all inputs are injectable.
+    Path rules are the host's (``os.path``); on Windows an absolute entry must
+    also carry a drive (a rooted ``\\dir`` is drive-relative).
     """
-    import ntpath
+    pth = os.path
+
+    def _absolute(p: str) -> bool:
+        return pth.isabs(p) and (os.name != "nt" or bool(pth.splitdrive(p)[0]))
 
     if not cmd:
         return None
     if "\\" in cmd or "/" in cmd:
-        if ntpath.isabs(cmd) and ntpath.splitdrive(cmd)[0] and isfile(cmd):
+        if _absolute(cmd) and isfile(cmd):
             return cmd
         return None
     if path_entries is None:
@@ -232,20 +237,20 @@ def safe_which(
         names = [cmd]
     else:
         names = [cmd + e for e in exts]
-    cwd_norm = ntpath.normcase(ntpath.normpath(cwd)) if cwd else None
+    cwd_norm = pth.normcase(pth.normpath(cwd)) if cwd else None
     for entry in path_entries:
         entry = entry.strip().strip('"')
         if not entry or entry == ".":
             continue
         # Relative entries resolve against the cwd: skip them too.
-        if not (ntpath.isabs(entry) and ntpath.splitdrive(entry)[0]):
+        if not _absolute(entry):
             continue
-        if cwd_norm and ntpath.normcase(ntpath.normpath(entry)) == cwd_norm:
+        if cwd_norm and pth.normcase(pth.normpath(entry)) == cwd_norm:
             continue
         for name in names:
-            cand = ntpath.join(entry, name)
+            cand = pth.join(entry, name)
             if isfile(cand):
-                return ntpath.normpath(cand)
+                return pth.normpath(cand)
     return None
 
 

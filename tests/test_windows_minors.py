@@ -189,6 +189,8 @@ def _populate_user(fw):
     _mk(fw.roaming / "Microsoft" / "Teams" / "Cache")
 
 
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="the Windows path model needs drive-letter temp paths")
 def test_every_windows_cleaner_path_passes_guard(fake_win, monkeypatch):
     monkeypatch.setattr(platform, "is_windows", lambda: True)
     monkeypatch.delenv("SCOOP", raising=False)
