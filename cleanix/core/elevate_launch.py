@@ -34,6 +34,10 @@ class ElevationDeclined(Exception):
 class ElevationFailed(Exception):
     """Elevation or the elevated helper failed."""
 
+    def __init__(self, message: str = "", exit_code: Optional[int] = None):
+        super().__init__(message)
+        self.exit_code = exit_code
+
 
 def _invoker_uid() -> int:
     getuid = getattr(os, "getuid", None)
@@ -55,44 +59,81 @@ def _applescript_quote(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _run(argv: List[str], timeout: int) -> "subprocess.CompletedProcess":
+def _run(argv: List[str], timeout: int):
+    """Popen-based runner: returns (returncode, stderr).
+
+    After authentication the helper runs as root, so an unprivileged kill() may
+    fail and a plain wait() would block until the helper exits; never block.
+    """
     try:
-        return subprocess.run(argv, capture_output=True, text=True,
-                              timeout=timeout, stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired as exc:
-        raise ElevationFailed("elevated helper timed out") from exc
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
     except OSError as exc:
         raise ElevationFailed(f"could not start the elevation prompt: {exc}") from exc
+    try:
+        _out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+        raise ElevationFailed("elevated helper timed out and may still be running") from exc
+    return proc.returncode, err or ""
 
 
 def launch_elevated(argv: Sequence[str], *, timeout: int = 3600) -> int:
+    """Run argv elevated. Returns 0 only on success; every failure raises one
+    of ElevationUnavailable / ElevationDeclined / ElevationFailed.
+
+    The detailed outcome comes from the helper's result file, not the exit code.
+    On Windows this blocks while the consent dialog is open: call it off the
+    GUI thread.
+    """
+    if not argv or not os.path.isabs(str(argv[0])):
+        raise ValueError("argv[0] must be an absolute program path")
     args = [str(a) for a in argv]
     osname = current_os()
     if osname == WINDOWS:
         try:
-            return winenv.run_elevated(args, timeout)
+            rc = winenv.run_elevated(args, timeout)
         except TimeoutError as exc:
-            raise ElevationFailed("elevated helper timed out") from exc
+            raise ElevationFailed(str(exc) or "elevated helper timed out") from exc
         except OSError as exc:
             if getattr(exc, "winerror", None) == _ERROR_CANCELLED:
                 raise ElevationDeclined("the UAC prompt was declined") from exc
             raise ElevationFailed(f"UAC elevation failed: {exc}") from exc
+        if rc != 0:
+            raise ElevationFailed(f"elevated helper exited with code {rc}", exit_code=rc)
+        return 0
     if osname == LINUX:
         pkexec = utils.safe_which("pkexec")
         if not pkexec:
             raise ElevationUnavailable("pkexec (polkit) was not found")
-        proc = _run([pkexec] + args, timeout)
-        if proc.returncode in (126, 127):
-            raise ElevationDeclined("authentication was declined or unavailable")
+        rc, err = _run([pkexec] + args, timeout)
+        if rc == 126:
+            raise ElevationDeclined("authentication was declined")
+        if rc == 127:
+            if "no authentication agent" in err.lower():
+                raise ElevationUnavailable("no polkit authentication agent is running")
+            raise ElevationFailed(err.strip() or "pkexec could not run the helper", exit_code=rc)
     elif osname == MACOS:
         script = ('do shell script "%s" with administrator privileges'
                   % _applescript_quote(shlex.join(args)))
-        proc = _run([_OSASCRIPT, "-e", script], timeout)
-        if proc.returncode != 0 and "(-128)" in (proc.stderr or ""):
+        rc, err = _run([_OSASCRIPT, "-e", script], timeout)
+        if rc != 0 and (err.rstrip().endswith("(-128)") or "User canceled" in err):
             raise ElevationDeclined("the password prompt was cancelled")
     else:
         raise ElevationUnavailable(f"no elevation mechanism for {osname}")
-    if proc.returncode != 0:
-        msg = (proc.stderr or "").strip() or f"exit code {proc.returncode}"
-        raise ElevationFailed(msg)
+    if rc != 0:
+        raise ElevationFailed(err.strip() or f"exit code {rc}", exit_code=rc)
     return 0

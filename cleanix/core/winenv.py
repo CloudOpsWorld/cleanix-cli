@@ -141,7 +141,8 @@ def _shellexecuteinfo_class():
 def run_elevated(argv: Sequence[str], timeout: int) -> int:
     """Run argv elevated via UAC (verb runas), wait, return its exit code.
 
-    argv[0] must be an absolute program path. Raises OSError (winerror 1223)
+    argv[0] must be an absolute program path. ShellExecuteExW blocks while the
+    consent dialog is open, so call this off the GUI thread. Raises OSError (winerror 1223)
     if the user declines the prompt, TimeoutError if the process outlives
     ``timeout`` seconds, and OSError off Windows.
     """
@@ -163,6 +164,8 @@ def run_elevated(argv: Sequence[str], timeout: int) -> int:
     kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     kernel32.GetExitCodeProcess.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
 
     info = info_cls()
     info.cbSize = ctypes.sizeof(info_cls)
@@ -177,9 +180,14 @@ def run_elevated(argv: Sequence[str], timeout: int) -> int:
     if not handle:
         raise OSError("ShellExecuteExW returned no process handle")
     try:
-        wait = kernel32.WaitForSingleObject(handle, max(0, int(timeout)) * 1000)
+        ms = min(max(0, int(timeout)) * 1000, 0xFFFFFFFE)
+        wait = kernel32.WaitForSingleObject(handle, ms)
         if wait == _WAIT_TIMEOUT:
-            raise TimeoutError("elevated process timed out")
+            try:
+                kernel32.TerminateProcess(handle, 1)
+            except Exception:
+                pass
+            raise TimeoutError("elevated helper timed out and may still be running")
         if wait != _WAIT_OBJECT_0:
             raise ctypes.WinError(ctypes.get_last_error())
         code = wintypes.DWORD()
