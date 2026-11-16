@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import shutil
 import subprocess
+import threading
 from typing import List, Optional
 
 from cleanix.core import platform as plat
@@ -22,12 +24,15 @@ def _resolve(name: str) -> Optional[str]:
 def _argv(path: str) -> Optional[List[str]]:
     if plat.is_windows():
         exe = _resolve("explorer")
-        return [exe, "/select," + path] if exe else None
+        return [exe, "/select," + ntpath.normpath(path)] if exe else None
     if plat.is_macos():
         exe = _resolve("open")
         return [exe, "-R", path] if exe else None
+    parent = os.path.dirname(path) or "."
+    if not os.path.isdir(parent):
+        return None
     exe = _resolve("xdg-open")
-    return [exe, os.path.dirname(path) or "."] if exe else None
+    return [exe, parent] if exe else None
 
 
 def reveal_in_file_manager(path: str) -> bool:
@@ -39,7 +44,7 @@ def reveal_in_file_manager(path: str) -> bool:
         return False
     try:
         # Explorer exits non-zero even on success, so do not wait or check.
-        subprocess.Popen(
+        proc = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -47,4 +52,13 @@ def reveal_in_file_manager(path: str) -> bool:
         )
     except (OSError, ValueError):
         return False
+    threading.Thread(target=_reap, args=(proc,), daemon=True).start()
     return True
+
+
+def _reap(proc) -> None:
+    """Wait for the child off-thread so it does not linger as a zombie."""
+    try:
+        proc.wait()
+    except Exception:  # noqa: BLE001
+        pass

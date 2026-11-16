@@ -29,6 +29,31 @@ from cleanix.core.utils import human_size
 from cleanix.gui import reveal
 
 
+class _WheelGuardMixin:
+    """Ignore wheel events unless focused, so scrolling the form never edits values."""
+
+    def _guard_init(self) -> None:
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):  # noqa: N802
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class GuardedSpinBox(_WheelGuardMixin, QSpinBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._guard_init()
+
+
+class GuardedDoubleSpinBox(_WheelGuardMixin, QDoubleSpinBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._guard_init()
+
+
 class ElidedLabel(QLabel):
     """Single-line label that elides with "..." and keeps the full text as tooltip."""
 
@@ -217,10 +242,10 @@ class SettingsPanel(QWidget):
         if typ is bool:
             w: QWidget = QCheckBox()
         elif typ is int:
-            w = QSpinBox()
+            w = GuardedSpinBox()
             w.setRange(-_INT_MAX, _INT_MAX)
         elif typ is float:
-            w = QDoubleSpinBox()
+            w = GuardedDoubleSpinBox()
             w.setDecimals(3)
             w.setRange(-1e12, 1e12)
         elif typ is list:

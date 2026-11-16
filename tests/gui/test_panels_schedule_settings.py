@@ -96,7 +96,7 @@ def test_settings_panel_has_editor_for_every_config_key(qtbot, cfg_path):
     p = SettingsPanel()
     qtbot.addWidget(p)
     assert set(p.editors) == set(config.field_names())
-    expected = {bool: QCheckBox, int: QSpinBox, float: QDoubleSpinBox, list: QPlainTextEdit, str: QLineEdit}
+    expected = {bool: QCheckBox, int: panels_config.GuardedSpinBox, float: panels_config.GuardedDoubleSpinBox, list: QPlainTextEdit, str: QLineEdit}
     for key, typ in config._field_types().items():
         assert type(p.editors[key]) is expected[typ], key
         assert p.editors[key].accessibleName()
@@ -167,7 +167,7 @@ def test_settings_tab_order_reaches_every_control(qtbot, cfg_path):
         w = w.nextInFocusChain()
     controls = list(p.editors.values()) + list(p.reset_buttons.values()) + [_button(p, "Save")]
     for c in controls:
-        assert c in seen or any(ch in seen for ch in c.findChildren(QLineEdit))
+        assert c in seen or c.focusProxy() in seen
 
 
 def _result():
@@ -205,7 +205,8 @@ def test_reveal_builds_per_platform_commands_without_shell(monkeypatch, tmp_path
     calls = []
 
     class FakeProc:
-        pass
+        def wait(self):
+            pass
 
     def fake_popen(argv, **kw):
         calls.append((argv, kw))
@@ -213,6 +214,7 @@ def test_reveal_builds_per_platform_commands_without_shell(monkeypatch, tmp_path
 
     monkeypatch.setattr(reveal.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(reveal, "_resolve", lambda name: "/abs/" + name)
+    (tmp_path / "sub").mkdir()
     target = str(tmp_path / "sub" / "f.txt")
 
     monkeypatch.setattr(reveal.plat, "current_os", lambda: "windows")
@@ -264,3 +266,59 @@ def test_reveal_returns_false_when_launch_fails(monkeypatch, tmp_path):
 
     monkeypatch.setattr(reveal.subprocess, "Popen", boom)
     assert reveal.reveal_in_file_manager(str(tmp_path / "f")) is False
+
+
+def test_reveal_windows_uses_backslash_path(monkeypatch):
+    calls = []
+    monkeypatch.setattr(reveal.subprocess, "Popen", lambda argv, **kw: calls.append(argv) or _Proc())
+    monkeypatch.setattr(reveal, "_resolve", lambda name: "X:/" + name)
+    monkeypatch.setattr(reveal.plat, "current_os", lambda: "windows")
+    assert reveal.reveal_in_file_manager("C:/x/huge.iso") is True
+    assert calls[0][1] == r"/select,C:\x\huge.iso"
+
+
+class _Proc:
+    def __init__(self):
+        import threading
+
+        self.waited = threading.Event()
+
+    def wait(self):
+        self.waited.set()
+
+
+def test_reveal_reaps_child_in_background(monkeypatch, tmp_path):
+    proc = _Proc()
+    monkeypatch.setattr(reveal.subprocess, "Popen", lambda argv, **kw: proc)
+    monkeypatch.setattr(reveal, "_resolve", lambda name: "/abs/" + name)
+    monkeypatch.setattr(reveal.plat, "current_os", lambda: "macos")
+    assert reveal.reveal_in_file_manager(str(tmp_path / "f")) is True
+    assert proc.waited.wait(5)
+
+
+def test_reveal_linux_missing_parent_returns_false(monkeypatch, tmp_path):
+    called = []
+    monkeypatch.setattr(reveal.subprocess, "Popen", lambda *a, **k: called.append(a))
+    monkeypatch.setattr(reveal, "_resolve", lambda name: "/abs/" + name)
+    monkeypatch.setattr(reveal.plat, "current_os", lambda: "linux")
+    assert reveal.reveal_in_file_manager(str(tmp_path / "gone" / "f")) is False
+    assert called == []
+
+
+def test_spin_boxes_ignore_wheel_when_unfocused(qtbot, cfg_path):
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+
+    p = SettingsPanel()
+    qtbot.addWidget(p)
+    for key in ("keep_backups", "temp_min_age_days"):
+        sb = p.editors[key]
+        assert sb.focusPolicy() == Qt.FocusPolicy.StrongFocus
+        before = sb.value()
+        ev = QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(0, 0), QPoint(0, 120),
+                         Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+                         Qt.ScrollPhase.NoScrollPhase, False)
+        assert not sb.hasFocus()
+        sb.wheelEvent(ev)
+        assert sb.value() == before
+        assert not ev.isAccepted()
