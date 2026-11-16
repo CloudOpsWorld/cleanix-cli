@@ -153,4 +153,47 @@ def test_thread_is_cleaned_up_after_finish(qtbot, monkeypatch):
     worker = workers.ScanWorker(object())
     thread = workers.start_worker(worker)
     qtbot.waitUntil(lambda: _finished(thread), timeout=5000)
-    qtbot.waitUntil(lambda: thread not in workers._active, timeout=5000)
+    qtbot.waitUntil(lambda: not any(e[0] is thread for e in workers._active), timeout=5000)
+
+
+def test_worker_is_deleted_after_thread_finished(qtbot, monkeypatch):
+    import shiboken6
+
+    monkeypatch.setattr(workers.service, "scan", lambda *a, **k: None)
+    worker = workers.ScanWorker(object())
+    thread = workers.start_worker(worker)
+    qtbot.waitUntil(lambda: _finished(thread), timeout=5000)
+    qtbot.waitUntil(lambda: not shiboken6.isValid(worker), timeout=5000)
+
+
+def test_cancel_all_and_wait_stops_running_worker(qtbot, monkeypatch):
+    started = threading.Event()
+
+    def fake_scan(config, only=None, exclude=None, progress=None, cancel=None):
+        started.set()
+        while not cancel():
+            QThread.msleep(5)
+        raise service.Cancelled()
+
+    monkeypatch.setattr(workers.service, "scan", fake_scan)
+    workers.start_worker(workers.ScanWorker(object()))
+    qtbot.waitUntil(started.is_set, timeout=5000)
+    assert workers.cancel_all_and_wait(5000) is True
+    assert not workers._active
+
+
+def test_cancel_all_and_wait_with_nothing_running():
+    assert workers.cancel_all_and_wait() is True
+
+
+def test_base_exception_still_emits_terminal_signal(monkeypatch):
+    def fake_scan(*a, **k):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(workers.service, "scan", fake_scan)
+    worker = workers.ScanWorker(object())
+    rec = Recorder(worker)
+    with pytest.raises(KeyboardInterrupt):
+        worker.run()
+    assert rec.terminal() == ["failed"]
+    assert rec.events[-1] == ("failed", "interrupted")
