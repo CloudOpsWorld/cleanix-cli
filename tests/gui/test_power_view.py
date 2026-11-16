@@ -33,7 +33,8 @@ def _result():
     return ScanResult(reports=[
         CleanerReport("temp", "Temp", "Temp files", items=[
             CleanableItem("temp", "small cache", size=900 * 1024, path="/tmp/a"),
-            CleanableItem("temp", big_path, size=10 * MB, path=big_path),
+            CleanableItem("temp", "big cache dir", size=10 * MB, path=big_path),
+            CleanableItem("temp", "unicode", size=1, path="C:/Users/שלום/über/缓存"),
         ]),
         CleanerReport("apt", "APT", "Apt", items=[
             CleanableItem("apt", "apt clean", size=5 * MB, kind=ItemKind.COMMAND,
@@ -64,15 +65,31 @@ class FakeScan(QObject):
 
 
 class FakeClean(FakeScan):
+    def __init__(self, items=(), dry_run=True):
+        super().__init__()
+        self.items = list(items)
+        self.dry_run = dry_run
+
     def run(self):
-        from cleanix.core.models import CleanResult
+        from cleanix.core.models import CleanOutcome, CleanResult
         from cleanix.core.service import CleanSummary
-        self.finished.emit(CleanSummary(result=CleanResult(dry_run=True),
-                                        freed=1, removed=1))
+        outs = [CleanOutcome(i, removed=not self.dry_run, freed=i.size,
+                             dry_run=self.dry_run) for i in self.items]
+        self.finished.emit(CleanSummary(
+            result=CleanResult(outcomes=outs, dry_run=self.dry_run),
+            freed=1, removed=1))
 
 
 @pytest.fixture
-def sync_workers(monkeypatch):
+def fake_catalog(monkeypatch):
+    monkeypatch.setattr(catalog, "list_cleaners", lambda cfg, **k: [
+        _info("temp", "Temp"), _info("apt", "APT", root=True, category="system"),
+        _info("big_files", "Big files", category="review"),
+        _info("opt", "Optional", default=False)])
+
+
+@pytest.fixture
+def sync_workers(monkeypatch, fake_catalog):
     """Run workers synchronously on the calling thread."""
     monkeypatch.setattr(workers, "start_worker", lambda w: w.run())
     monkeypatch.setattr(pv.PowerView, "show_results", lambda *a, **k: None)
@@ -126,7 +143,7 @@ def test_item_model_columns_roles_and_size_sort_key(view):
     sizes = [view.proxy.data(view.proxy.index(r, 3), Qt.ItemDataRole.UserRole)
              for r in range(view.proxy.rowCount())]
     assert sizes == sorted(sizes)
-    first_two = sizes[:2]
+    first_two = sizes[1:3]
     assert first_two == [900 * 1024, 5 * MB]
     assert sizes.index(10 * MB) > sizes.index(900 * 1024)
     view.proxy.sort(3, Qt.SortOrder.DescendingOrder)
@@ -148,6 +165,7 @@ def test_check_toggle_updates_checked_items(view):
     _load(view)
     m = view.item_model
     assert len(m.checked_items()) == 3
+    assert m.item_at(0) in m.checked_items()
     m.set_checked(0, False)
     assert m.item_at(0) not in m.checked_items()
     assert len(m.checked_items()) == 2
@@ -157,13 +175,13 @@ def test_check_toggle_updates_checked_items(view):
 
 def test_filter_text_hides_non_matching_rows(view):
     _load(view)
-    assert view.proxy.rowCount() == 4
+    assert view.proxy.rowCount() == 5
     view.filter_edit.setText("apt")
     assert view.proxy.rowCount() == 1
     view.filter_edit.setText("SMALL")
     assert view.proxy.rowCount() == 1
     view.filter_edit.setText("")
-    assert view.proxy.rowCount() == 4
+    assert view.proxy.rowCount() == 5
 
 
 def _select(view, predicate):
@@ -176,10 +194,10 @@ def _select(view, predicate):
 def test_detail_pane_shows_hint_for_report_only_and_command_for_command_items(view):
     _load(view)
     _select(view, lambda i: i.report_only)
-    assert "Delete it manually" in view.detail_label.text()
-    assert "/x/huge.iso" in view.detail_label.text()
+    assert "Delete it manually" in view.detail_label.toPlainText()
+    assert "/x/huge.iso" in view.detail_label.toPlainText()
     _select(view, lambda i: i.kind is ItemKind.COMMAND)
-    text = view.detail_label.text()
+    text = view.detail_label.toPlainText()
     assert "apt-get clean" in text
     assert "Requires administrator" in text
 
@@ -244,7 +262,7 @@ def test_enabled_cleaners_are_passed_to_scan_as_only(qtbot, monkeypatch, sync_wo
                             Qt.ItemDataRole.CheckStateRole)
     v.scan_button.click()
     assert seen[-1] == ["temp", "opt"]
-    assert v.item_model.rowCount() == 4
+    assert v.item_model.rowCount() == 5
 
 
 def test_default_scan_factory_builds_scan_worker_with_only(qtbot, monkeypatch, sync_workers):
@@ -271,7 +289,8 @@ def test_table_cells_elide_with_tooltip_for_long_paths(view):
     tip = m.data(m.index(row, 2), Qt.ItemDataRole.ToolTipRole)
     assert long_path in tip
     # the displayed text is the full string; the view elides it visually
-    assert m.data(m.index(row, 2), Qt.ItemDataRole.DisplayRole) == long_path
+    assert m.data(m.index(row, 2), Qt.ItemDataRole.DisplayRole) == "big cache dir"
+    assert long_path != m.item_at(row).description
     cmd_row = next(r for r in range(m.rowCount())
                    if m.item_at(r).kind is ItemKind.COMMAND)
     assert "apt-get clean" in m.data(m.index(cmd_row, 2), Qt.ItemDataRole.ToolTipRole)
@@ -294,10 +313,193 @@ def test_panel_titles_and_add_panel(view):
 
 
 def test_clean_finished_emits_summary_and_updates_status(qtbot, monkeypatch, sync_workers):
-    v = pv.PowerView(Config(), clean_worker_factory=lambda items, **k: FakeClean())
+    v = pv.PowerView(Config(), clean_worker_factory=lambda items, **k: FakeClean(items))
     qtbot.addWidget(v)
     _load(v)
     with qtbot.waitSignal(v.clean_finished) as sig:
         v.clean_button.click()
     assert sig.args[0].removed == 1
     assert "Would free" in v.status_label.text()
+
+
+def _stub_real_clean(monkeypatch, texts, seen):
+    monkeypatch.setattr(pv.PowerView, "confirm_clean",
+                        lambda self, text: texts.append(text) or True)
+
+    def factory(items, *, dry_run, use_quarantine):
+        seen.append(list(items))
+        return FakeClean(items, dry_run=dry_run)
+    return factory
+
+
+def test_initial_checked_set_equals_preselect_set(view):
+    _load(view)
+    m = view.item_model
+    infos = {view.cleaner_model.info_at(r).id: view.cleaner_model.info_at(r)
+             for r in range(view.cleaner_model.rowCount())}
+    expected = [i for i in _result().all_items()
+                if catalog.preselect(i, infos[i.cleaner_id])]
+    assert [i.path for i in m.checked_items()] == [i.path for i in expected]
+    assert not any(i.requires_root or i.kind is ItemKind.COMMAND or i.report_only
+                   for i in m.checked_items())
+
+
+def test_unknown_cleaner_starts_unchecked(qtbot, monkeypatch, sync_workers):
+    monkeypatch.setattr(catalog, "list_cleaners", lambda cfg, **k: [])
+    v = pv.PowerView(Config())
+    qtbot.addWidget(v)
+    _load(v)
+    assert v.item_model.checked_items() == []
+
+
+def test_clean_only_visible_items_and_confirm_mentions_hidden(
+        qtbot, monkeypatch, sync_workers, view):
+    texts, seen = [], []
+    v = pv.PowerView(Config(), allow_admin_items=True,
+                     clean_worker_factory=_stub_real_clean(monkeypatch, texts, seen))
+    qtbot.addWidget(v)
+    _load(v)
+    v.select_all_visible()
+    assert len(v.item_model.checked_items()) == 4  # all non-report-only
+    v.filter_edit.setText("apt")
+    v.dry_run_check.setChecked(False)
+    v.clean_button.click()
+    assert [i.cleaner_id for i in seen[0]] == ["apt"]
+    assert "1 selected item(s)" in texts[0]
+    assert "3 more checked item(s) are hidden by the filter and will NOT be cleaned" in texts[0]
+
+
+def test_select_all_visible_only_filtered_in_and_never_report_only(
+        qtbot, sync_workers):
+    view = pv.PowerView(Config(), allow_admin_items=True)
+    qtbot.addWidget(view)
+    _load(view)
+    view.select_none_visible()
+    assert view.item_model.checked_items() == []
+    view.filter_edit.setText("apt")
+    view.select_all_visible()
+    assert [i.cleaner_id for i in view.item_model.checked_items()] == ["apt"]
+    view.filter_edit.setText("")
+    view.select_all_visible()
+    assert all(not i.report_only for i in view.item_model.checked_items())
+    assert len(view.item_model.checked_items()) == 4
+    view.filter_edit.setText("temp")
+    view.select_none_visible()
+    assert [i.cleaner_id for i in view.item_model.checked_items()] == ["apt"]
+
+
+def test_admin_rows_not_checkable_by_default(view):
+    _load(view)
+    m = view.item_model
+    row = next(r for r in range(m.rowCount()) if m.item_at(r).requires_root)
+    assert not (m.flags(m.index(row, 0)) & Qt.ItemFlag.ItemIsUserCheckable)
+    assert m.data(m.index(row, 0), Qt.ItemDataRole.CheckStateRole) is None
+    assert m.data(m.index(row, 4)) == "Admin"
+    assert m.set_checked(row, True) is False
+    view.select_all_visible()
+    assert not any(i.requires_root for i in m.checked_items())
+    assert len(m.checked_items()) == 3
+    _select(view, lambda i: i.requires_root)
+    assert "not available until elevation is supported" in view.detail_label.toPlainText()
+
+
+def test_admin_rows_checkable_when_allowed_but_start_unchecked(qtbot, sync_workers):
+    v = pv.PowerView(Config(), allow_admin_items=True)
+    qtbot.addWidget(v)
+    _load(v)
+    m = v.item_model
+    row = next(r for r in range(m.rowCount()) if m.item_at(r).requires_root)
+    assert m.flags(m.index(row, 0)) & Qt.ItemFlag.ItemIsUserCheckable
+    assert not m.is_checked(row)
+    assert m.set_checked(row, True) is True
+    assert m.item_at(row) in m.checked_items()
+    _select(v, lambda i: i.requires_root)
+    assert "not available until" not in v.detail_label.toPlainText()
+
+
+def test_start_scan_and_clean_ignored_while_worker_running(qtbot, monkeypatch):
+    monkeypatch.setattr(workers, "start_worker", lambda w: None)  # never finishes
+    n = []
+    v = pv.PowerView(Config(), scan_worker_factory=lambda only: n.append(1) or FakeScan(_result()))
+    qtbot.addWidget(v)
+    v.start_scan()
+    v.start_scan()
+    assert n == [1]
+    v._result = _result()
+    v.item_model.set_result(_result(), lambda i: True)
+    v.start_clean()
+    assert v.status_label.text() == "Scanning..."
+
+
+def test_shutdown_cancels_worker_and_is_idempotent(qtbot, monkeypatch):
+    monkeypatch.setattr(workers, "start_worker", lambda w: None)
+    cancelled = []
+
+    class W(FakeScan):
+        def cancel(self):
+            cancelled.append(1)
+
+    v = pv.PowerView(Config(), scan_worker_factory=lambda only: W())
+    qtbot.addWidget(v)
+    v.shutdown()  # nothing running
+    v.start_scan()
+    v.shutdown()
+    v.shutdown()
+    assert cancelled == [1]
+
+
+def test_detail_pane_handles_long_unicode_paths_and_is_keyboard_reachable(view):
+    _load(view)
+    _select(view, lambda i: i.size == 10 * MB)
+    d = view.detail_label
+    path = view.item_model.item_at(
+        next(r for r in range(view.item_model.rowCount())
+             if view.item_model.item_at(r).size == 10 * MB)).path
+    assert path in d.toolTip() and path in d.toPlainText()
+    assert d.lineWrapMode() == d.LineWrapMode.WidgetWidth
+    flags = d.textInteractionFlags()
+    assert flags & Qt.TextInteractionFlag.TextSelectableByKeyboard
+    assert d.focusPolicy() in (Qt.FocusPolicy.StrongFocus, Qt.FocusPolicy.TabFocus)
+    _select(view, lambda i: i.size == 1)
+    uni = next(i for i in _result().all_items() if i.size == 1).path
+    assert uni in d.toolTip()
+    m = view.item_model
+    row = next(r for r in range(m.rowCount()) if m.item_at(r).size == 1)
+    assert uni in m.data(m.index(row, 2), Qt.ItemDataRole.ToolTipRole)
+
+
+def test_second_clean_after_real_clean_does_not_resubmit(qtbot, monkeypatch, sync_workers):
+    texts, seen = [], []
+    v = pv.PowerView(Config(), clean_worker_factory=_stub_real_clean(monkeypatch, texts, seen))
+    qtbot.addWidget(v)
+    _load(v)
+    v.dry_run_check.setChecked(False)
+    first = len(v.item_model.checked_items())
+    assert first > 0
+    v.clean_button.click()
+    assert len(seen[0]) == first
+    assert v.item_model.checked_items() == []
+    v.clean_button.click()
+    assert len(seen) == 1
+
+
+def test_dry_run_keeps_rows(qtbot, monkeypatch, sync_workers):
+    seen = []
+    v = pv.PowerView(Config(), clean_worker_factory=lambda items, **k: (
+        seen.append(1) or FakeClean(items, dry_run=True)))
+    qtbot.addWidget(v)
+    _load(v)
+    n = v.item_model.rowCount()
+    v.clean_button.click()
+    assert v.item_model.rowCount() == n
+
+
+def test_confirm_text_keep_copy_and_permanent():
+    cmd = CleanableItem("apt", "x", size=MB, kind=ItemKind.COMMAND, command=["a"])
+    path = CleanableItem("temp", "y", size=MB, path="/t")
+    keep = pv.PowerView.confirm_text([cmd, path], 0, True)
+    assert "restore" in keep and "cannot be kept" in keep and "permanently" not in keep
+    perm = pv.PowerView.confirm_text([path], 2, False)
+    assert "permanently removed" in perm and "cannot be undone" in perm
+    assert "2 more checked" in perm
+    assert "hidden" not in pv.PowerView.confirm_text([path], 0, False)

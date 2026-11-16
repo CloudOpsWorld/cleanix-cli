@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from PySide6.QtCore import QAbstractListModel, QAbstractTableModel, QModelIndex, Qt
 
 from cleanix.config import Config
 from cleanix.core import catalog
-from cleanix.core.models import CleanableItem, ItemKind, ScanResult
+from cleanix.core.models import CleanableItem, ItemKind, ScanResult, item_key
 from cleanix.core.utils import human_size
 
 # Custom roles for CleanerListModel.
@@ -93,8 +93,9 @@ def _target_text(item: CleanableItem) -> str:
 
 
 class ItemTableModel(QAbstractTableModel):
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, allow_admin_items: bool = False) -> None:
         super().__init__(parent)
+        self._allow_admin = allow_admin_items
         self._items: List[CleanableItem] = []
         self._names: Dict[str, str] = {}
         self._checked: List[bool] = []
@@ -112,7 +113,8 @@ class ItemTableModel(QAbstractTableModel):
             return COLUMNS[section]
         return None
 
-    def set_result(self, result: Optional[ScanResult]) -> None:
+    def set_result(self, result: Optional[ScanResult],
+                   preselect: Optional[Callable[[CleanableItem], bool]] = None) -> None:
         self.beginResetModel()
         self._items = []
         self._names = {}
@@ -120,8 +122,39 @@ class ItemTableModel(QAbstractTableModel):
             for rep in result.reports:
                 self._names[rep.cleaner_id] = rep.name
                 self._items.extend(rep.items)
-        # Items start checked unless report-only; opt-in handled by cleaner list.
-        self._checked = [not i.report_only for i in self._items]
+        # Checked only when the caller's preselect rule says so (never for
+        # report-only rows); with no rule everything starts unchecked.
+        self._checked = [
+            (bool(preselect(i)) and self._checkable(i)) if preselect else False
+            for i in self._items]
+        self.endResetModel()
+
+    @property
+    def allow_admin_items(self) -> bool:
+        return self._allow_admin
+
+    def set_allow_admin_items(self, allow: bool) -> None:
+        self.beginResetModel()
+        self._allow_admin = bool(allow)
+        self._checked = [c and self._checkable(i)
+                         for c, i in zip(self._checked, self._items)]
+        self.endResetModel()
+
+    def _checkable(self, item: CleanableItem) -> bool:
+        if item.report_only:
+            return False
+        return self._allow_admin or not item.requires_root
+
+    def is_checked(self, row: int) -> bool:
+        return self._checked[row] and self._checkable(self._items[row])
+
+    def remove_keys(self, keys) -> None:
+        keys = set(keys)
+        self.beginResetModel()
+        kept = [(i, c) for i, c in zip(self._items, self._checked)
+                if item_key(i) not in keys]
+        self._items = [i for i, _ in kept]
+        self._checked = [c for _, c in kept]
         self.endResetModel()
 
     def item_at(self, row: int) -> CleanableItem:
@@ -131,7 +164,7 @@ class ItemTableModel(QAbstractTableModel):
         return self._names.get(item.cleaner_id, item.cleaner_id)
 
     def set_checked(self, row: int, checked: bool) -> bool:
-        if not (0 <= row < len(self._items)) or self._items[row].report_only:
+        if not (0 <= row < len(self._items)) or not self._checkable(self._items[row]):
             return False
         self._checked[row] = bool(checked)
         idx = self.index(row, 0)
@@ -140,13 +173,13 @@ class ItemTableModel(QAbstractTableModel):
 
     def checked_items(self) -> List[CleanableItem]:
         return [i for i, c in zip(self._items, self._checked)
-                if c and not i.report_only]
+                if c and self._checkable(i)]
 
     def flags(self, index):  # noqa: D401
         if not index.isValid():
             return Qt.ItemFlag.NoItemFlags
         f = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        if index.column() == 0 and not self._items[index.row()].report_only:
+        if index.column() == 0 and self._checkable(self._items[index.row()]):
             f |= Qt.ItemFlag.ItemIsUserCheckable
         return f
 
@@ -163,7 +196,7 @@ class ItemTableModel(QAbstractTableModel):
         item = self._items[index.row()]
         col = index.column()
         if role == Qt.ItemDataRole.CheckStateRole:
-            if col == 0 and not item.report_only:
+            if col == 0 and self._checkable(item):
                 return (Qt.CheckState.Checked if self._checked[index.row()]
                         else Qt.CheckState.Unchecked)
             return None

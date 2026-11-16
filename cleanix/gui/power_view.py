@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from PySide6.QtGui import QTextOption
 from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListView,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QTableView,
@@ -26,8 +28,8 @@ from PySide6.QtWidgets import (
 )
 
 from cleanix.config import Config
-from cleanix.core import report
-from cleanix.core.models import CleanableItem, ItemKind, ScanResult
+from cleanix.core import catalog, report
+from cleanix.core.models import CleanableItem, ItemKind, ScanResult, item_key
 from cleanix.core.utils import human_size
 from cleanix.gui import workers
 from cleanix.gui.models import (
@@ -46,8 +48,13 @@ class _ItemFilterProxy(QSortFilterProxyModel):
         self.setSortRole(Qt.ItemDataRole.UserRole)
 
     def set_filter_text(self, text: str) -> None:
+        begin = getattr(self, "beginFilterChange", None)
         self._text = text.strip().lower()
-        self.invalidateFilter()
+        if begin is not None:
+            begin()
+            self.endFilterChange()
+        else:
+            self.invalidateFilter()
 
     def filterAcceptsRow(self, row: int, parent: QModelIndex) -> bool:  # noqa: N802
         if not self._text:
@@ -79,12 +86,14 @@ class PowerView(QWidget):
     def __init__(self, config: Config, *,
                  scan_worker_factory: Optional[Callable[[List[str]], object]] = None,
                  clean_worker_factory: Optional[Callable[..., object]] = None,
+                 allow_admin_items: bool = False,
                  parent: Optional[QWidget] = None) -> None:
         """``scan_worker_factory(only_ids)`` and
         ``clean_worker_factory(items, dry_run=..., use_quarantine=...)`` return
         worker QObjects (see cleanix.gui.workers)."""
         super().__init__(parent)
         self._config = config
+        self._allow_admin = allow_admin_items
         self._scan_factory = scan_worker_factory or self._default_scan_worker
         self._clean_factory = clean_worker_factory or self._default_clean_worker
         self._result: Optional[ScanResult] = None
@@ -116,7 +125,7 @@ class PowerView(QWidget):
     # ----- UI -----
     def _build_scan_tab(self) -> None:
         self.cleaner_model = _CleanerDelegateModel(self._config, self)
-        self.item_model = ItemTableModel(self)
+        self.item_model = ItemTableModel(self, allow_admin_items=self._allow_admin)
         self.proxy = _ItemFilterProxy(self)
         self.proxy.setSourceModel(self.item_model)
 
@@ -125,6 +134,10 @@ class PowerView(QWidget):
         self.clean_button = QPushButton("Clean selected")
         self.clean_button.setAccessibleName("Clean selected")
         self.clean_button.setEnabled(False)
+        self.select_visible_button = QPushButton("Select all visible")
+        self.select_visible_button.setAccessibleName("Select all visible")
+        self.select_none_button = QPushButton("Select none")
+        self.select_none_button.setAccessibleName("Select none")
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setAccessibleName("Cancel")
         self.cancel_button.setEnabled(False)
@@ -146,6 +159,7 @@ class PowerView(QWidget):
 
         toolbar = QHBoxLayout()
         for w in (self.scan_button, self.clean_button, self.cancel_button,
+                  self.select_visible_button, self.select_none_button,
                   self.dry_run_check, self.quarantine_check, self.export_button):
             toolbar.addWidget(w)
         toolbar.addStretch(1)
@@ -171,12 +185,18 @@ class PowerView(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.selectionModel().currentRowChanged.connect(self._on_current_changed)
 
-        self.detail_label = QLabel("Select an item to see details.")
-        self.detail_label.setAccessibleName("Item details")
-        self.detail_label.setWordWrap(True)
+        # Read-only text box: wraps long unbroken paths, keyboard focusable
+        # and selectable.
+        self.detail_label = QPlainTextEdit()
+        self.detail_label.setReadOnly(True)
+        self.detail_label.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.detail_label.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         self.detail_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.detail_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        self.detail_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.detail_label.setAccessibleName("Item details")
+        self._set_detail("Select an item to see details.")
 
         self.status_label = QLabel("")
         self.status_label.setAccessibleName("Status")
@@ -197,22 +217,30 @@ class PowerView(QWidget):
         lay.addWidget(split, 1)
         lay.addWidget(self.status_label)
 
+        QWidget.setTabOrder(self.table, self.detail_label)
         self.scan_button.clicked.connect(self.start_scan)
         self.clean_button.clicked.connect(self.start_clean)
         self.cancel_button.clicked.connect(self.cancel_current)
         self.export_button.clicked.connect(self._on_export_clicked)
         self.filter_edit.textChanged.connect(self.proxy.set_filter_text)
+        self.select_visible_button.clicked.connect(self.select_all_visible)
+        self.select_none_button.clicked.connect(self.select_none_visible)
 
     # ----- detail -----
     def _on_current_changed(self, current: QModelIndex, _previous=None) -> None:
         if not current.isValid():
-            self.detail_label.setText("Select an item to see details.")
+            self._set_detail("Select an item to see details.")
             return
         row = self.proxy.mapToSource(current).row()
-        self.detail_label.setText(self.detail_text(self.item_model.item_at(row)))
+        self._set_detail(self.detail_text(self.item_model.item_at(row),
+                                          allow_admin=self._allow_admin))
+
+    def _set_detail(self, text: str) -> None:
+        self.detail_label.setPlainText(text)
+        self.detail_label.setToolTip(text)  # full text
 
     @staticmethod
-    def detail_text(item: CleanableItem) -> str:
+    def detail_text(item: CleanableItem, allow_admin: bool = True) -> str:
         lines = [item.description]
         if item.kind is ItemKind.COMMAND:
             lines.append("Command: " + " ".join(item.command or []))
@@ -225,6 +253,9 @@ class PowerView(QWidget):
         lines.append(f"Size: {human_size(item.size)}")
         if item.requires_root:
             lines.append("Requires administrator")
+            if not allow_admin:
+                lines.append("Needs administrator permission; not available "
+                             "until elevation is supported.")
         return "\n".join(lines)
 
     # ----- busy state -----
@@ -239,6 +270,28 @@ class PowerView(QWidget):
             self._worker.cancel()
             self.status_label.setText("Cancelling...")
 
+    def _visible_rows(self) -> List[int]:
+        return [self.proxy.mapToSource(self.proxy.index(r, 0)).row()
+                for r in range(self.proxy.rowCount())]
+
+    def visible_checked_items(self) -> List[CleanableItem]:
+        m = self.item_model
+        return [m.item_at(r) for r in self._visible_rows() if m.is_checked(r)]
+
+    def select_all_visible(self) -> None:
+        for r in self._visible_rows():
+            self.item_model.set_checked(r, True)  # refuses report-only rows
+
+    def select_none_visible(self) -> None:
+        for r in self._visible_rows():
+            self.item_model.set_checked(r, False)
+
+    def shutdown(self) -> None:
+        """Cancel any running worker; safe to call repeatedly."""
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.cancel()
+
     def _run(self, worker) -> None:
         self._worker = worker
         worker.progress.connect(self._on_progress)
@@ -247,6 +300,8 @@ class PowerView(QWidget):
 
     # ----- scan -----
     def start_scan(self) -> None:
+        if self._worker is not None:
+            return
         only = self.cleaner_model.enabled_ids()
         if not only:
             self.status_label.setText("Select at least one cleaner to scan.")
@@ -264,7 +319,14 @@ class PowerView(QWidget):
     def _on_scan_finished(self, result) -> None:
         self._worker = None
         self._result = result
-        self.item_model.set_result(result)
+        infos = {self.cleaner_model.info_at(r).id: self.cleaner_model.info_at(r)
+                 for r in range(self.cleaner_model.rowCount())}
+
+        def _pre(item: CleanableItem) -> bool:
+            info = infos.get(item.cleaner_id)
+            return info is not None and catalog.preselect(item, info)
+
+        self.item_model.set_result(result, _pre)
         self.table.sortByColumn(3, Qt.SortOrder.DescendingOrder)
         self.status_label.setText(
             f"Found {result.total_items} items, {human_size(result.total_size)}")
@@ -282,26 +344,47 @@ class PowerView(QWidget):
         self._set_busy(False)
 
     # ----- clean -----
-    def confirm_clean(self, count: int, size: int) -> bool:
+    @staticmethod
+    def confirm_text(items: List[CleanableItem], hidden: int, keep_copy: bool) -> str:
+        size = human_size(sum(i.size for i in items))
+        lines = [f"{len(items)} selected item(s), {size}."]
+        commands = sum(1 for i in items if i.kind is ItemKind.COMMAND)
+        if keep_copy:
+            lines.append("A copy of each removed file is kept so you can restore it.")
+            if commands:
+                lines.append(f"{commands} command item(s) cannot be kept or undone.")
+        else:
+            lines.append("These items will be permanently removed. This cannot be undone.")
+        if hidden:
+            lines.append(f"{hidden} more checked item(s) are hidden by the filter "
+                         "and will NOT be cleaned.")
+        lines.append("Continue?")
+        return "\n".join(lines)
+
+    def confirm_clean(self, text: str) -> bool:
         answer = QMessageBox.question(
-            self, "Cleanix",
-            f"Remove {count} selected items ({human_size(size)})?",
+            self, "Cleanix", text,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         return answer == QMessageBox.StandardButton.Yes
 
     def start_clean(self) -> None:
-        items = self.item_model.checked_items()
+        if self._worker is not None:
+            return
+        items = self.visible_checked_items()
         if not items:
-            self.status_label.setText("No items selected.")
+            self.status_label.setText("No visible items selected.")
             return
         dry_run = self.dry_run_check.isChecked()
-        if not dry_run and not self.confirm_clean(len(items), sum(i.size for i in items)):
-            return
+        keep = self.quarantine_check.isChecked()
+        if not dry_run:
+            m = self.item_model
+            total_checked = sum(1 for r in range(m.rowCount()) if m.is_checked(r))
+            text = self.confirm_text(items, total_checked - len(items), keep)
+            if not self.confirm_clean(text):
+                return
         self.status_label.setText("Dry run..." if dry_run else "Cleaning...")
-        worker = self._clean_factory(
-            items, dry_run=dry_run,
-            use_quarantine=self.quarantine_check.isChecked())
+        worker = self._clean_factory(items, dry_run=dry_run, use_quarantine=keep)
         worker.finished.connect(self._on_clean_finished)
         worker.cancelled.connect(self._on_cancelled)
         worker.failed.connect(self._on_failed)
@@ -318,6 +401,10 @@ class PowerView(QWidget):
         if summary.errors:
             text += f", {len(summary.errors)} errors"
         self.status_label.setText(text)
+        if not dry:
+            # Done rows leave the table; a rescan is needed for fresh state.
+            done = {item_key(o.item) for o in summary.result.outcomes if o.removed}
+            self.item_model.remove_keys(done)
         self.show_results(summary, text)
         self.clean_finished.emit(summary)
 
