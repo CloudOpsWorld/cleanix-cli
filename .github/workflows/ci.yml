@@ -16,8 +16,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # cleanix is a *nix cleaner — Linux and macOS only, no Windows.
-        os: [ubuntu-latest, macos-latest]
+        # Linux, macOS and Windows are all supported platforms.
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:

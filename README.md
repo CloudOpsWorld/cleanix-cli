@@ -6,13 +6,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A safe, thorough system cleaner for **every *nix flavour** — Linux (all
-major distros), macOS, and the BSDs. It **analyzes** your OS for junk — caches,
+major distros), macOS, and the BSDs — and **Windows**. It **analyzes** your OS for junk — caches,
 temp files, package-manager leftovers, orphaned packages, broken symlinks,
 package-update config residue, rotated logs, trash, thumbnails, browser/dev
 caches, container cruft — and only **removes** anything after you confirm.
 
 It can run on a **schedule** (a systemd timer on Linux/BSD, a launchd agent on
-macOS) to periodically analyze the
+macOS, a Task Scheduler task on Windows) to periodically analyze the
 system and notify you. Scheduled runs *never delete anything*; they only produce
 a report so you can review and clean on your own terms.
 
@@ -28,10 +28,31 @@ Cleaners declare which platforms they apply to; `cleanix` auto-detects the OS
 | FreeBSD  | `freebsd`                          | pkg cache + autoremove, ports distfiles & work dirs |
 | NetBSD   | `netbsd`                           | pkg, pkgin cache |
 | OpenBSD  | `openbsd`                          | pkg |
+| Windows  | `windows`                          | `%TEMP%`, thumbnail/icon caches, error reports & crash dumps, Recycle Bin, Windows Update/Delivery Optimization cache, system temp & dumps (admin), browser caches (Chrome/Edge/Brave/Firefox), DirectX/NVIDIA/AMD shader caches, WinGet/Chocolatey/Scoop/NuGet caches, Visual Studio cache; report-only: Prefetch, `Windows.old`, WSL disks; opt-in: DISM component store; Task Scheduler |
 | Cross-OS | all of the above                   | trash, thumbnails, ~/.cache, temp files, fonts, browser caches, broken symlinks, `.DS_Store`/AppleDouble, dev/language caches (cargo/go/gradle/ccache/composer/…), pip, npm/yarn, Docker, Podman |
 
 Run `cleanix list` to see what applies to your machine, or `cleanix list --all`
 to see every platform's cleaners.
+
+## Windows notes
+
+- Config is `%APPDATA%\cleanix\config.yaml`; state, history and quarantine live
+  under `%LOCALAPPDATA%\cleanix`. Cleanix never touches the registry.
+- Items that need admin rights (`win_system_temp`, `win_update_cache`,
+  `win_system_dumps`, DISM) require an **elevated terminal** (Run as
+  administrator); otherwise they are skipped with a note.
+- **Report-only:** Prefetch, `Windows.old` and WSL virtual disks (`wsl_disk`)
+  are sized and explained, never deleted.
+- **DISM component-store cleanup is opt-in:**
+  `cleanix clean --only win_component_store --execute` (elevated).
+- **Quarantine covers path-based items only.** Command items such as emptying
+  the Recycle Bin and DISM cannot be undone with `cleanix restore`.
+- `cleanix schedule install` creates a per-user, scan-only Task Scheduler task
+  named "Cleanix Scan" (it never cleans).
+- `cleanix factory-reset` is not supported on Windows.
+- The AI-tool, dev-cache, pip/npm, Docker, Electron, JetBrains, big-file,
+  duplicate, downloads, stale-project and browser-profile cleaners also run on
+  Windows.
 
 ## AI / LLM leftovers (triaged, not nuked)
 
@@ -243,7 +264,8 @@ sudo cleanix clean --only memory_macos --execute   # macOS `purge`
   note) when you run unprivileged.
 - **Scheduling.** Install a periodic read-only scan that reports (and notifies)
   on a daily/weekly/monthly cadence — a **systemd user timer** on Linux, a
-  **launchd LaunchAgent** on macOS, and a **cron job** on the BSDs (or any
+  **launchd LaunchAgent** on macOS, a per-user **Task Scheduler** task on
+  Windows, and a **cron job** on the BSDs (or any
   system with `crontab` but no systemd). Same `cleanix schedule` command on all.
 
 ## Install
@@ -302,7 +324,7 @@ cleanix factory-reset --scope user
 
 ## Configuration via CLI
 
-`cleanix config` reads/writes `~/.config/cleanix/config.yaml` with type-checked
+`cleanix config` reads/writes `~/.config/cleanix/config.yaml` (`%APPDATA%\cleanix\config.yaml` on Windows) with type-checked
 values, so you never have to hand-edit YAML:
 
 ```bash
@@ -474,6 +496,7 @@ cleanix/
     __init__.py       # backend() — picks systemd or launchd for the OS
     systemd.py        # install/uninstall/status of a user systemd timer (Linux/BSD)
     launchd.py        # install/uninstall/status of a launchd LaunchAgent (macOS)
+    schtasks.py       # per-user Task Scheduler scan task (Windows)
 ```
 
 To add a cleaner: subclass `Cleaner`, set `id`/`name`/`platforms`/`requires_root`,

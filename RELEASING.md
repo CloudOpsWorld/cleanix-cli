@@ -7,7 +7,7 @@ push-to-`main`-triggers-release flow.
 
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| `.github/workflows/ci.yml` | push / PR to `main`/`master` | Test matrix (Ubuntu + macOS × Python 3.9–3.13), advisory ruff lint & mypy |
+| `.github/workflows/ci.yml` | push / PR to `main`/`master` | Test matrix (Ubuntu + macOS + Windows × Python 3.10–3.13), advisory ruff lint & mypy |
 | `.github/workflows/build.yml` | `workflow_call` / manual | Runs tests, builds standalone binaries (Linux + macOS via PyInstaller) and the wheel/sdist (`python -m build` + `twine check`) |
 | `.github/workflows/release.yml` | push to `main`/`master` | Detects a new version, tags it, builds artifacts, creates a GitHub Release, and publishes to PyPI |
 

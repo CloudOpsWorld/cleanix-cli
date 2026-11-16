@@ -1170,6 +1170,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if sys.platform == "win32":
+        # Redirected/scheduled output defaults to a legacy code page that
+        # cannot encode the table glyphs; never crash on rendering.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError, OSError):
+                pass
     console = Console()
     try:
         return args.func(args, console)
