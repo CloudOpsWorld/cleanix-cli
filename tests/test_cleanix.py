@@ -364,6 +364,7 @@ def test_docker_stopped_containers_no_dead_filter(monkeypatch):
 def test_scheduler_backend_per_os(monkeypatch):
     import cleanix.scheduler as sched
 
+    monkeypatch.setattr(sched, "is_windows", lambda: False)
     monkeypatch.setattr(sched, "is_macos", lambda: True)
     monkeypatch.setattr(sched, "is_bsd", lambda: False)
     assert sched.backend().__name__.endswith("launchd")
