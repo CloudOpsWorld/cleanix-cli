@@ -6,6 +6,7 @@ root checks are enforced in one auditable place.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
@@ -132,7 +133,11 @@ class Engine:
         # Reversible mode: move to quarantine instead of deleting.
         if quarantine is not None:
             try:
-                quarantine.store(p)
+                if os.name == "nt":
+                    # Act on exactly the (canonical) path the guard checked.
+                    quarantine.store(safety.assert_safe_to_delete(path))
+                else:
+                    quarantine.store(p)
             except Exception as exc:  # noqa: BLE001
                 return CleanOutcome(item=item, removed=False, error=f"quarantine: {exc}")
             return CleanOutcome(item=item, removed=True, freed=freed)

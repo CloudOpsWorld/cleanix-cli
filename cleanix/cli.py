@@ -917,12 +917,14 @@ def cmd_quarantine(args: argparse.Namespace, console: Console) -> int:
 
     # empty
     if args.all or not args.run_id:
-        freed = quarantine.purge_all()
+        freed, errors = quarantine.purge_all_detailed()
         console.print(f"[green]Emptied quarantine, reclaimed {human_size(freed)}.[/green]")
     else:
-        freed = quarantine.purge(args.run_id)
+        freed, errors = quarantine.purge_detailed(args.run_id)
         console.print(f"[green]Removed run '{args.run_id}', reclaimed {human_size(freed)}.[/green]")
-    return 0
+    for err in errors:
+        console.print(f"[red]Could not remove:[/red] {err}")
+    return 1 if errors else 0
 
 
 def cmd_completion(args: argparse.Namespace, console: Console) -> int:
