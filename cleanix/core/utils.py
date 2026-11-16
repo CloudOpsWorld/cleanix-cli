@@ -127,11 +127,122 @@ def exists(path: str | os.PathLike) -> bool:
 
 
 def which(cmd: str) -> Optional[str]:
+    if sys.platform == "win32":
+        return resolve_executable(cmd)
     return shutil.which(cmd)
 
 
 def has_any(*cmds: str) -> bool:
+    if sys.platform == "win32":
+        return any(resolve_executable(c) for c in cmds)
     return any(shutil.which(c) for c in cmds)
+
+
+# -- Windows executable resolution -------------------------------------------
+# CreateProcess and shutil.which search the *current directory* before
+# System32/PATH, so a bare "Dism.exe" run from an untrusted folder would execute
+# a planted .\Dism.exe (elevated, during a clean). On Windows every command is
+# therefore resolved to an absolute path before it is spawned: the built-in
+# system tools come from GetSystemDirectoryW, everything else from the PATH
+# entries only (never the cwd, never a relative entry).
+
+# Bare name (casefolded, without .exe) -> path relative to the system directory.
+_WIN_SYSTEM_TOOLS = {
+    "powershell": "WindowsPowerShell\\v1.0\\powershell.exe",
+    "dism": "Dism.exe",
+    "schtasks": "schtasks.exe",
+}
+
+_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+
+
+def windows_system_dir() -> str:
+    """The real System32 directory (GetSystemDirectoryW; never the env)."""
+    try:
+        import ctypes
+
+        fn = ctypes.windll.kernel32.GetSystemDirectoryW  # type: ignore[attr-defined]
+        buf = ctypes.create_unicode_buffer(1024)
+        n = fn(buf, 1024)
+        if 0 < n < 1024 and buf.value:
+            return buf.value
+    except Exception:  # noqa: BLE001
+        pass
+    return "C:\\Windows\\System32"
+
+
+def windows_system_tool(name: str, system_dir: Optional[str] = None) -> Optional[str]:
+    """Absolute path of a built-in Windows tool (powershell/Dism/schtasks)."""
+    key = name.lower()
+    if key.endswith(".exe"):
+        key = key[:-4]
+    rel = _WIN_SYSTEM_TOOLS.get(key)
+    if rel is None:
+        return None
+    import ntpath
+
+    return ntpath.join(system_dir or windows_system_dir(), rel)
+
+
+def safe_which(
+    cmd: str,
+    path_entries: Optional[Sequence[str]] = None,
+    pathext: Optional[str] = None,
+    cwd: Optional[str] = None,
+    isfile=os.path.isfile,
+) -> Optional[str]:
+    """``which`` that never searches the current directory.
+
+    Only absolute PATH entries are searched (``''``, ``'.'``, relative entries
+    and the cwd itself are skipped); ``PATHEXT`` is honoured. A ``cmd`` that
+    contains a directory separator is returned as an absolute path only if it is
+    already absolute. Pure apart from ``isfile``; all inputs are injectable.
+    """
+    import ntpath
+
+    if not cmd:
+        return None
+    if "\\" in cmd or "/" in cmd:
+        if ntpath.isabs(cmd) and ntpath.splitdrive(cmd)[0] and isfile(cmd):
+            return cmd
+        return None
+    if path_entries is None:
+        path_entries = (os.environ.get("PATH") or "").split(os.pathsep)
+    if pathext is None:
+        pathext = os.environ.get("PATHEXT") or _DEFAULT_PATHEXT
+    if cwd is None:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = ""
+    exts = [e for e in pathext.split(";") if e]
+    if any(cmd.lower().endswith(e.lower()) for e in exts):
+        names = [cmd]
+    else:
+        names = [cmd + e for e in exts]
+    cwd_norm = ntpath.normcase(ntpath.normpath(cwd)) if cwd else None
+    for entry in path_entries:
+        entry = entry.strip().strip('"')
+        if not entry or entry == ".":
+            continue
+        # Relative entries resolve against the cwd: skip them too.
+        if not (ntpath.isabs(entry) and ntpath.splitdrive(entry)[0]):
+            continue
+        if cwd_norm and ntpath.normcase(ntpath.normpath(entry)) == cwd_norm:
+            continue
+        for name in names:
+            cand = ntpath.join(entry, name)
+            if isfile(cand):
+                return ntpath.normpath(cand)
+    return None
+
+
+def resolve_executable(cmd: str) -> Optional[str]:
+    """Absolute path for ``cmd`` on Windows, or ``None`` if not found safely."""
+    tool = windows_system_tool(cmd)
+    if tool is not None:
+        return tool if os.path.isfile(tool) else None
+    return safe_which(cmd)
 
 
 def is_broken_symlink(path: str | os.PathLike) -> bool:
@@ -251,7 +362,14 @@ def run_command(
     """Run a command, returning ``(returncode, stdout, stderr)``.
 
     Never raises on a non-zero exit; callers inspect the return code.
+    On Windows ``command[0]`` is resolved to an absolute path first (see
+    :func:`resolve_executable`) so the current directory is never searched.
     """
+    if sys.platform == "win32" and command:
+        exe = resolve_executable(str(command[0]))
+        if exe is None:
+            return 127, "", f"command not found: {command[0]}"
+        command = [exe, *list(command)[1:]]
     try:
         proc = subprocess.run(
             list(command),

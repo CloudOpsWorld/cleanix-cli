@@ -9,6 +9,8 @@ output.
 
 from __future__ import annotations
 
+import ntpath
+import os
 import shutil
 import subprocess
 import sys
@@ -35,9 +37,39 @@ def _cleanix_exe() -> Tuple[str, bool]:
     is on PATH, so the task does not depend on PATH at run time.
     """
     exe = shutil.which("cleanix")
+    if exe and os.name == "nt":
+        exe = _vet_windows_exe(exe)
     if exe:
         return exe, False
     return sys.executable, True
+
+
+def _vet_windows_exe(exe: str):
+    """Absolutise ``exe`` and reject a copy found in the current directory.
+
+    ``shutil.which`` searches the cwd first on Windows, so a planted
+    ``.\\cleanix.exe`` would otherwise be written (as a relative path) into the
+    scheduled task. Anything under the cwd is accepted only when the cwd-free
+    PATH search finds the very same file; otherwise ``None`` (module fallback).
+    """
+    from cleanix.core.utils import safe_which
+
+    exe = os.path.abspath(exe)
+    try:
+        cwd = os.path.abspath(os.getcwd())
+    except OSError:
+        cwd = ""
+    norm = ntpath.normcase(ntpath.normpath(exe))
+    cwd_norm = ntpath.normcase(ntpath.normpath(cwd)) if cwd else ""
+    under_cwd = bool(cwd_norm) and (
+        norm == cwd_norm or norm.startswith(cwd_norm.rstrip("\\") + "\\")
+    )
+    if not under_cwd:
+        return exe
+    safe = safe_which("cleanix")
+    if safe and ntpath.normcase(ntpath.normpath(safe)) == norm:
+        return exe
+    return None
 
 
 def build_create_args(
@@ -64,9 +96,17 @@ def build_create_args(
 
 
 def _run(argv: List[str]) -> Tuple[int, str, str]:
+    kwargs = {}
+    if sys.platform == "win32":
+        # Never let CreateProcess search the current directory for schtasks:
+        # run the System32 binary (argv itself stays unchanged).
+        from cleanix.core.utils import windows_system_tool
+
+        kwargs["executable"] = windows_system_tool("schtasks")
     try:
         proc = subprocess.run(
-            argv, capture_output=True, text=True, errors="replace", check=False
+            argv, capture_output=True, text=True, errors="replace", check=False,
+            **kwargs,
         )
     except FileNotFoundError:
         return 127, "", "schtasks not found"
