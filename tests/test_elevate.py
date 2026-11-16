@@ -21,7 +21,10 @@ from cleanix.core import context, elevate, engine, history, quarantine, safety, 
 from cleanix.core.models import CleanableItem, CleanerReport, ItemKind, item_key
 
 POSIX = os.name != "nt"
-UID = 1000
+# Files created by the tests are owned by the test runner: on POSIX the helper
+# really checks that, so the "requesting uid" must be ours.
+UID = os.getuid() if POSIX else 1000
+FAKE_UID = 1000  # for pure ownership checks on fake stat results
 
 
 # --------------------------------------------------------------------------
@@ -62,7 +65,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(quarantine, "quarantine_root", lambda: tmp_path / "q")
     monkeypatch.setattr(engine, "is_root", lambda: True)
     monkeypatch.delenv("PKEXEC_UID", raising=False)
-    monkeypatch.delenv("SUDO_USER", raising=False)
+    # set-then-delete registers an undo, so a SUDO_USER the helper sets is removed
+    monkeypatch.setenv("SUDO_USER", "x")
+    monkeypatch.delenv("SUDO_USER")
 
     cleaners = []
 
@@ -144,23 +149,30 @@ def test_read_request_refuses_symlink(tmp_path):
 
 
 @pytest.mark.parametrize("st, ok", [
-    (SimpleNamespace(st_uid=UID, st_mode=0o100600), True),
-    (SimpleNamespace(st_uid=UID + 1, st_mode=0o100600), False),
-    (SimpleNamespace(st_uid=UID, st_mode=0o100620), False),
-    (SimpleNamespace(st_uid=UID, st_mode=0o100602), False),
+    (SimpleNamespace(st_uid=FAKE_UID, st_mode=0o100600), True),
+    (SimpleNamespace(st_uid=FAKE_UID + 1, st_mode=0o100600), False),
+    (SimpleNamespace(st_uid=FAKE_UID, st_mode=0o100620), False),
+    (SimpleNamespace(st_uid=FAKE_UID, st_mode=0o100602), False),
     (SimpleNamespace(st_uid=0, st_mode=0o100644), False),
 ])
 def test_check_secure_owner_and_mode(st, ok):
     if ok:
-        elevate._check_secure(st, UID, "request")
+        elevate._check_secure(st, FAKE_UID, "request")
     else:
         with pytest.raises(ValueError):
-            elevate._check_secure(st, UID, "request")
+            elevate._check_secure(st, FAKE_UID, "request")
 
 
 def test_check_secure_allows_root_owner_only_when_asked():
     st = SimpleNamespace(st_uid=0, st_mode=0o100644)
-    elevate._check_secure(st, UID, "config", allow_root=True)
+    elevate._check_secure(st, FAKE_UID, "config", allow_root=True)
+
+
+def test_every_real_cleaner_id_is_accepted_in_requests():
+    from cleanix.core.registry import ALL_CLEANERS
+
+    bad = [c.id for c in ALL_CLEANERS if not elevate._CLEANER_ID_RE.fullmatch(c.id)]
+    assert bad == []
 
 
 @pytest.mark.parametrize("mutate", [
@@ -279,33 +291,50 @@ def test_helper_never_cleans_items_that_do_not_need_admin(env):
 
 
 def test_config_supplied_paths_are_not_deleted_as_admin(env, monkeypatch):
+    """A user-writable config must not steer the admin re-scan to new places."""
+    from cleanix.config import Config
+
     victim = _file(env.tmp / "system" / "lib", "important.so")
+    link_dir = env.tmp / "userdir"
+    link_dir.mkdir()
     cfg = env.reqdir / "config.yaml"
-    cfg.write_text(f"extra_cache_dirs: [{json.dumps(str(victim.parent))}]\n", encoding="utf-8")
+    d = json.dumps(str(victim.parent))
+    cfg.write_text(
+        f"temp_min_age_days: 42\nextra_cache_dirs: [{d}]\n"
+        f"symlink_scan_dirs: [{json.dumps(str(link_dir))}]\nproject_scan_dirs: [{d}]\n",
+        encoding="utf-8")
     if POSIX:
         os.chmod(cfg, 0o600)
     seen = {}
 
     def from_config():
-        seen["dirs"] = list(service_config["cfg"].extra_cache_dirs)
-        return [CleanableItem(cleaner_id="user_cache", description="extra", size=1,
-                              path=str(victim.parent), requires_root=False)]
+        c = seen["cfg"]
+        # Worst case: a cleaner turns every configured dir into an admin item.
+        dirs = list(c.extra_cache_dirs) + list(c.symlink_scan_dirs) + list(c.project_scan_dirs)
+        return [CleanableItem(cleaner_id="sys", description="cfg", size=1,
+                              path=p, requires_root=True) for p in dirs
+                if p in (str(victim.parent), str(link_dir))]
 
-    service_config = {}
     real_scan = service.scan
 
     def spy_scan(config, **kw):
-        service_config["cfg"] = config
+        seen["cfg"] = config
         return real_scan(config, **kw)
 
     monkeypatch.setattr(service, "scan", spy_scan)
-    env.cleaners.append(FakeCleaner("user_cache", from_config))
-    key = "user_cache|path|" + str(victim.parent)
-    rc, _ = _run(env, _selection([key], only=["user_cache"]), config=str(cfg))
+    env.cleaners.append(FakeCleaner("sys", from_config))
+    keys = ["sys|path|" + str(victim.parent), "sys|path|" + str(link_dir)]
+    rc, _ = _run(env, _selection(keys), config=str(cfg))
     assert rc == 0
-    assert seen["dirs"] == [str(victim.parent)]  # the config was really loaded
-    assert victim.exists()
-    assert elevate.read_result(env.result).removed == 0
+    loaded = seen["cfg"]
+    assert loaded.temp_min_age_days == 42  # the config was really loaded
+    defaults = Config()
+    assert loaded.extra_cache_dirs == defaults.extra_cache_dirs
+    assert loaded.symlink_scan_dirs == defaults.symlink_scan_dirs
+    assert loaded.project_scan_dirs == defaults.project_scan_dirs
+    assert victim.exists() and link_dir.exists()
+    res = elevate.read_result(env.result)
+    assert res.removed == 0 and res.unmatched == 2
 
 
 def test_protected_globs_expand_against_invoking_user_home(env, monkeypatch):

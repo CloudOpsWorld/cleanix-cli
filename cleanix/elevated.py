@@ -43,6 +43,13 @@ _ALLOWED_EXITS = {EXIT_OK, EXIT_REFUSED, EXIT_INTERNAL, EXIT_DEADLINE}
 DEFAULT_DEADLINE = 3300.0  # seconds; the launcher gives up after 3600
 MAX_CONFIG_BYTES = 1024 * 1024
 
+# Config fields that name *where* to scan. The config is user-writable, so as
+# admin these keep their built-in defaults: a user-chosen directory (possibly
+# swapped for a link mid-clean) must never become a root deletion target.
+# Items found there in the GUI's own scan come back as "unmatched".
+_IGNORED_CONFIG_FIELDS = frozenset({"extra_cache_dirs", "symlink_scan_dirs",
+                                    "project_scan_dirs"})
+
 _monotonic = time.monotonic
 
 
@@ -119,7 +126,7 @@ def _load_config(config_path: Optional[str], home: Path, expected_uid: Optional[
         raise Refused("config is not valid YAML") from None
     if not isinstance(obj, dict):
         raise Refused("config is not a mapping")
-    known = {f.name for f in fields(Config)}
+    known = {f.name for f in fields(Config)} - _IGNORED_CONFIG_FIELDS
     for key, value in obj.items():
         if key in known and value is not None:
             setattr(cfg, key, value)
