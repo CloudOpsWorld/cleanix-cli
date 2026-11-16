@@ -50,6 +50,7 @@ _WIN_SKIP_APPS = {"bravesoftware", "opera software", "mozilla", "microsoft"}
 
 class ElectronCacheCleaner(Cleaner):
     id = "electron_cache"
+    safe_default = True
     name = "Electron/Chromium app caches"
     description = "Rebuildable Cache/GPUCache/Code Cache from Electron apps"
     requires_root = False
@@ -126,6 +127,7 @@ class FlatpakAppCacheCleaner(Cleaner):
 
 class GpuShaderCacheCleaner(Cleaner):
     id = "gpu_shader_cache"
+    safe_default = True
     name = "GPU shader caches"
     description = "Mesa/NVIDIA/RADV shader caches (rebuilt after driver changes)"
     requires_root = False
@@ -195,6 +197,7 @@ class SteamCleaner(Cleaner):
 
 class JetBrainsCleaner(Cleaner):
     id = "jetbrains"
+    safe_default = True
     name = "JetBrains IDE caches"
     description = "Caches, logs, and indexes for IntelliJ/PyCharm/etc."
     requires_root = False

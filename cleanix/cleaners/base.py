@@ -63,6 +63,9 @@ class Cleaner(abc.ABC):
     # Set by the registry when ``--only`` forces a cleaner on Windows that does
     # not support Windows: scan() then skips it instead of running POSIX logic.
     unsupported_platform: bool = False
+    # True only for cleaners reviewed as safe to pre-select in a GUI's Simple
+    # mode. Default False so unreviewed cleaners are never pre-selected.
+    safe_default: bool = False
 
     def __init__(self, config: Config):
         self.config = config

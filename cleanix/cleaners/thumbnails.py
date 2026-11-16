@@ -15,6 +15,7 @@ from cleanix.core.utils import home, iter_children
 
 class ThumbnailCleaner(Cleaner):
     id = "thumbnails"
+    safe_default = True
     name = "Thumbnails"
     description = "Cached image/video thumbnails (regenerated on demand)"
     requires_root = False

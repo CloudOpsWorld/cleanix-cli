@@ -16,6 +16,7 @@ from cleanix.core.utils import home, path_size
 
 class PipCacheCleaner(Cleaner):
     id = "pip_cache"
+    safe_default = True
     name = "pip cache"
     description = "Cached wheels and downloads under ~/.cache/pip"
     requires_root = False

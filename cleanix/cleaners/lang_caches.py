@@ -20,6 +20,7 @@ from cleanix.core.utils import home, path_size
 
 class LangPackageCacheCleaner(Cleaner):
     id = "lang_caches"
+    safe_default = True
     name = "Language package caches"
     description = "Go/Rust/JS/.NET/etc. re-downloadable module & package caches"
     requires_root = False

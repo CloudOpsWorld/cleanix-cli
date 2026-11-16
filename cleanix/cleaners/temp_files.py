@@ -17,6 +17,7 @@ from cleanix.core.utils import iter_children, older_than
 
 class TempFilesCleaner(Cleaner):
     id = "temp"
+    safe_default = True
     scope = SCOPE_SYSTEM
     name = "Temp files (/tmp, /var/tmp)"
     description = "Stale temporary files older than the configured age"

@@ -20,6 +20,7 @@ _PACKAGE_DIRS = {"winget", "chocolatey"}
 
 class WinTempCleaner(Cleaner):
     id = "win_temp"
+    safe_default = True
     name = "Temp files (%TEMP%)"
     description = "Stale files in the user temp folder older than the configured age"
     platforms = (WINDOWS,)
@@ -40,6 +41,7 @@ class WinTempCleaner(Cleaner):
 
 class WinThumbnailCleaner(Cleaner):
     id = "win_thumbnails"
+    safe_default = True
     name = "Thumbnail and icon caches"
     description = "Explorer thumbnail and icon cache databases (rebuilt automatically)"
     platforms = (WINDOWS,)
@@ -61,6 +63,7 @@ class WinThumbnailCleaner(Cleaner):
 
 class WinErrorReportingCleaner(Cleaner):
     id = "win_error_reports"
+    safe_default = True
     name = "Error reports and crash dumps"
     description = "Windows Error Reporting data and user crash dumps"
     platforms = (WINDOWS,)

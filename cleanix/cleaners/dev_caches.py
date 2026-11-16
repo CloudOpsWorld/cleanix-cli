@@ -19,6 +19,7 @@ from cleanix.core.utils import home, path_size
 
 class DevCacheCleaner(Cleaner):
     id = "dev_caches"
+    safe_default = True
     name = "Developer caches"
     description = "Regenerable caches for cargo, go, gradle, ccache, composer…"
     requires_root = False

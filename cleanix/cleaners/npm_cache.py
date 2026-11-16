@@ -16,6 +16,7 @@ from cleanix.core.utils import home, path_size
 
 class NpmCacheCleaner(Cleaner):
     id = "npm_cache"
+    safe_default = True
     name = "npm/yarn cache"
     description = "JavaScript package manager caches"
     requires_root = False

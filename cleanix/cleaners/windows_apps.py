@@ -26,6 +26,7 @@ def _is_profile(name: str) -> bool:
 
 class WinBrowserCacheCleaner(Cleaner):
     id = "win_browser_cache"
+    safe_default = True
     name = "Browser caches"
     description = "Cache, Code Cache and GPUCache of Chrome, Edge, Brave and Firefox"
     platforms = (WINDOWS,)
@@ -67,6 +68,7 @@ class WinBrowserCacheCleaner(Cleaner):
 
 class WinShaderCacheCleaner(Cleaner):
     id = "win_shader_cache"
+    safe_default = True
     name = "GPU shader caches"
     description = "DirectX, NVIDIA and AMD shader caches (rebuilt on demand)"
     platforms = (WINDOWS,)
@@ -92,6 +94,7 @@ class WinShaderCacheCleaner(Cleaner):
 
 class WinPackageCacheCleaner(Cleaner):
     id = "win_pkg_caches"
+    safe_default = True
     name = "Package manager caches"
     description = "WinGet, Chocolatey, Scoop and NuGet download caches"
     platforms = (WINDOWS,)
@@ -122,6 +125,7 @@ class WinPackageCacheCleaner(Cleaner):
 
 class WinVisualStudioCleaner(Cleaner):
     id = "win_visualstudio"
+    safe_default = True
     name = "Visual Studio caches"
     description = "Visual Studio ComponentModelCache (rebuilt on next launch)"
     platforms = (WINDOWS,)
