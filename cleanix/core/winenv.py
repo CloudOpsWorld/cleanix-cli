@@ -102,3 +102,97 @@ def relaunch_elevated(argv: Sequence[str]) -> bool:
         return int(rc) > 32
     except Exception:
         return False
+
+
+ERROR_CANCELLED = 1223
+_SEE_MASK_NOCLOSEPROCESS = 0x00000040
+_SEE_MASK_NOASYNC = 0x00000100
+_WAIT_OBJECT_0 = 0
+_WAIT_TIMEOUT = 0x102
+
+
+def _shellexecuteinfo_class():
+    """SHELLEXECUTEINFOW (112 bytes on x64, 60 on x86); ctypes only."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("fMask", ctypes.c_ulong),
+            ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR),
+            ("hkeyClass", wintypes.HKEY),
+            ("dwHotKey", wintypes.DWORD),
+            ("hIcon", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        ]
+
+    return SHELLEXECUTEINFOW
+
+
+def run_elevated(argv: Sequence[str], timeout: int) -> int:
+    """Run argv elevated via UAC (verb runas), wait, return its exit code.
+
+    argv[0] must be an absolute program path. ShellExecuteExW blocks while the
+    consent dialog is open, so call this off the GUI thread. Raises OSError (winerror 1223)
+    if the user declines the prompt, TimeoutError if the process outlives
+    ``timeout`` seconds, and OSError off Windows.
+    """
+    if not _is_win():
+        raise OSError("elevation via UAC is only available on Windows")
+    import ctypes
+    import subprocess
+    from ctypes import wintypes
+
+    if not argv:
+        raise ValueError("empty argv")
+    info_cls = _shellexecuteinfo_class()
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(info_cls)]
+    shell32.ShellExecuteExW.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+
+    info = info_cls()
+    info.cbSize = ctypes.sizeof(info_cls)
+    info.fMask = _SEE_MASK_NOCLOSEPROCESS | _SEE_MASK_NOASYNC
+    info.lpVerb = "runas"
+    info.lpFile = str(argv[0])
+    info.lpParameters = subprocess.list2cmdline([str(a) for a in argv[1:]]) or None
+    info.nShow = 0  # SW_HIDE: the helper has no UI
+    if not shell32.ShellExecuteExW(ctypes.byref(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    handle = info.hProcess
+    if not handle:
+        raise OSError("ShellExecuteExW returned no process handle")
+    try:
+        ms = min(max(0, int(timeout)) * 1000, 0xFFFFFFFE)
+        wait = kernel32.WaitForSingleObject(handle, ms)
+        if wait == _WAIT_TIMEOUT:
+            try:
+                kernel32.TerminateProcess(handle, 1)
+            except Exception:
+                pass
+            raise TimeoutError("elevated helper timed out and may still be running")
+        if wait != _WAIT_OBJECT_0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(code.value)
+    finally:
+        kernel32.CloseHandle(handle)
