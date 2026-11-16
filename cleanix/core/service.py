@@ -64,7 +64,11 @@ def clean(
     use_quarantine: bool = True,
     progress: Optional[Callable[[str, int, int], None]] = None,
     cancel: CancelCB = None,
+    record_history: bool = True,
 ) -> CleanSummary:
+    """``record_history=False`` skips history, the manifest and saving a
+    quarantine index (the elevated helper must write nothing under the
+    user's home; the GUI records history itself)."""
     safety.set_protected_globs(config.protected_globs)
     items = list(items)
     total = len(items)
@@ -88,7 +92,7 @@ def clean(
 
     manifest: Optional[str] = None
     run_id: Optional[str] = None
-    if not dry_run:
+    if not dry_run and record_history:
         history.record(result.freed, result.removed_count,
                        mode="quarantine" if quarantine else "delete")
         manifest = history.write_manifest(result) or None

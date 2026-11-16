@@ -1,8 +1,9 @@
 """Tests for the elevated helper (request file, re-scan, match, clean).
 
 Nothing here needs real privileges and nothing is deleted outside tmp_path:
-scans are served by fake cleaners, the engine's root check is patched, and
-history/quarantine state is redirected into tmp_path.
+scans are served by fake cleaners and the engine's root check is patched.
+History/quarantine locations are NOT patched away: HOME/XDG/APPDATA point
+into tmp_path so that any write the helper made would be visible there.
 """
 
 from __future__ import annotations
@@ -42,15 +43,24 @@ class FakeCleaner:
                              items=list(items))
 
 
-def _item(path, cid="sys", *, root=True, report_only=False):
+def _item(path, cid="logs", *, root=True, report_only=False):
     return CleanableItem(cleaner_id=cid, description=f"item {Path(path).name}",
                          size=10, path=str(path), requires_root=root,
                          report_only=report_only)
 
 
+@pytest.fixture(autouse=True)
+def _restore_environ():
+    """The helper rewrites os.environ (trusted PATH etc.); restore it fully."""
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    """Isolated helper environment: fake user, redirected state, fake scan."""
+    """Isolated helper environment: fake user whose home is in tmp_path, fake scan."""
     home = tmp_path / "home" / "alice"
     home.mkdir(parents=True)
     user = context.TargetUser("alice", home, UID, UID, True)
@@ -60,22 +70,36 @@ def env(tmp_path, monkeypatch):
 
     fake_invoking_user.cache_clear = lambda: None  # type: ignore[attr-defined]
     monkeypatch.setattr(context, "invoking_user", fake_invoking_user)
+    # history/quarantine imported the function by name; bind them to the same
+    # user (their state LOCATIONS stay real and resolve into the fake home)
+    monkeypatch.setattr(history, "invoking_user", fake_invoking_user)
+    monkeypatch.setattr(quarantine, "invoking_user", fake_invoking_user)
     monkeypatch.setattr(elevated, "_user_for_uid", lambda uid: "alice" if uid == UID else None)
-    monkeypatch.setattr(history, "state_dir", lambda: tmp_path / "state")
-    monkeypatch.setattr(quarantine, "quarantine_root", lambda: tmp_path / "q")
+    for var, sub in (("HOME", ""), ("USERPROFILE", ""),
+                     ("XDG_STATE_HOME", ".local/state"), ("XDG_DATA_HOME", ".local/share"),
+                     ("XDG_CONFIG_HOME", ".config"), ("XDG_CACHE_HOME", ".cache"),
+                     ("LOCALAPPDATA", "AppData/Local"), ("APPDATA", "AppData/Roaming")):
+        monkeypatch.setenv(var, str(home / sub) if sub else str(home))
     monkeypatch.setattr(engine, "is_root", lambda: True)
     monkeypatch.delenv("PKEXEC_UID", raising=False)
-    # set-then-delete registers an undo, so a SUDO_USER the helper sets is removed
-    monkeypatch.setenv("SUDO_USER", "x")
-    monkeypatch.delenv("SUDO_USER")
 
     cleaners = []
+    built = []
 
     def fake_build(config, only=None, exclude=None):
+        built.append(list(only) if only else None)
         wanted = {c.lower() for c in only} if only else None
         return [c for c in cleaners if wanted is None or c.id.lower() in wanted]
 
     monkeypatch.setattr(service, "build_cleaners", fake_build)
+    scans = []
+    real_scan = service.scan
+
+    def spy_scan(config, **kw):
+        scans.append(config)
+        return real_scan(config, **kw)
+
+    monkeypatch.setattr(service, "scan", spy_scan)
 
     reqdir = tmp_path / "req"
     reqdir.mkdir()
@@ -84,7 +108,7 @@ def env(tmp_path, monkeypatch):
     junk = tmp_path / "junk"
     junk.mkdir()
     yield SimpleNamespace(tmp=tmp_path, home=home, cleaners=cleaners,
-                          reqdir=reqdir, junk=junk,
+                          reqdir=reqdir, junk=junk, built=built, scans=scans,
                           result=reqdir / elevate.RESULT_NAME)
     context.configure(None)
     safety.set_protected_globs([])
@@ -97,7 +121,7 @@ def _file(directory, name, data=b"x" * 10):
     return p
 
 
-def _selection(keys, only=("sys",), *, user="alice", quarantine_=False, nonce=None):
+def _selection(keys, only=("logs",), *, user="alice", quarantine_=False, nonce=None):
     return elevate.Selection(invoking_user=user, only=list(only), keys=list(keys),
                              use_quarantine=quarantine_, nonce=nonce or uuid.uuid4().hex)
 
@@ -232,7 +256,7 @@ def test_make_request_dir_is_private(tmp_path):
 def test_helper_deletes_only_matching_keys(env):
     a, b = _file(env.junk, "a.bin"), _file(env.junk, "b.bin")
     ia, ib = _item(a), _item(b)
-    env.cleaners.append(FakeCleaner("sys", [ia, ib]))
+    env.cleaners.append(FakeCleaner("logs", [ia, ib]))
     rc, _ = _run(env, _selection([item_key(ia)]))
     assert rc == 0
     assert not a.exists() and b.exists()
@@ -244,8 +268,8 @@ def test_helper_deletes_only_matching_keys(env):
 def test_helper_ignores_keys_not_in_fresh_scan(env):
     a, outside = _file(env.junk, "a.bin"), _file(env.tmp / "outside", "o.bin")
     ia = _item(a)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
-    forged = ["sys|path|/etc/passwd", item_key(_item(outside))]
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    forged = ["logs|path|/etc/passwd", item_key(_item(outside))]
     rc, _ = _run(env, _selection(forged))
     assert rc == 0
     assert a.exists() and outside.exists()
@@ -257,21 +281,24 @@ def test_tampered_request_with_extra_cleaner_and_duplicate_keys(env):
     """Review Focus 3: extra keys / cleaners not in the scan delete nothing."""
     a = _file(env.junk, "a.bin")
     ia = _item(a)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     keys = [item_key(ia), item_key(ia), "evil|path|" + str(env.home),
-            "sys|cmd|rm\x1f-rf\x1f/"]
-    rc, _ = _run(env, _selection(keys, only=["sys", "evil", "nonexistent"]))
+            "logs|cmd|rm\x1f-rf\x1f/"]
+    rc, _ = _run(env, _selection(keys, only=["logs", "evil", "nonexistent"]))
     assert rc == 0
     assert not a.exists()
     assert env.home.exists()
     res = elevate.read_result(env.result)
-    assert res.removed == 1 and res.unmatched == 2
+    # the "evil" key is refused up front (cleaner not allowlisted), the
+    # forged command key is simply not in the fresh scan
+    assert res.removed == 1 and res.unmatched == 1 and res.refused == 1
+    assert env.built == [["logs"]]  # non-allowlisted ids are never scanned
 
 
 def test_helper_never_cleans_report_only(env):
     a = _file(env.junk, "a.bin")
     ia = _item(a, report_only=True)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     rc, _ = _run(env, _selection([item_key(ia)]))
     assert rc == 0
     assert a.exists()
@@ -283,15 +310,18 @@ def test_helper_never_cleans_items_that_do_not_need_admin(env):
     """User-level items (e.g. from a user-writable config) are never deleted as admin."""
     a = _file(env.junk, "a.bin")
     ia = _item(a, root=False)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     rc, _ = _run(env, _selection([item_key(ia)]))
     assert rc == 0
     assert a.exists()
     assert elevate.read_result(env.result).refused == 1
 
 
-def test_config_supplied_paths_are_not_deleted_as_admin(env, monkeypatch):
-    """A user-writable config must not steer the admin re-scan to new places."""
+def test_config_only_contributes_protected_globs(env):
+    """A user-writable config must not steer root cleaners: every setting
+    except protected_globs keeps its built-in default in the helper."""
+    import dataclasses as dc
+
     from cleanix.config import Config
 
     victim = _file(env.tmp / "system" / "lib", "important.so")
@@ -300,41 +330,49 @@ def test_config_supplied_paths_are_not_deleted_as_admin(env, monkeypatch):
     cfg = env.reqdir / "config.yaml"
     d = json.dumps(str(victim.parent))
     cfg.write_text(
-        f"temp_min_age_days: 42\nextra_cache_dirs: [{d}]\n"
-        f"symlink_scan_dirs: [{json.dumps(str(link_dir))}]\nproject_scan_dirs: [{d}]\n",
+        "temp_min_age_days: 0\nlog_min_age_days: 0\ncoredump_min_age_days: 0\n"
+        "journal_max_size_mb: 1\nkeep_kernels: 0\nremove_old_kernels: true\n"
+        "purge_unused_locales: true\ndocker_prune_volumes: true\n"
+        "docker_prune_all_images: true\ndisabled_cleaners: [logs]\n"
+        f"extra_cache_dirs: [{d}]\n"
+        f"symlink_scan_dirs: [{json.dumps(str(link_dir))}]\nproject_scan_dirs: [{d}]\n"
+        f"protected_globs: [{json.dumps(str(env.tmp / 'nothing' / '*'))}]\n",
         encoding="utf-8")
     if POSIX:
         os.chmod(cfg, 0o600)
-    seen = {}
 
     def from_config():
-        c = seen["cfg"]
+        c = env.scans[-1]
         # Worst case: a cleaner turns every configured dir into an admin item.
         dirs = list(c.extra_cache_dirs) + list(c.symlink_scan_dirs) + list(c.project_scan_dirs)
-        return [CleanableItem(cleaner_id="sys", description="cfg", size=1,
+        return [CleanableItem(cleaner_id="logs", description="cfg", size=1,
                               path=p, requires_root=True) for p in dirs
                 if p in (str(victim.parent), str(link_dir))]
 
-    real_scan = service.scan
-
-    def spy_scan(config, **kw):
-        seen["cfg"] = config
-        return real_scan(config, **kw)
-
-    monkeypatch.setattr(service, "scan", spy_scan)
-    env.cleaners.append(FakeCleaner("sys", from_config))
-    keys = ["sys|path|" + str(victim.parent), "sys|path|" + str(link_dir)]
+    env.cleaners.append(FakeCleaner("logs", from_config))
+    keys = ["logs|path|" + str(victim.parent), "logs|path|" + str(link_dir)]
     rc, _ = _run(env, _selection(keys), config=str(cfg))
     assert rc == 0
-    loaded = seen["cfg"]
-    assert loaded.temp_min_age_days == 42  # the config was really loaded
-    defaults = Config()
-    assert loaded.extra_cache_dirs == defaults.extra_cache_dirs
-    assert loaded.symlink_scan_dirs == defaults.symlink_scan_dirs
-    assert loaded.project_scan_dirs == defaults.project_scan_dirs
+    loaded = env.scans[-1]
+    expected = Config()
+    expected.protected_globs = [str(env.tmp / "nothing" / "*")]  # the file was read
+    assert dc.asdict(loaded) == dc.asdict(expected)
     assert victim.exists() and link_dir.exists()
     res = elevate.read_result(env.result)
     assert res.removed == 0 and res.unmatched == 2
+
+
+def test_config_with_bad_protected_globs_is_refused(env):
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    cfg = env.reqdir / "config.yaml"
+    cfg.write_text("protected_globs: 5\n", encoding="utf-8")
+    if POSIX:
+        os.chmod(cfg, 0o600)
+    rc, _ = _run(env, _selection([item_key(ia)]), config=str(cfg))
+    assert rc == 1
+    assert a.exists() and env.scans == []
 
 
 def test_protected_globs_expand_against_invoking_user_home(env, monkeypatch):
@@ -348,7 +386,7 @@ def test_protected_globs_expand_against_invoking_user_home(env, monkeypatch):
                         lambda p: p.replace("~", str(env.tmp / "roothome"), 1)
                         if p.startswith("~") else p)
     ik = _item(keep)
-    env.cleaners.append(FakeCleaner("sys", [ik]))
+    env.cleaners.append(FakeCleaner("logs", [ik]))
     rc, _ = _run(env, _selection([item_key(ik)]), config=str(cfg))
     assert rc == 0
     assert keep.exists()
@@ -364,7 +402,7 @@ def test_helper_respects_safety_guard(env, monkeypatch):
     monkeypatch.setattr(quarantine.Quarantine, "store", boom, raising=False)
     sentinel = _file(env.home, "sentinel.txt")
     ih = _item(env.home)  # a home directory itself is always protected
-    env.cleaners.append(FakeCleaner("sys", [ih]))
+    env.cleaners.append(FakeCleaner("logs", [ih]))
     rc, _ = _run(env, _selection([item_key(ih)]))
     assert rc == 0
     assert sentinel.exists()
@@ -376,7 +414,7 @@ def test_helper_respects_safety_guard(env, monkeypatch):
 def test_helper_writes_result_json_and_exit_zero(env):
     a = _file(env.junk, "a.bin")
     ia = _item(a)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     sel = _selection([item_key(ia)])
     rc, _ = _run(env, sel)
     assert rc == 0
@@ -388,7 +426,7 @@ def test_helper_writes_result_json_and_exit_zero(env):
 
 
 def test_nonce_is_echoed(env):
-    env.cleaners.append(FakeCleaner("sys", []))
+    env.cleaners.append(FakeCleaner("logs", []))
     nonce = uuid.uuid4().hex
     rc, _ = _run(env, _selection([], nonce=nonce))
     assert rc == 0
@@ -398,7 +436,7 @@ def test_nonce_is_echoed(env):
 def test_helper_bad_request_exits_nonzero_and_deletes_nothing(env):
     a = _file(env.junk, "a.bin")
     ia = _item(a)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     req = env.reqdir / elevate.REQUEST_NAME
     req.write_text('{"keys": ["%s"' % item_key(ia).replace("\\", "\\\\"), encoding="utf-8")
     rc = elevated.run(req, env.result, None, expected_uid=UID)
@@ -410,14 +448,17 @@ def test_helper_bad_request_exits_nonzero_and_deletes_nothing(env):
 
 
 def test_missing_request_exits_one(env):
-    rc = elevated.run(env.reqdir / "nope.json", env.result, None, expected_uid=UID)
+    rc = elevated.run(env.reqdir / elevate.REQUEST_NAME, env.result, None, expected_uid=UID)
     assert rc == 1
+    assert elevate.read_result(env.result).errors
+    # a request file under another name is refused outright
+    assert elevated.run(env.reqdir / "nope.json", env.result, None, expected_uid=UID) == 1
 
 
 def test_result_outside_request_dir_is_refused(env):
     a = _file(env.junk, "a.bin")
     ia = _item(a)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
     elsewhere = env.tmp / "elsewhere" / "result.json"
     elsewhere.parent.mkdir()
@@ -430,7 +471,7 @@ def test_posix_requires_uid(env, monkeypatch):
     monkeypatch.setattr(elevated, "_is_posix", lambda: True)
     a = _file(env.junk, "a.bin")
     ia = _item(a)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
     rc = elevated.run(req, env.result, None, expected_uid=None)
     assert rc == 1
@@ -446,7 +487,7 @@ def test_helper_scope_is_single_user(env, monkeypatch):
         return real(*a, **k)
 
     monkeypatch.setattr(context, "configure", spy)
-    env.cleaners.append(FakeCleaner("sys", []))
+    env.cleaners.append(FakeCleaner("logs", []))
     rc, _ = _run(env, _selection([]))
     assert rc == 0
     assert calls and calls[-1] == ((), {"all_users": False})
@@ -456,7 +497,7 @@ def test_helper_scope_is_single_user(env, monkeypatch):
 def test_invoking_user_mismatch_refused(env):
     a = _file(env.junk, "a.bin")
     ia = _item(a)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     rc, _ = _run(env, _selection([item_key(ia)], user="bob"))
     assert rc == 1
     assert a.exists()
@@ -467,7 +508,7 @@ def test_unknown_uid_refused_on_posix(env, monkeypatch):
     monkeypatch.setattr(elevated, "_user_for_uid", lambda uid: None)
     a = _file(env.junk, "a.bin")
     ia = _item(a)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     rc, _ = _run(env, _selection([item_key(ia)]))
     assert rc == 1
     assert a.exists()
@@ -483,7 +524,7 @@ def _argv(env, req, *extra):
 def test_main_runs_helper(env):
     a = _file(env.junk, "a.bin")
     ia = _item(a)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
     assert elevated.main(_argv(env, req)) == 0
     assert not a.exists()
@@ -492,7 +533,7 @@ def test_main_runs_helper(env):
 def test_uid_must_match_pkexec_uid(env, monkeypatch):
     a = _file(env.junk, "a.bin")
     ia = _item(a)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
     monkeypatch.setenv("PKEXEC_UID", str(UID + 1))
     assert elevated.main(_argv(env, req)) == 1
@@ -508,7 +549,7 @@ def test_uid_must_match_pkexec_uid(env, monkeypatch):
 def test_deadline_stops_cleaning_and_writes_partial_result_with_exit_3(env, monkeypatch):
     files = [_file(env.junk, f"f{i}.bin") for i in range(3)]
     items = [_item(p) for p in files]
-    env.cleaners.append(FakeCleaner("sys", items))
+    env.cleaners.append(FakeCleaner("logs", items))
     clock = [0.0]
     monkeypatch.setattr(elevated, "_monotonic", lambda: clock[0])
     real_rmtree = safety.safe_rmtree
@@ -535,7 +576,7 @@ def test_deadline_during_scan_cleans_nothing(env, monkeypatch):
         clock[0] = 10_000.0
         return [ia]
 
-    env.cleaners.append(FakeCleaner("sys", slow_scan))
+    env.cleaners.append(FakeCleaner("logs", slow_scan))
     monkeypatch.setattr(elevated, "_monotonic", lambda: clock[0])
     req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
     assert elevated.main(_argv(env, req, "--deadline", "100")) == 3
@@ -550,13 +591,13 @@ def test_default_deadline_is_below_launcher_timeout():
 
 @pytest.mark.parametrize("case", [
     "bad_args", "help", "missing_request", "garbage_request", "pkexec_mismatch",
-    "bad_deadline", "scan_raises", "run_returns_126", "run_returns_127",
+    "bad_deadline", "deadline_too_large", "scan_raises", "run_returns_126", "run_returns_127",
     "run_exits_127", "keyboard_interrupt",
 ])
 def test_main_never_returns_126_or_127(env, monkeypatch, case):
     a = _file(env.junk, "a.bin")
     ia = _item(a)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
     argv = _argv(env, req)
     if case == "bad_args":
@@ -571,6 +612,8 @@ def test_main_never_returns_126_or_127(env, monkeypatch, case):
         monkeypatch.setenv("PKEXEC_UID", "4242")
     elif case == "bad_deadline":
         argv = _argv(env, req, "--deadline", "-5")
+    elif case == "deadline_too_large":
+        argv = _argv(env, req, "--deadline", "3301")
     elif case == "scan_raises":
         def boom(*a, **k):
             raise RuntimeError("secret file contents")
@@ -598,7 +641,7 @@ def test_main_never_returns_126_or_127(env, monkeypatch, case):
 def test_result_written_atomically(env, monkeypatch):
     a = _file(env.junk, "a.bin")
     ia = _item(a)
-    env.cleaners.append(FakeCleaner("sys", [ia]))
+    env.cleaners.append(FakeCleaner("logs", [ia]))
     req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
     calls = []
     real_replace = os.replace
@@ -642,3 +685,333 @@ def test_module_entry_point_exists():
 
     assert importlib.util.find_spec("cleanix.elevated") is not None
     assert callable(elevated.main)
+
+
+# --------------------------------------------------------------------------
+# C1: the helper writes nothing under the user's home (no history/quarantine)
+# --------------------------------------------------------------------------
+def _tree(root):
+    return sorted(str(p.relative_to(root)) for p in Path(root).rglob("*"))
+
+
+def test_helper_writes_nothing_under_user_home_even_with_quarantine(env):
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    assert _tree(env.home) == []
+    # the real (unpatched) state locations resolve into the fake home
+    assert str(history.state_dir()).startswith(str(env.home))
+    assert str(quarantine.quarantine_root()).startswith(str(env.home))
+    rc, _ = _run(env, _selection([item_key(ia)], quarantine_=True))
+    assert rc == 0
+    assert not a.exists()  # deleted for real, not moved into a quarantine
+    assert elevate.read_result(env.result).removed == 1
+    assert _tree(env.home) == []
+    assert not quarantine.quarantine_root().exists()
+    assert not history.state_dir().exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_planted_state_symlink_is_never_followed(env):
+    target = env.tmp / "victim_dir"
+    target.mkdir()
+    state = env.home / ".local" / "state"
+    state.mkdir(parents=True)
+    (state / "cleanix").symlink_to(target)
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    rc, _ = _run(env, _selection([item_key(ia)], quarantine_=True))
+    assert rc == 0
+    assert not a.exists()
+    assert list(target.iterdir()) == []
+    assert (state / "cleanix").is_symlink()
+
+
+# --------------------------------------------------------------------------
+# C2 / I3: allowlist and requires_root relative to the requesting user
+# --------------------------------------------------------------------------
+def test_allowlist_contains_system_cleaners_and_temp_only():
+    from cleanix.core import catalog
+
+    ids = elevated.admin_cleaner_ids()
+    assert "temp" in ids and "logs" in ids and "journal" in ids
+    assert "user_cache" not in ids and "broken_symlinks" not in ids
+    assert all(catalog.category_of(i) == "system" for i in ids - {"temp"})
+
+
+def test_root_item_from_non_allowlisted_cleaner_is_refused_and_never_scanned(env):
+    a = _file(env.junk, "a.bin")
+    ia = _item(a, cid="user_cache", root=True)
+    scanned = []
+    env.cleaners.append(FakeCleaner("user_cache", lambda: scanned.append(1) or [ia]))
+    rc, _ = _run(env, _selection([item_key(ia)], only=["user_cache"]))
+    assert rc == 0
+    assert a.exists() and scanned == []
+    assert env.scans == []  # the scan phase never ran as root
+    assert elevate.read_result(env.result).refused == 1
+
+
+def test_non_allowlisted_item_in_scan_is_refused_even_if_flagged_root(env):
+    """An allowlisted cleaner reporting a foreign cleaner id is not cleaned."""
+    a = _file(env.junk, "a.bin")
+    ia = _item(a, cid="user_cache", root=True)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    rc, _ = _run(env, _selection([item_key(ia)], only=["logs"]))
+    assert rc == 0
+    assert a.exists()
+
+
+@pytest.mark.parametrize("cid, root, report_only, ok", [
+    ("logs", True, False, True),
+    ("temp", True, False, True),
+    ("logs", False, False, False),
+    ("logs", True, True, False),
+    ("user_cache", True, False, False),
+    ("broken_symlinks", True, False, False),
+])
+def test_eligibility_rule(cid, root, report_only, ok):
+    item = _item("/x/y", cid=cid, root=root, report_only=report_only)
+    assert elevated._eligible(item, elevated.admin_cleaner_ids()) is ok
+
+
+def test_user_owned_temp_entry_is_not_eligible(env):
+    planted = _file(env.junk, "planted")
+    it = _item(planted, cid="temp", root=False)  # owned by the requesting user
+    env.cleaners.append(FakeCleaner("temp", [it]))
+    rc, _ = _run(env, _selection([item_key(it)], only=["temp"]))
+    assert rc == 0
+    assert planted.exists()
+    assert elevate.read_result(env.result).refused == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX st_uid / os.getuid")
+def test_temp_cleaner_requires_root_is_relative_to_bound_user(monkeypatch):
+    from cleanix.cleaners import temp_files
+    from cleanix.config import Config
+
+    class FakeChild:
+        def __init__(self, name, uid):
+            self.name, self.uid = name, uid
+
+        def lstat(self):
+            return SimpleNamespace(st_uid=self.uid)
+
+        def __str__(self):
+            return "/tmp/" + self.name
+
+    children = {"/tmp": [FakeChild("mine", 1234), FakeChild("theirs", 4321)]}
+    monkeypatch.setattr(temp_files, "iter_children", lambda root: children.get(str(root), []))
+    monkeypatch.setattr(temp_files, "older_than", lambda p, d: True)
+    cleaner = temp_files.TempFilesCleaner(Config())
+    monkeypatch.setattr(cleaner, "path_item", lambda p, desc, requires_root: CleanableItem(
+        cleaner_id="temp", description=desc, path=str(p), requires_root=requires_root))
+    user = context.TargetUser("u", Path("/home/u"), 1234, 1234, True)
+    with context.use_user(user):
+        items = {Path(i.path).name: i.requires_root for i in cleaner.find_items()}
+    assert items == {"mine": False, "theirs": True}
+
+
+# --------------------------------------------------------------------------
+# I3 / I7: trusted environment
+# --------------------------------------------------------------------------
+def test_posix_environment_is_sanitized(monkeypatch):
+    monkeypatch.setattr(elevated, "_is_posix", lambda: True)
+    for k, v in {"PATH": "/evil", "PYTHONPATH": "/evil", "PYTHONHOME": "/x",
+                 "PYTHONSTARTUP": "/x", "LD_PRELOAD": "/evil.so",
+                 "LD_LIBRARY_PATH": "/evil", "DYLD_INSERT_LIBRARIES": "/x",
+                 "BASH_ENV": "/x", "IFS": "x"}.items():
+        monkeypatch.setenv(k, v)
+    elevated._sanitize_environment()
+    assert os.environ["PATH"] == "/usr/sbin:/usr/bin:/sbin:/bin"
+    for k in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "LD_PRELOAD",
+              "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "IFS"):
+        assert k not in os.environ
+
+
+def test_windows_environment_comes_from_api(monkeypatch):
+    monkeypatch.setattr(elevated, "_is_posix", lambda: False)
+    monkeypatch.setattr(elevated, "_win_known_dirs",
+                        lambda: (r"D:\Win", r"D:\Win\System32", r"D:\PD"))
+    for k, v in {"SystemRoot": r"C:\evil", "windir": r"C:\evil",
+                 "SystemDrive": "E:", "ProgramData": r"C:\evil",
+                 "PATH": r"C:\evil", "PYTHONPATH": r"C:\evil"}.items():
+        monkeypatch.setenv(k, v)
+    elevated._sanitize_environment()
+    env_ = {k.lower(): v for k, v in os.environ.items()}
+    assert env_["systemroot"] == r"D:\Win" and env_["windir"] == r"D:\Win"
+    assert env_["systemdrive"] == "D:" and env_["programdata"] == r"D:\PD"
+    assert env_["path"].split(";")[0] == r"D:\Win\System32"
+    assert "evil" not in env_["path"] and "pythonpath" not in env_
+
+
+def test_windows_api_failure_refuses_run(env, monkeypatch):
+    monkeypatch.setattr(elevated, "_is_posix", lambda: False)
+
+    def fail():
+        raise OSError("api down")
+
+    monkeypatch.setattr(elevated, "_win_known_dirs", fail)
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    rc, _ = _run(env, _selection([item_key(ia)]))
+    assert rc == 1
+    assert a.exists() and env.scans == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real Windows API")
+def test_real_windows_known_dirs_override_tampered_env(monkeypatch):
+    windir, sysdir, programdata = elevated._win_known_dirs()
+    assert Path(windir).is_dir() and Path(sysdir).is_dir() and Path(programdata).is_dir()
+    monkeypatch.setenv("SystemRoot", r"C:\evil")
+    monkeypatch.setenv("ProgramData", r"C:\evil")
+    elevated._sanitize_environment()
+    assert os.environ["SystemRoot"] == windir
+    assert os.environ["ProgramData"] == programdata
+
+
+# --------------------------------------------------------------------------
+# I4: request directory validated up front
+# --------------------------------------------------------------------------
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+def test_world_writable_request_dir_refused_before_scan(env):
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
+    os.chmod(env.reqdir, 0o777)
+    try:
+        rc = elevated.run(req, env.result, None, expected_uid=UID)
+    finally:
+        os.chmod(env.reqdir, 0o700)
+    assert rc == 1
+    assert a.exists() and env.scans == [] and not env.result.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_request_through_symlinked_parent_refused(env):
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    elevate.write_request(env.reqdir, _selection([item_key(ia)]))
+    link = env.tmp / "link"
+    link.symlink_to(env.tmp)
+    via = link / "req"
+    rc = elevated.run(via / elevate.REQUEST_NAME, via / elevate.RESULT_NAME, None,
+                      expected_uid=UID)
+    assert rc == 1
+    assert a.exists() and env.scans == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX ownership")
+def test_request_dir_owned_by_someone_else_refused(env):
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
+    with pytest.raises(ValueError):
+        elevate.RequestDir(env.reqdir, UID + 1)
+    rc = elevated.run(req, env.result, None, expected_uid=UID + 1)
+    assert rc == 1 and a.exists() and env.scans == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows reparse-point check")
+def test_windows_reparse_point_in_request_path_refused(env, monkeypatch):
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
+    monkeypatch.setattr(safety, "is_reparse_point",
+                        lambda p: Path(p) == env.tmp)  # a parent is a junction
+    rc = elevated.run(req, env.result, None, expected_uid=UID)
+    assert rc == 1
+    assert a.exists() and env.scans == []
+
+
+# --------------------------------------------------------------------------
+# I5: hard deadline
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("value", [0, -1, 3300.5, float("inf"), float("nan")])
+def test_run_rejects_deadline_outside_range(env, value):
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
+    assert elevated.run(req, env.result, None, expected_uid=UID, deadline=value) == 1
+    assert a.exists()
+
+
+def test_command_timeouts_are_clamped_to_remaining_deadline(env, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(elevated, "_monotonic", lambda: clock[0])
+    calls = []
+
+    def fake_run_command(cmd, timeout=120):
+        calls.append(timeout)
+        return 0, "", ""
+
+    monkeypatch.setattr(engine, "run_command", fake_run_command)
+    long_ = CleanableItem(cleaner_id="logs", description="long", kind=ItemKind.COMMAND,
+                          command=["true", "1"], requires_root=True, timeout=3000)
+    default = CleanableItem(cleaner_id="logs", description="dflt", kind=ItemKind.COMMAND,
+                            command=["true", "2"], requires_root=True)
+    short = CleanableItem(cleaner_id="logs", description="short", kind=ItemKind.COMMAND,
+                          command=["true", "3"], requires_root=True, timeout=10)
+    env.cleaners.append(FakeCleaner("logs", [long_, default, short]))
+    rc, _ = _run(env, _selection([item_key(i) for i in (long_, default, short)]),
+                 deadline=60)
+    assert rc == 0
+    assert calls == [60, 60, 10]
+
+
+def test_watchdog_writes_deadline_result_and_exits_3(env, monkeypatch):
+    import threading
+
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    release = threading.Event()
+
+    def blocking_scan():
+        release.wait(10)
+        return [ia]
+
+    env.cleaners.append(FakeCleaner("logs", blocking_scan))
+    exits = []
+
+    def fake_exit(code):
+        exits.append(code)
+        release.set()
+
+    monkeypatch.setattr(os, "_exit", fake_exit)
+    sel = _selection([item_key(ia)])
+    rc, _ = _run(env, sel, deadline=0.2, grace=0.2)
+    assert exits == [3]
+    assert rc == 3
+    assert a.exists()
+    res = elevate.read_result(env.result)
+    assert res.deadline_hit and res.nonce == sel.nonce
+    assert "stopped after its deadline" in res.errors[0]
+
+
+# --------------------------------------------------------------------------
+# minors
+# --------------------------------------------------------------------------
+def test_bound_user_uid_must_match_expected_uid(env, monkeypatch):
+    monkeypatch.setattr(elevated, "_is_posix", lambda: True)
+    other = context.TargetUser("alice", env.home, UID + 1, UID + 1, True)
+    fake = lambda: other  # noqa: E731
+    fake.cache_clear = lambda: None
+    monkeypatch.setattr(context, "invoking_user", fake)
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    rc, _ = _run(env, _selection([item_key(ia)]))
+    assert rc == 1
+    assert a.exists() and env.scans == []
+
+
+def test_config_check_does_not_allow_root_owner():
+    st = SimpleNamespace(st_uid=0, st_mode=0o100644)
+    with pytest.raises(ValueError):
+        elevate._check_secure(st, FAKE_UID, "config")

@@ -133,6 +133,19 @@ def test_service_clean_execute_records_history_and_manifest(tmp_path, state):
     assert summary.errors == []
 
 
+def test_service_clean_without_history_writes_no_state(tmp_path, state):
+    paths = _files(tmp_path)
+    summary = service.clean(
+        _items(paths), Config(), dry_run=False, use_quarantine=False,
+        record_history=False,
+    )
+    assert not any(p.exists() for p in paths)
+    assert summary.removed == 3
+    assert summary.manifest_path is None and summary.quarantine_run is None
+    assert not (state / "state").exists()
+    assert not (state / "q").exists()
+
+
 def test_service_clean_with_quarantine_is_restorable(tmp_path, state):
     paths = _files(tmp_path, 1)
     summary = service.clean(

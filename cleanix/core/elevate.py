@@ -55,6 +55,9 @@ class Selection:
     invoking_user: str
     only: List[str]
     keys: List[str]
+    # Kept in the schema for compatibility but IGNORED by the helper: it
+    # always deletes without quarantine (a root-owned quarantine/history under
+    # the user's home would be a root file-placement primitive).
     use_quarantine: bool
     nonce: str = field(default_factory=new_nonce)
 
@@ -88,13 +91,20 @@ def _check_secure(st, expected_uid: Optional[int], what: str, *,
 
 
 def read_secure(path: Path, *, expected_uid: Optional[int], max_bytes: int,
-                what: str, allow_root: bool = False) -> bytes:
-    """Read a small regular file, refusing links and (POSIX) foreign owners."""
+                what: str, allow_root: bool = False,
+                dir_fd: Optional[int] = None) -> bytes:
+    """Read a small regular file, refusing links and (POSIX) foreign owners.
+
+    With ``dir_fd`` (POSIX) only ``path.name`` is opened, relative to that
+    already-validated directory descriptor."""
     path = Path(path)
     if _POSIX:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
-            fd = os.open(str(path), flags)
+            if dir_fd is not None:
+                fd = os.open(path.name, flags, dir_fd=dir_fd)
+            else:
+                fd = os.open(str(path), flags)
         except OSError as exc:
             raise ValueError(f"{what} could not be opened") from exc
         try:
@@ -146,17 +156,19 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def _atomic_write(path: Path, data: bytes, mode: int, *,
-                  dir_uid: Optional[int] = None) -> None:
+                  dir_uid: Optional[int] = None, dir_fd: Optional[int] = None) -> None:
     """Write ``data`` to ``path`` via a temp file in the same directory and
-    ``os.replace``. On POSIX the directory is opened with ``O_NOFOLLOW`` and,
-    when ``dir_uid`` is given, must be owned by it and not group/world
-    writable; all file operations are relative to that descriptor."""
+    ``os.replace``. On POSIX the directory is opened with ``O_NOFOLLOW`` (or
+    the given, already-validated ``dir_fd`` is used) and, when ``dir_uid`` is
+    given, must be owned by it and not group/world writable; all file
+    operations are relative to that descriptor."""
     path = Path(path)
     parent = path.parent
     tmp_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
     if _POSIX:
         dflags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        dfd = os.open(str(parent), dflags)
+        own_fd = dir_fd is None
+        dfd = os.open(str(parent), dflags) if own_fd else dir_fd
         try:
             st = os.fstat(dfd)
             if not stat.S_ISDIR(st.st_mode):
@@ -181,7 +193,8 @@ def _atomic_write(path: Path, data: bytes, mode: int, *,
                     pass
                 raise
         finally:
-            os.close(dfd)
+            if own_fd:
+                os.close(dfd)
         return
     tmp = parent / tmp_name
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
@@ -222,7 +235,9 @@ def make_request_dir() -> Path:
                 base = runtime
         except OSError:
             base = None
-    return Path(tempfile.mkdtemp(prefix="cleanix-elevate-", dir=base))
+    # realpath: the helper refuses a request reached through a symlinked
+    # parent (e.g. macOS /var -> /private/var), so hand out the real path.
+    return Path(os.path.realpath(tempfile.mkdtemp(prefix="cleanix-elevate-", dir=base)))
 
 
 def write_request(directory: Path, selection: Selection) -> Path:
@@ -288,6 +303,69 @@ def read_request(path: Path, *, expected_uid: Optional[int]) -> Selection:
     data = read_secure(Path(path), expected_uid=expected_uid if _POSIX else None,
                        max_bytes=MAX_REQUEST_BYTES, what="request")
     return parse_request(data)
+
+
+class RequestDir:
+    """The request directory, validated ONCE and then used by descriptor.
+
+    POSIX: the absolute path must equal its realpath (no symlinked parent
+    components); it is opened ``O_DIRECTORY|O_NOFOLLOW`` and the opened
+    directory must be owned by ``expected_uid`` and not group/world writable.
+    ``request.json`` is read and ``result.json`` written relative to that
+    descriptor, so renaming or swapping the path afterwards has no effect.
+    Windows: refused if the directory or any parent is a reparse point.
+    Raises ValueError on any failure.
+    """
+
+    def __init__(self, directory: Path, expected_uid: Optional[int]):
+        self.path = Path(os.path.abspath(str(directory)))
+        self.expected_uid = expected_uid
+        self.fd: Optional[int] = None
+        if _POSIX:
+            if expected_uid is None:
+                raise ValueError("the requesting uid is unknown")
+            if os.path.realpath(str(self.path)) != str(self.path):
+                raise ValueError("request directory is reached through a symbolic link")
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(str(self.path), flags)
+            except OSError:
+                raise ValueError("request directory could not be opened") from None
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISDIR(st.st_mode):
+                    raise ValueError("request directory is not a directory")
+                _check_secure(st, expected_uid, "request directory")
+            except BaseException:
+                os.close(fd)
+                raise
+            self.fd = fd
+            return
+        from cleanix.core import safety
+
+        for p in (self.path, *self.path.parents):
+            if safety.is_reparse_point(p):
+                raise ValueError("request directory path contains a link or junction")
+        if not self.path.is_dir():
+            raise ValueError("request directory is not a directory")
+
+    def read_request(self) -> Selection:
+        data = read_secure(self.path / REQUEST_NAME,
+                           expected_uid=self.expected_uid if _POSIX else None,
+                           max_bytes=MAX_REQUEST_BYTES, what="request", dir_fd=self.fd)
+        return parse_request(data)
+
+    def write_result(self, result: "HelperResult") -> None:
+        data = json.dumps(_result_payload(result)).encode("utf-8")
+        _atomic_write(self.path / RESULT_NAME, data, 0o644, dir_fd=self.fd,
+                      dir_uid=self.expected_uid if _POSIX else None)
+
+    def close(self) -> None:
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            finally:
+                self.fd = None
 
 
 # --------------------------------------------------------------------------
