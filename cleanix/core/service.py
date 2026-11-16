@@ -30,6 +30,7 @@ class CleanSummary:
     freed: int = 0
     removed: int = 0
     errors: List[CleanOutcome] = field(default_factory=list)
+    cancelled: bool = False
 
 
 def scan(
@@ -40,6 +41,8 @@ def scan(
     progress: Optional[Callable[[str, int, int], None]] = None,
     cancel: CancelCB = None,
 ) -> ScanResult:
+    """Scan the selected cleaners. ``cancel`` must be thread-safe: the parallel
+    engine path calls it from worker threads."""
     safety.set_protected_globs(config.protected_globs)
     cleaners = build_cleaners(config, only=only, exclude=exclude)
     total = len(cleaners)
@@ -66,9 +69,16 @@ def clean(
     cancel: CancelCB = None,
     record_history: bool = True,
 ) -> CleanSummary:
-    """``record_history=False`` skips history, the manifest and saving a
-    quarantine index (the elevated helper must write nothing under the
-    user's home; the GUI records history itself)."""
+    """Clean ``items``. ``cancel`` must be thread-safe: it may be called from
+    worker threads.
+
+    ``record_history=False`` skips history and the manifest (the elevated
+    helper must write nothing under the user's home; the GUI records history
+    itself). It cannot be combined with a real quarantine run, which would
+    move files without saving the index needed to restore them.
+    """
+    if not record_history and use_quarantine and not dry_run:
+        raise ValueError("record_history=False cannot be combined with quarantine")
     safety.set_protected_globs(config.protected_globs)
     items = list(items)
     total = len(items)
@@ -92,7 +102,7 @@ def clean(
 
     manifest: Optional[str] = None
     run_id: Optional[str] = None
-    if not dry_run and record_history:
+    if not dry_run and record_history and result.outcomes:
         history.record(result.freed, result.removed_count,
                        mode="quarantine" if quarantine else "delete")
         manifest = history.write_manifest(result) or None
@@ -107,4 +117,5 @@ def clean(
         freed=result.freed,
         removed=result.removed_count,
         errors=result.errors,
+        cancelled=bool(cancel is not None and cancel()),
     )

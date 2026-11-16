@@ -1,6 +1,7 @@
 """Tests for the service layer and engine cancellation."""
 
 import threading
+import time
 
 import pytest
 
@@ -73,21 +74,16 @@ def test_item_key_path_and_command():
 @pytest.mark.parametrize("parallel", [False, True])
 def test_engine_scan_cancel_stops_early(parallel):
     done0 = threading.Event()
-    calls = []
-    lock = threading.Lock()
 
     def cancel():
-        with lock:
-            first = not calls
-            calls.append(1)
-        if first:
-            return False
-        done0.wait(timeout=5)
-        return True
+        # Non-blocking apart from a short pause that lets cleaner 0 finish
+        # before the submit loop asks again (keeps the parallel case stable).
+        time.sleep(0.05)
+        return done0.is_set()
 
     cleaners = [FakeCleaner(0, on_scan=done0.set)] + [FakeCleaner(i) for i in range(1, 5)]
     result = Engine(cleaners).scan(parallel=parallel, cancel=cancel)
-    assert len(result.reports) < 5
+    assert 1 <= len(result.reports) < 5
 
 
 def test_engine_clean_cancel_stops_between_items(tmp_path):
@@ -157,17 +153,51 @@ def test_service_clean_with_quarantine_is_restorable(tmp_path, state):
     assert paths[0].exists()
 
 
-def test_service_scan_raises_cancelled():
+def test_service_scan_raises_cancelled(monkeypatch):
+    monkeypatch.setattr(service, "build_cleaners", lambda *a, **k: [FakeCleaner(0)])
     with pytest.raises(service.Cancelled):
-        service.scan(Config(), only=["trash"], cancel=lambda: True)
+        service.scan(Config(), cancel=lambda: True)
 
 
-def test_service_scan_applies_protected_globs(tmp_path):
+def test_service_scan_applies_protected_globs(tmp_path, monkeypatch):
+    monkeypatch.setattr(service, "build_cleaners", lambda *a, **k: [])
     target = tmp_path / "keep" / "file.bin"
     target.parent.mkdir()
     target.write_bytes(b"x")
     assert safety.is_safe_to_delete(str(target))
     cfg = Config()
     cfg.protected_globs = [str(tmp_path / "keep" / "*")]
-    service.scan(cfg, only=["trash"])
+    service.scan(cfg)
     assert not safety.is_safe_to_delete(str(target))
+
+
+def test_service_clean_nothing_processed_records_no_history(tmp_path, state):
+    summary = service.clean([], Config(), dry_run=False, use_quarantine=False)
+    assert summary.manifest_path is None
+    assert history.stats()["runs"] == 0
+    paths = _files(tmp_path)
+    summary = service.clean(
+        _items(paths), Config(), dry_run=False, use_quarantine=False,
+        cancel=lambda: True,
+    )
+    assert all(p.exists() for p in paths)
+    assert history.stats()["runs"] == 0
+    assert summary.cancelled is True
+
+
+def test_service_clean_cancelled_between_items(tmp_path, state):
+    paths = _files(tmp_path)
+    seen = {"n": 0}
+
+    def progress(_d, _done, _total):
+        seen["n"] += 1
+
+    summary = service.clean(
+        _items(paths), Config(), dry_run=False, use_quarantine=False,
+        progress=progress, cancel=lambda: seen["n"] >= 1,
+    )
+    assert summary.cancelled is True
+    assert summary.removed == 1
+    assert history.stats()["runs"] == 1
+    ok = service.clean([], Config(), dry_run=True)
+    assert ok.cancelled is False

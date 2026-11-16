@@ -43,6 +43,8 @@ class Engine:
 
         ``cancel`` (optional) is polled between cleaners; once it returns true
         no further cleaner is started and the partial result is returned.
+        ``cancel`` must be thread-safe: the parallel path calls it from worker
+        threads.
         """
         n = len(self.cleaners)
         if not parallel or n <= 1:
