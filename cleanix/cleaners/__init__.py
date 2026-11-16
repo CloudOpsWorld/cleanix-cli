@@ -178,6 +178,12 @@ from cleanix.cleaners.windows_system import (
     WinUpdateCacheCleaner,
     WindowsOldReporter,
 )
+from cleanix.cleaners.windows_apps import (
+    WinBrowserCacheCleaner,
+    WinPackageCacheCleaner,
+    WinShaderCacheCleaner,
+    WinVisualStudioCleaner,
+)
 
 ALL_CLEANERS: List[Type[Cleaner]] = [
     # Cross-platform user junk
@@ -303,6 +309,10 @@ ALL_CLEANERS: List[Type[Cleaner]] = [
     WinPrefetchReporter,
     WindowsOldReporter,
     WinComponentStoreCleaner,
+    WinBrowserCacheCleaner,
+    WinShaderCacheCleaner,
+    WinPackageCacheCleaner,
+    WinVisualStudioCleaner,
     # BSD
     FreeBsdPkgCleaner,
     BsdDistfilesCleaner,

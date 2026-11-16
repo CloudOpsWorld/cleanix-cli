@@ -14,7 +14,8 @@ from typing import Iterable
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
-from cleanix.core.platform import LINUX, MACOS, XDG_PLATFORMS
+from cleanix.core import platform, winenv
+from cleanix.core.platform import LINUX, MACOS, WINDOWS, XDG_PLATFORMS
 from cleanix.core.utils import config_dir
 from cleanix.core.utils import home, iter_children, path_size
 
@@ -43,15 +44,30 @@ _SKIP_APPS = {
     "microsoft-edge", "opera", "google-chrome-beta", "chromium-dev",
 }
 
+# Windows Roaming dirs owned by browsers (compared case-insensitively).
+_WIN_SKIP_APPS = {"bravesoftware", "opera software", "mozilla", "microsoft"}
+
 
 class ElectronCacheCleaner(Cleaner):
     id = "electron_cache"
     name = "Electron/Chromium app caches"
     description = "Rebuildable Cache/GPUCache/Code Cache from Electron apps"
     requires_root = False
-    platforms = XDG_PLATFORMS
+    platforms = (*XDG_PLATFORMS, WINDOWS)
 
     def _config_roots(self) -> Iterable[Path]:
+        if platform.is_windows():
+            roaming = winenv.roaming_appdata()
+            if roaming.is_dir():
+                for app in iter_children(roaming):
+                    low = app.name.lower()
+                    if (
+                        app.is_dir()
+                        and low not in _WIN_SKIP_APPS
+                        and low not in {n.lower() for n in _SKIP_APPS}
+                    ):
+                        yield app
+            return
         cfg = config_dir()
         if cfg.is_dir():
             for app in iter_children(cfg):
@@ -175,9 +191,12 @@ class JetBrainsCleaner(Cleaner):
     name = "JetBrains IDE caches"
     description = "Caches, logs, and indexes for IntelliJ/PyCharm/etc."
     requires_root = False
-    platforms = (LINUX, MACOS, *XDG_PLATFORMS)
+    platforms = (LINUX, MACOS, *XDG_PLATFORMS, WINDOWS)
 
     def _roots(self) -> Iterable[Path]:
+        if platform.is_windows():
+            yield winenv.local_appdata() / "JetBrains"
+            return
         # Linux/BSD: ~/.cache/JetBrains/<Product>/{caches,log,index,...}
         yield home() / ".cache" / "JetBrains"
         # macOS: ~/Library/Caches/JetBrains and ~/Library/Logs/JetBrains
