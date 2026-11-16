@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import os
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -38,6 +39,10 @@ class TargetUser:
 
 
 def is_effective_root() -> bool:
+    if sys.platform == "win32":
+        from cleanix.core import winenv
+
+        return winenv.is_admin()
     return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
@@ -61,7 +66,7 @@ def invoking_user() -> TargetUser:
             pass
     home = Path(os.path.expanduser("~"))
     uid = os.geteuid() if hasattr(os, "geteuid") else 0
-    return TargetUser(os.environ.get("USER", "user"), home, uid, uid, True)
+    return TargetUser(os.environ.get("USER") or os.environ.get("USERNAME") or "user", home, uid, uid, True)
 
 
 def _all_users(min_uid: int) -> List[TargetUser]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Iterator, Optional, Sequence
@@ -159,6 +160,10 @@ def walk_pruned(root: str | os.PathLike, prune: Optional[set] = None):
 
 
 def is_root() -> bool:
+    if sys.platform == "win32":
+        from cleanix.core import winenv
+
+        return winenv.is_admin()
     return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
