@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 
 from cleanix.config import Config
 from cleanix.core import catalog, quarantine
-from cleanix.core.models import CleanableItem, ScanResult
+from cleanix.core.models import CleanableItem, ItemKind, ScanResult
 from cleanix.core.utils import human_size
 from cleanix.gui import workers
 
@@ -56,6 +56,10 @@ class ConfirmInfo:
     count: int
     size: int
     keep_copy: bool = True
+    # Selected items that are not PATH items (commands such as emptying the
+    # Recycle Bin or pruning containers): never quarantined, never undoable.
+    irreversible: int = 0
+    trash_items: int = 0
 
 
 class ElidedLabel(QLabel):
@@ -112,6 +116,7 @@ class CategoryCard(QFrame):
 
     def __init__(self, category: str, label: str, items: List[CleanableItem], *,
                  mode: str = "select", checked: bool = False,
+                 hint: Optional[str] = None,
                  parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.category = category
@@ -140,7 +145,8 @@ class CategoryCard(QFrame):
         self.hint_label: Optional[ElidedLabel] = None
         hints = [i.hint for i in self.items if i.hint]
         if mode == "readonly":
-            text = hints[0] if hints else "Shown for review; not cleaned from Simple mode."
+            text = hint or (hints[0] if hints else
+                            "Shown for review; not cleaned from Simple mode.")
             self.hint_label = ElidedLabel(text)
             outer.addWidget(self.hint_label)
 
@@ -162,6 +168,7 @@ class ConfirmCleanDialog(QDialog):
         self.setWindowTitle("Confirm clean")
         self._count = info.count
         self._size = info.size
+        self._irreversible = info.irreversible
         self.summary_label = QLabel(
             f"Clean {info.count} item{'s' if info.count != 1 else ''} "
             f"({human_size(info.size)})?")
@@ -171,6 +178,10 @@ class ConfirmCleanDialog(QDialog):
             "Keep a copy so I can undo (uses disk space until emptied)")
         self.keep_copy_checkbox.setChecked(info.keep_copy)
         self.keep_copy_checkbox.toggled.connect(self._update_warning)
+        if info.irreversible >= info.count:
+            # Nothing selected can be kept: a copy is meaningless.
+            self.keep_copy_checkbox.setChecked(False)
+            self.keep_copy_checkbox.setEnabled(False)
         self.clean_button = QPushButton("Clean")
         self.clean_button.setDefault(True)
         self.clean_button.setAccessibleName("Clean")
@@ -190,12 +201,21 @@ class ConfirmCleanDialog(QDialog):
 
     @Slot()
     def _update_warning(self, *_args) -> None:
-        if self.keep_copy_checkbox.isChecked():
-            self.warning_label.setText(
-                "The files are kept in quarantine, so this clean can be undone.")
+        n = self._irreversible
+        parts = []
+        if n:
+            parts.append(
+                f"{n} selected item{'s' if n != 1 else ''} cannot be undone "
+                "(for example emptying the Recycle Bin or pruning containers).")
+        if n >= self._count:
+            pass
+        elif self.keep_copy_checkbox.isChecked():
+            parts.append("The files are kept in quarantine, so "
+                         + ("the rest of " if n else "")
+                         + "this clean can be undone.")
         else:
-            self.warning_label.setText(
-                "The files will be deleted and this cannot be undone.")
+            parts.append("The files will be deleted and this cannot be undone.")
+        self.warning_label.setText(" ".join(parts))
 
     def keep_copy(self) -> bool:
         return self.keep_copy_checkbox.isChecked()
@@ -214,15 +234,21 @@ def _button(text: str, name: Optional[str] = None) -> QPushButton:
 
 
 class SimpleView(QWidget):
+    # Notification only: emitted just BEFORE the clean worker starts, with the
+    # items about to be cleaned. The view starts the clean itself.
     request_clean = Signal(list)
     scanned = Signal(object)
 
     def __init__(self, config: Config, *, scan_worker_factory: Optional[Callable] = None,
                  clean_worker_factory: Optional[Callable] = None,
                  confirm: Optional[Callable[[ConfirmInfo], Tuple[bool, bool]]] = None,
+                 allow_admin_items: bool = False,
                  parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._config = config
+        self._allow_admin = allow_admin_items
+        self._kept_copy = True
+        self._all_irreversible = False
         # Factories mirror the worker constructors: scan(config) and
         # clean(items, config, dry_run=..., use_quarantine=...).
         self._scan_factory = scan_worker_factory or workers.ScanWorker
@@ -374,6 +400,7 @@ class SimpleView(QWidget):
         if self._worker is not None:
             return
         self.error_label.setText("")
+        self._clear_cards()
         self.scan_progress.setRange(0, 0)
         self.scan_status.setText("Scanning...")
         self._cancel_requested = False
@@ -440,6 +467,8 @@ class SimpleView(QWidget):
             info = infos.get(item.cleaner_id)
             if item.report_only or info is None:
                 mode = "readonly"
+            elif item.requires_root and not self._allow_admin:
+                mode = "readonly"
             elif category in _OPT_IN:
                 mode = "optin"
             elif catalog.preselect(item, info):
@@ -448,10 +477,7 @@ class SimpleView(QWidget):
                 mode = "readonly"
             groups.setdefault((category, mode), []).append(item)
 
-        for card in self._cards:
-            card.setParent(None)
-            card.deleteLater()
-        self._cards = []
+        self._clear_cards()
 
         order = list(catalog.CATEGORIES)
         for mode in ("select", "optin", "readonly"):
@@ -462,8 +488,12 @@ class SimpleView(QWidget):
                 label = catalog.CATEGORIES[category]
                 if mode == "readonly":
                     label += " (review only)"
+                hint = None
+                if mode == "readonly" and not self._allow_admin and any(
+                        i.requires_root for i in items):
+                    hint = "Needs administrator permission"
                 card = CategoryCard(category, label, items, mode=mode,
-                                    checked=(mode == "select"))
+                                    checked=(mode == "select"), hint=hint)
                 card.toggled.connect(self._refresh_clean_button)
                 self._cards.append(card)
                 (self._main_cards_layout if mode == "select" else self._also_layout
@@ -478,13 +508,21 @@ class SimpleView(QWidget):
         self._set_state(SimpleState.RESULTS)
         self.scanned.emit(result)
 
+    def _clear_cards(self) -> None:
+        for card in self._cards:
+            card.setParent(None)
+            card.deleteLater()
+        self._cards = []
+        self.also_found_toggle.setChecked(False)
+
     def cards(self) -> List[CategoryCard]:
         return list(self._cards)
 
     def selected_items(self) -> List[CleanableItem]:
         out: List[CleanableItem] = []
         for card in self._cards:
-            out.extend(card.selected_items())
+            out.extend(i for i in card.selected_items()
+                       if self._allow_admin or not i.requires_root)
         return out
 
     def selected_size(self) -> int:
@@ -506,8 +544,10 @@ class SimpleView(QWidget):
         items = self.selected_items()
         if not items or self._state is not SimpleState.RESULTS:
             return
-        accepted, keep_copy = self._confirm(
-            ConfirmInfo(len(items), sum(i.size for i in items), True))
+        irreversible = sum(1 for i in items if i.kind is not ItemKind.PATH)
+        accepted, keep_copy = self._confirm(ConfirmInfo(
+            len(items), sum(i.size for i in items), True, irreversible,
+            sum(1 for i in items if catalog.category_of(i.cleaner_id) == "trash")))
         if not accepted:
             return
         self.request_clean.emit(items)
@@ -515,6 +555,8 @@ class SimpleView(QWidget):
 
     def _start_clean(self, items: List[CleanableItem], keep_copy: bool) -> None:
         self._cancel_requested = False
+        self._kept_copy = keep_copy
+        self._all_irreversible = all(i.kind is not ItemKind.PATH for i in items)
         self.clean_progress.setRange(0, 0)
         self.clean_status.setText("Cleaning...")
         worker = self._clean_factory(
@@ -548,7 +590,15 @@ class SimpleView(QWidget):
             if stopped else f"Freed {freed} ({summary.removed} items removed).")
         n_err = len(summary.errors)
         self.errors_label.setText(f"{n_err} error{'s' if n_err != 1 else ''}")
-        self.undo_label.setText("")
+        if summary.quarantine_run:
+            self.undo_label.setText("")
+        elif self._all_irreversible:
+            self.undo_label.setText(
+                "Nothing was kept: the selected items cannot be undone.")
+        elif not self._kept_copy:
+            self.undo_label.setText("Undo is unavailable: you chose not to keep a copy.")
+        else:
+            self.undo_label.setText("Undo is unavailable: nothing was kept.")
         self.undo_button.setEnabled(bool(summary.quarantine_run))
         self._set_state(SimpleState.DONE)
 
@@ -558,19 +608,32 @@ class SimpleView(QWidget):
         if self._state is not SimpleState.CLEANING:
             return
         self._worker = None
-        self._set_state(SimpleState.RESULTS)
+        self._stopped_before_finishing()
+
+    def _stopped_before_finishing(self, detail: str = "") -> None:
+        # Some items may already be gone: force a rescan instead of showing
+        # stale cards.
+        self._clear_cards()
+        self.error_label.setText(
+            "Clean stopped before finishing; scan again to see what is left."
+            + (f" ({detail})" if detail else ""))
+        self._set_state(SimpleState.IDLE)
 
     @Slot(str)
     def _on_clean_failed(self, message: str) -> None:
         if self._state is not SimpleState.CLEANING:
             return
         self._worker = None
-        self.results_summary.setText(f"Clean failed: {message}")
-        self._set_state(SimpleState.RESULTS)
+        self._stopped_before_finishing(message)
 
     # ---- undo ----------------------------------------------------------
     @Slot()
     def undo(self) -> None:
+        """Restore the last clean's quarantine run.
+
+        Note: ``quarantine.restore`` runs synchronously on the GUI thread; a
+        later task may move it to a worker.
+        """
         run = getattr(self._last_summary, "quarantine_run", None)
         if self._state is not SimpleState.DONE or not run:
             return

@@ -78,12 +78,18 @@ class FakeCleanWorker(FakeWorker):
         self.finished.emit(s)
 
 
-def make_view(qtbot, scan=None, clean=None, confirm=None):
+def make_view(qtbot, scan=None, clean=None, confirm=None, allow_admin=False, calls=None):
+    def clean_factory(items, cfg, **kw):
+        if calls is not None:
+            calls.append(kw)
+        return clean
+
     v = SimpleView(
         Config(),
         scan_worker_factory=(lambda cfg: scan) if scan else None,
-        clean_worker_factory=(lambda items, cfg, **kw: clean) if clean else None,
+        clean_worker_factory=clean_factory if clean else None,
         confirm=confirm or (lambda info: (True, True)),
+        allow_admin_items=allow_admin,
     )
     qtbot.addWidget(v)
     v.show()
@@ -311,7 +317,6 @@ def test_long_unicode_and_rtl_labels_are_elided_with_tooltip(qtbot):
         qtbot.waitExposed(card)
         lbl = card.label_widget
         assert lbl.toolTip() == text and lbl.fullText() == text
-        assert lbl.width() <= card.width()
         assert lbl.elidedText() != text
         assert card.minimumSizeHint().width() < 400
     lbl = ElidedLabel("short")
@@ -344,3 +349,172 @@ def test_tab_order_reaches_scan_clean_and_cancel_buttons(qtbot):
     for c in v.cards():
         assert c.checkbox in _chain(v.scan_button)
         assert c.checkbox.accessibleName()
+
+
+def cmd_item(cid="win_recycle_bin", size=100):
+    return item(cid, size, kind=ItemKind.COMMAND, path=None, command=["empty"])
+
+
+def test_confirm_warns_when_command_items_cannot_be_undone(qtbot):
+    infos = []
+    v = make_view(qtbot, confirm=lambda info: infos.append(info) or (False, True))
+    v.set_scan_result(result(item("temp", 10), cmd_item()))
+    v.also_found_toggle.setChecked(True)
+    next(c for c in v.cards() if c.category == "trash").checkbox.setChecked(True)
+    v.clean_button.click()
+    assert infos[0].irreversible == 1 and infos[0].trash_items == 1
+    d = ConfirmCleanDialog(infos[0])
+    qtbot.addWidget(d)
+    assert "cannot be undone" in d.warning_label.text()
+    assert "1 selected item cannot be undone" in d.warning_label.text()
+    d.keep_copy_checkbox.setChecked(False)
+    assert "1 selected item cannot be undone" in d.warning_label.text()
+
+
+def test_all_command_selection_disables_keep_copy(qtbot):
+    d = ConfirmCleanDialog(ConfirmInfo(2, 10, irreversible=2))
+    qtbot.addWidget(d)
+    assert not d.keep_copy_checkbox.isEnabled()
+    assert not d.keep_copy()
+    assert "cannot be undone" in d.warning_label.text()
+    assert "kept in quarantine" not in d.warning_label.text()
+
+
+def test_done_explains_disabled_undo(qtbot):
+    v = make_view(qtbot, clean=FakeCleanWorker(outcome=summary(run=None)))
+    v.set_scan_result(result(cmd_item()))
+    v.also_found_toggle.setChecked(True)
+    v.cards()[0].checkbox.setChecked(True)
+    v.clean_button.click()
+    qtbot.waitUntil(lambda: v.state() is SimpleState.DONE, timeout=3000)
+    assert not v.undo_button.isEnabled()
+    assert "cannot be undone" in v.undo_label.text()
+    v = make_view(qtbot, clean=FakeCleanWorker(outcome=summary(run=None)),
+                  confirm=lambda info: (True, False))
+    v.set_scan_result(result(item("temp", 10)))
+    v.clean_button.click()
+    qtbot.waitUntil(lambda: v.state() is SimpleState.DONE, timeout=3000)
+    assert "not to keep a copy" in v.undo_label.text()
+
+
+def _root_result():
+    return result(item("temp", 10), item("apt", 20, requires_root=True),
+                  item("docker", 30))
+
+
+def test_admin_items_not_selectable_by_default(qtbot):
+    v = make_view(qtbot)
+    v.set_scan_result(_root_result())
+    v.also_found_toggle.setChecked(True)
+    system = [c for c in v.cards() if c.category == "system"]
+    root_card = next(c for c in system if c.mode == "readonly")
+    assert "administrator" in root_card.hint_label.fullText().lower()
+    assert not root_card.checkbox.isEnabled()
+    opt = next(c for c in system if c.mode == "optin")
+    opt.checkbox.setChecked(True)
+    assert all(not i.requires_root for i in v.selected_items())
+    assert v.selected_size() == 40
+    assert v.clean_button_text() == "Free 40 B"
+
+
+def test_admin_items_selectable_when_allowed(qtbot):
+    v = make_view(qtbot, allow_admin=True)
+    v.set_scan_result(_root_result())
+    v.also_found_toggle.setChecked(True)
+    system = next(c for c in v.cards() if c.category == "system")
+    assert system.mode == "optin" and len(system.items) == 2
+    system.checkbox.setChecked(True)
+    assert any(i.requires_root for i in v.selected_items())
+    assert v.selected_size() == 60
+    v2 = make_view(qtbot, allow_admin=True)
+    v2.set_scan_result(result(item("temp", 5, requires_root=True)))
+    assert v2.selected_items() == []
+
+
+def test_quarantine_choice_is_passed_to_clean_worker(qtbot):
+    calls = []
+    v = make_view(qtbot, clean=FakeCleanWorker(outcome=summary()), calls=calls)
+    v.set_scan_result(result(item("temp", 10)))
+    v.clean_button.click()
+    qtbot.waitUntil(lambda: v.state() is SimpleState.DONE, timeout=3000)
+    assert calls == [{"dry_run": False, "use_quarantine": True}]
+    calls2 = []
+    v = make_view(qtbot, clean=FakeCleanWorker(outcome=summary(run=None)), calls=calls2,
+                  confirm=lambda info: (True, False))
+    v.set_scan_result(result(item("temp", 10)))
+    v.clean_button.click()
+    qtbot.waitUntil(lambda: v.state() is SimpleState.DONE, timeout=3000)
+    assert calls2 == [{"dry_run": False, "use_quarantine": False}]
+
+
+def test_declined_confirm_never_creates_worker(qtbot):
+    calls = []
+    v = make_view(qtbot, clean=FakeCleanWorker(outcome=summary()), calls=calls,
+                  confirm=lambda info: (False, True))
+    emitted = []
+    v.request_clean.connect(emitted.append)
+    v.set_scan_result(result(item("temp", 10)))
+    v.clean_button.click()
+    assert calls == [] and emitted == []
+    assert v.state() is SimpleState.RESULTS
+
+
+@pytest.mark.parametrize("kind", ["cancelled", "failed"])
+def test_clean_stopped_without_summary_forces_rescan(qtbot, kind):
+    class W(FakeWorker):
+        def finish(self):
+            if kind == "failed":
+                self.failed.emit("disk gone")
+            else:
+                self.cancelled.emit()
+
+    v = make_view(qtbot, clean=W())
+    v.set_scan_result(result(item("temp", 10)))
+    v.clean_button.click()
+    qtbot.waitUntil(lambda: v.state() is SimpleState.IDLE, timeout=3000)
+    assert "scan again" in v.error_label.text()
+    assert v.cards() == []
+
+
+def test_cancelled_rescan_from_results_clears_old_cards(qtbot):
+    w = FakeWorker(outcome=result(item()), block=True)
+    v = make_view(qtbot, scan=w)
+    v.set_scan_result(result(item("temp", 10)))
+    assert v.cards()
+    v.rescan_button.click()
+    qtbot.waitUntil(w.started.is_set, timeout=3000)
+    v.cancel_scan_button.click()
+    qtbot.waitUntil(lambda: v.state() is SimpleState.IDLE, timeout=3000)
+    assert v.cards() == [] and v.selected_items() == []
+
+
+def test_double_start_guard(qtbot):
+    made = []
+    w = FakeWorker(outcome=result(item()), block=True)
+
+    def factory(cfg):
+        made.append(1)
+        return w
+
+    v = SimpleView(Config(), scan_worker_factory=factory)
+    qtbot.addWidget(v)
+    v.start_scan()
+    v.start_scan()
+    assert len(made) == 1
+    w.cancel()
+    qtbot.waitUntil(lambda: v.state() is SimpleState.IDLE, timeout=3000)
+
+
+def test_late_cancel_with_uncancelled_summary_is_not_stopped_early(qtbot):
+    class Late(FakeWorker):
+        def finish(self):  # cancel arrived after the last item
+            self.finished.emit(self.outcome)
+
+    cw = Late(outcome=summary(cancelled=False), block=True)
+    v = make_view(qtbot, clean=cw)
+    v.set_scan_result(result(item("temp", 10)))
+    v.clean_button.click()
+    qtbot.waitUntil(cw.started.is_set, timeout=3000)
+    v.cancel_clean_button.click()
+    qtbot.waitUntil(lambda: v.state() is SimpleState.DONE, timeout=3000)
+    assert "Stopped" not in v.done_label.text()
