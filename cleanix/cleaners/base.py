@@ -60,6 +60,9 @@ class Cleaner(abc.ABC):
     # when explicitly requested via ``--only`` (e.g. the memory cleaners, whose
     # effect is transient and shouldn't happen on every run).
     default_enabled: bool = True
+    # Set by the registry when ``--only`` forces a cleaner on Windows that does
+    # not support Windows: scan() then skips it instead of running POSIX logic.
+    unsupported_platform: bool = False
 
     def __init__(self, config: Config):
         self.config = config
@@ -158,6 +161,9 @@ class Cleaner(abc.ABC):
         report = CleanerReport(
             cleaner_id=self.id, name=self.name, description=self.description
         )
+        if self.unsupported_platform:
+            report.skipped_reason = "not supported on this platform"
+            return report
         reason = self.available()
         if reason:
             report.skipped_reason = reason

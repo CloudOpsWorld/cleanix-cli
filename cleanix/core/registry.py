@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Sequence
 from cleanix.cleaners import ALL_CLEANERS
 from cleanix.cleaners.base import Cleaner
 from cleanix.config import Config
+from cleanix.core import platform as _plat
 
 
 def build_cleaners(
@@ -32,6 +33,10 @@ def build_cleaners(
             # Explicit selection wins even over platform/disable filters.
             if cid not in only_set:
                 continue
+            # ... except on Windows, where a POSIX cleaner must never run: it
+            # is still listed, but its scan reports it as unsupported.
+            if _plat.is_windows() and not instance.supported():
+                instance.unsupported_platform = True
         else:
             if cid in exclude_set or cid in disabled:
                 continue

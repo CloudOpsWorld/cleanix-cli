@@ -7,7 +7,6 @@ deliberate manual step and the disk is never deleted.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Iterable
 
@@ -15,7 +14,7 @@ from cleanix.cleaners.base import Cleaner, SCOPE_USER
 from cleanix.core import winenv
 from cleanix.core.models import CleanableItem
 from cleanix.core.platform import WINDOWS
-from cleanix.core.utils import human_size, iter_children, path_size
+from cleanix.core.utils import human_size, iter_children, path_size, walk_no_reparse
 
 _HINT = (
     "WSL virtual disk: it grows but never shrinks by itself. Shut WSL down "
@@ -41,7 +40,7 @@ class WslDiskReporter(Cleaner):
                 yield state / "ext4.vhdx", pkg.name
         docker = local / "Docker" / "wsl"
         if docker.is_dir():
-            for dirpath, _dirs, files in os.walk(docker, onerror=lambda e: None):
+            for dirpath, _dirs, files in walk_no_reparse(docker):
                 if "ext4.vhdx" in files:
                     yield Path(dirpath) / "ext4.vhdx", "Docker Desktop"
 

@@ -19,6 +19,7 @@ from typing import Iterable, Set
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.context import current_user
 from cleanix.core.models import CleanableItem
+from cleanix.core import platform as _plat
 from cleanix.core.platform import ALL, WINDOWS
 from cleanix.core.utils import (
     home,
@@ -151,7 +152,8 @@ class AICompileCacheCleaner(Cleaner):
         yield h / ".nv" / "ComputeCache", "CUDA compute (PTX JIT) cache"
         yield cache / "flashinfer", "FlashInfer JIT cache"
         yield cache / "tfhub_modules", "TensorFlow Hub module cache"
-        if user:
+        # /tmp is drive-relative on Windows (and not where these live there).
+        if user and not _plat.is_windows():
             yield Path("/tmp") / f"torchinductor_{user}", "TorchInductor cache (/tmp)"
             yield Path("/tmp") / f"triton_{user}", "Triton cache (/tmp)"
 

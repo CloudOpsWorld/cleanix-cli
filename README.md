@@ -13,7 +13,8 @@ caches, container cruft — and only **removes** anything after you confirm.
 
 It can run on a **schedule** (a systemd timer on Linux/BSD, a launchd agent on
 macOS, a Task Scheduler task on Windows) to periodically analyze the
-system and notify you. Scheduled runs *never delete anything*; they only produce
+system and notify you (on Windows the report file is the output; no
+notification is shown). Scheduled runs *never delete anything*; they only produce
 a report so you can review and clean on your own terms.
 
 ## Platform support
@@ -48,7 +49,22 @@ to see every platform's cleaners.
 - **Quarantine covers path-based items only.** Command items such as emptying
   the Recycle Bin and DISM cannot be undone with `cleanix restore`.
 - `cleanix schedule install` creates a per-user, scan-only Task Scheduler task
-  named "Cleanix Scan" (it never cleans).
+  named "Cleanix Scan" (it never cleans). It does not raise a notification:
+  the JSON report at `%LOCALAPPDATA%\cleanix\last-scan.json` is the output.
+- External tools are never looked up in the current directory: PowerShell,
+  DISM and schtasks run from the System32 directory, everything else (e.g.
+  `docker`) only from absolute `PATH` entries.
+- Quarantine across volumes refuses folders that contain a junction or
+  symlink (they are never copied); a locked file makes the item fail with
+  nothing copied, and any copy that has to be kept is listed by
+  `cleanix quarantine list`.
+- **Residual limits (elevated runs).** `C:\Windows\Temp` is writable by
+  standard users. Before descending into each folder the remover re-checks
+  that it is still the same plain folder (not swapped for a junction), but a
+  swap in the short window between that check and the deletion is not
+  prevented (that needs handle-relative NT APIs), and entries in
+  `Windows\Temp` are not filtered by owner. If untrusted local users share the
+  machine, exclude that cleaner (`--exclude win_system_temp`).
 - `cleanix factory-reset` is not supported on Windows.
 - The AI-tool, dev-cache, pip/npm, Docker, Electron, JetBrains, big-file,
   duplicate, downloads, stale-project and browser-profile cleaners also run on
@@ -262,7 +278,8 @@ sudo cleanix clean --only memory_macos --execute   # macOS `purge`
   that declares the platforms it applies to.
 - **Root-aware.** Cleaners that need root are clearly flagged and skipped (with a
   note) when you run unprivileged.
-- **Scheduling.** Install a periodic read-only scan that reports (and notifies)
+- **Scheduling.** Install a periodic read-only scan that reports (and notifies;
+  on Windows the report file is the output)
   on a daily/weekly/monthly cadence — a **systemd user timer** on Linux, a
   **launchd LaunchAgent** on macOS, a per-user **Task Scheduler** task on
   Windows, and a **cron job** on the BSDs (or any
@@ -304,7 +321,8 @@ cleanix clean --execute --yes --only trash,pip_cache
 cleanix scan --json
 
 # Install a weekly read-only scan that notifies you
-# (systemd timer on Linux/BSD, launchd agent on macOS)
+# (systemd timer on Linux/BSD, launchd agent on macOS; on Windows a Task
+# Scheduler task whose output is the report file, no notification)
 cleanix schedule install --frequency weekly
 
 # Check / remove the schedule

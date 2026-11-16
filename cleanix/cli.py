@@ -124,6 +124,14 @@ def _elevate_text() -> str:
     return "re-run with sudo"
 
 
+def _disk_label() -> str:
+    """The volume reported by _disk_free(): the system drive on Windows."""
+    from cleanix.core import platform as plat
+    from cleanix.core import winenv
+
+    return winenv.system_drive() + "\\" if plat.is_windows() else "/"
+
+
 def _disk_free(path: Optional[str] = None) -> Optional[int]:
     import shutil as _shutil
 
@@ -502,7 +510,7 @@ def cmd_clean(args: argparse.Namespace, console: Console) -> int:
     if free_before is not None and free_after is not None:
         gained = free_after - free_before
         console.print(
-            f"[dim]Disk free on / : {human_size(free_before)} → "
+            f"[dim]Disk free on {_disk_label()} : {human_size(free_before)} → "
             f"{human_size(free_after)} ({'+' if gained >= 0 else ''}"
             f"{human_size(gained)}).[/dim]"
         )
@@ -956,7 +964,7 @@ def cmd_schedule(args: argparse.Namespace, console: Console) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cleanix",
-        description="A safe, thorough scheduled system cleaner for Linux, macOS and BSD.",
+        description="A safe, thorough scheduled system cleaner for Linux, macOS, BSD and Windows.",
     )
     parser.add_argument(
         "--version", action="version", version=f"cleanix {__version__}"

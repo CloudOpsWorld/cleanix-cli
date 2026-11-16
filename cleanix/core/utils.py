@@ -40,6 +40,13 @@ def _allocated_bytes(st: os.stat_result) -> int:
 def path_size(path: str | os.PathLike) -> int:
     """Actual on-disk size of a file or directory tree in bytes (best effort)."""
     p = Path(path)
+    win = sys.platform == "win32"
+    if win:
+        # Junctions are not symlinks: never size (or walk into) their target.
+        from cleanix.core import safety as _safety
+
+        if _safety.is_reparse_point(p):
+            return 0
     try:
         if p.is_symlink():
             return 0
@@ -52,6 +59,11 @@ def path_size(path: str | os.PathLike) -> int:
     for root, dirs, files in os.walk(p, onerror=lambda e: None):
         # Do not follow symlinked directories.
         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        if win:
+            dirs[:] = [
+                d for d in dirs
+                if not _safety.is_reparse_point(os.path.join(root, d))
+            ]
         for name in files:
             fp = os.path.join(root, name)
             try:
@@ -256,6 +268,21 @@ _PRUNE_DIRS = {
     ".git", ".hg", ".svn", "node_modules", ".cache", "Library",
     ".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "Photos Library.photoslibrary",
 }
+
+
+def walk_no_reparse(root: str | os.PathLike):
+    """``os.walk`` (errors ignored) that on Windows never descends into a
+    junction or other reparse point. Identical to ``os.walk`` elsewhere."""
+    win = sys.platform == "win32"
+    if win:
+        from cleanix.core import safety as _safety
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+        if win:
+            dirnames[:] = [
+                d for d in dirnames
+                if not _safety.is_reparse_point(os.path.join(dirpath, d))
+            ]
+        yield dirpath, dirnames, filenames
 
 
 def walk_pruned(root: str | os.PathLike, prune: Optional[set] = None):

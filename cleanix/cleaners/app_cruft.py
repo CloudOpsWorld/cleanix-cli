@@ -61,6 +61,13 @@ class ElectronCacheCleaner(Cleaner):
             if roaming.is_dir():
                 for app in iter_children(roaming):
                     low = app.name.lower()
+                    if low == "microsoft":
+                        # Roaming\Microsoft holds Office/Windows state (and
+                        # Edge); only classic Teams is an Electron app here.
+                        for sub in iter_children(app):
+                            if sub.name.lower() == "teams" and sub.is_dir():
+                                yield sub
+                        continue
                     if (
                         app.is_dir()
                         and low not in _WIN_SKIP_APPS

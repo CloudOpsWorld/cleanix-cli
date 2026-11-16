@@ -31,6 +31,7 @@ from cleanix.core.utils import (
     modified_within,
     older_than,
     surplus_after_keeping,
+    walk_no_reparse,
 )
 
 
@@ -148,7 +149,7 @@ class CodexCleaner(_AgentCleaner):
         sessions = root / "sessions"
         if sessions.is_dir():
             age = self.config.ai_history_max_age_days
-            for dirpath, _dirs, files in os.walk(sessions, onerror=lambda e: None):
+            for dirpath, _dirs, files in walk_no_reparse(sessions):
                 for name in files:
                     p = Path(dirpath, name)
                     if older_than(p, age):
