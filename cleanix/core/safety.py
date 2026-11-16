@@ -69,26 +69,40 @@ def _canonical(p: str | os.PathLike) -> Path:
       :func:`set_protected_globs`, where expansion *is* intended.)
     """
     raw = Path(os.path.abspath(str(p)))
+    if os.name == "nt":
+        raw = Path(_clean_windows(str(raw)))
     try:
         parent = Path(os.path.realpath(str(raw.parent)))
     except OSError:
         parent = raw.parent
     if os.name != "nt":
         return parent / raw.name if raw.name else parent
-    # Windows: expand 8.3 short names (DOCUME~1) so neither the built-in guard
-    # nor user globs can be bypassed by a short spelling.
+    # Windows: first clean the path exactly like safety_windows.normalize() does
+    # (NTFS stream suffixes, trailing dots/spaces), so that what we check is
+    # what we delete; then expand 8.3 short names (DOCUME~1) so neither the
+    # built-in guard nor user globs can be bypassed by a short spelling.
     parent = Path(_long_path(str(parent)))
     if not raw.name:
         return parent
-    cand = parent / raw.name
-    try:
-        is_link = _is_link_strict(str(cand))
-    except OSError:
-        return cand                      # cannot tell: keep literal, never follow
-    if is_link:
-        return cand                      # never expand through a link
-    expanded = _long_path(str(cand))     # no-op if it does not exist
-    return Path(expanded)
+    # GetLongPathNameW works on names only and never traverses a final link,
+    # so it is safe to expand the final component even when it is a junction.
+    return Path(_long_path(str(parent / raw.name)))
+
+
+def _clean_windows(path: str) -> str:
+    p = path.replace("/", "\\")
+    if p[:4] in (_EXT, "\\\\.\\") and p[4:5].isalpha() and p[5:6] == ":":
+        p = p[4:]
+    drive, tail = os.path.splitdrive(p)
+    comps = []
+    for c in tail.split("\\"):
+        if c not in (".", ".."):
+            c = c.split(":", 1)[0].rstrip(". ")
+        comps.append(c)
+    # drop empty components produced by cleaning (keep the leading root sep)
+    lead = "\\" if tail.startswith("\\") else ""
+    body = "\\".join(c for c in comps if c)
+    return os.path.normpath(drive + lead + body)
 
 
 _EXT = "\\\\?\\"  # extended-length path prefix
@@ -194,6 +208,8 @@ def _is_link_strict(path: str) -> bool:
 
     A missing path is simply not a link (False).
     """
+    if os.name != "nt":
+        return os.path.islink(path)     # POSIX: exactly the previous behaviour
     try:
         st = _lstat(path)
     except FileNotFoundError:

@@ -80,20 +80,81 @@ def test_short_name_cannot_bypass_user_folders():
         pytest.skip("no 8.3 aliases exist for user folders / Program Files on this machine")
 
 
+def _mk_junction(link, target):
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip("cannot create junction")
+
+
 def test_junction_with_short_name_removed_as_link_only(tmp_path):
     target = tmp_path / "target"
     target.mkdir()
     (target / "keep.txt").write_text("x")
     link = tmp_path / "JunctionWithLongName"
-    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        pytest.skip("cannot create junction")
+    _mk_junction(link, target)
     short = _needs_short(link)
     assert short.lower() != str(link).lower()
     safety.safe_rmtree(short)
     assert not os.path.lexists(link)
     assert (target / "keep.txt").exists()
+
+
+def test_glob_protected_junction_refused_by_short_name(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "keep.txt").write_text("x")
+    link = tmp_path / "JunctionWithLongName"
+    _mk_junction(link, target)
+    short = _needs_short(link)
+    assert short.lower() != str(link).lower()
+    safety.set_protected_globs([str(link)])
+    try:
+        with pytest.raises(safety.UnsafePathError):
+            safety.safe_rmtree(short)
+    finally:
+        safety.set_protected_globs([])
+    assert os.path.lexists(link) and (target / "keep.txt").exists()
+
+
+_SUFFIXES = ["::$INDEX_ALLOCATION", ":x", "::$INDEX_ALLOCATION.", ":x:$DATA", " ", "."]
+
+
+@pytest.mark.parametrize("suffix", _SUFFIXES)
+def test_short_name_plus_stream_suffix_cannot_bypass_glob(tmp_path, suffix):
+    prot = tmp_path / "ProtectedLongFolderName"
+    inner = prot / "ImportantSubFolder"
+    inner.mkdir(parents=True)
+    (inner / "data.txt").write_text("x")
+    short = _needs_short(inner)
+    assert short.lower() != str(inner).lower()
+    safety.set_protected_globs([str(inner)])
+    try:
+        assert not safety.is_safe_to_delete(short + suffix)
+        with pytest.raises(safety.UnsafePathError):
+            safety.safe_rmtree(short + suffix)
+    finally:
+        safety.set_protected_globs([])
+    assert (inner / "data.txt").exists()
+
+
+@pytest.mark.parametrize("suffix", _SUFFIXES)
+def test_short_name_plus_stream_suffix_cannot_bypass_builtin(suffix):
+    home = os.path.expanduser("~")
+    cands = [os.path.join(home, n) for n in ("Documents", "Pictures", "Downloads")]
+    cands.append(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    tried = 0
+    for long_p in cands:
+        if not os.path.isdir(long_p):
+            continue
+        short = _short(long_p)
+        if short.lower() == long_p.lower():
+            continue
+        tried += 1
+        assert short != long_p
+        assert not safety.is_safe_to_delete(short + suffix), short + suffix
+    if not tried:
+        pytest.skip("no 8.3 aliases exist for user folders / Program Files on this machine")
 
 
 def test_link_check_fails_closed_in_walk(tmp_path, monkeypatch):
