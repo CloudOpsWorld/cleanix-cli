@@ -22,6 +22,9 @@ SYSTEMROOT_ALLOWED: Tuple[str, ...] = (
     "serviceprofiles\\networkservice\\appdata\\local\\microsoft\\windows\\deliveryoptimization\\cache",
 )
 
+# Allowed when equal; every other entry is allowed only strictly below it.
+_ALLOWED_FILES = ("memory.dmp",)
+
 _USER_PROTECTED = (
     "Documents", "Desktop", "Downloads", "Pictures", "Music", "Videos",
     "OneDrive", "AppData", "AppData\\Roaming", "AppData\\Local",
@@ -40,17 +43,24 @@ _ENV_DEFAULTS = {
 def normalize(path: str) -> str:
     """Canonical comparison form: no ``\\\\?\\`` prefix, backslashes, normpath,
     casefolded, no trailing separator except on a drive root."""
-    p = str(path)
-    if p[:4] in ("\\\\?\\", "//?/", "\\\\.\\", "//./"):
+    # Convert "/" first so mixed-separator prefixes (//?\C:\x) are recognised.
+    p = str(path).replace("/", "\\")
+    if p[:4] in ("\\\\?\\", "\\\\.\\"):
         p = p[4:]
-        if p[:4].upper() == "UNC\\" or p[:4].upper() == "UNC/":
+        if p[:4].upper() == "UNC\\":
             p = "\\\\" + p[4:]
-    p = p.replace("/", "\\")
-    p = ntpath.normpath(p).casefold()
+    drive, tail = ntpath.splitdrive(p)
+    comps = []
+    for c in tail.split("\\"):
+        if c not in (".", ".."):
+            # NTFS stream suffix (name:stream:$TYPE) and trailing dots/spaces
+            # are ignored by Windows; strip them so they cannot dodge the check.
+            c = c.split(":", 1)[0].rstrip(". ")
+        comps.append(c)
+    p = ntpath.normpath(drive + "\\".join(comps)).casefold()
     drive, tail = ntpath.splitdrive(p)
     if tail not in ("", "\\"):
-        tail = tail.rstrip("\\")
-        p = drive + tail
+        p = drive + tail.rstrip("\\")
     return p
 
 
@@ -75,11 +85,27 @@ def _is_root(norm: str) -> bool:
 
 
 def _env(env: Mapping[str, str], key: str) -> str:
+    """Env value, or the documented default if missing/malformed (fail closed)."""
     lk = key.lower()
+    default = _ENV_DEFAULTS[lk]
     for k, val in env.items():
         if str(k).lower() == lk and val:
-            return str(val)
-    return _ENV_DEFAULTS[lk]
+            n = normalize(str(val))
+            if lk == "systemdrive":
+                if len(n) == 2 and n[1] == ":" and n[0].isalpha():
+                    return str(val)
+            elif _is_absolute(n) and not _is_root(n) and not n.startswith("\\\\"):
+                return str(val)
+    return default
+
+
+def _both(env: Mapping[str, str], key: str) -> List[str]:
+    """Normalised env-derived value plus the default (deduplicated)."""
+    out = [normalize(_env(env, key))]
+    d = normalize(_ENV_DEFAULTS[key.lower()])
+    if d not in out:
+        out.append(d)
+    return out
 
 
 def violation(target: str, env: Mapping[str, str], homes: Sequence[str]) -> Optional[str]:
@@ -87,21 +113,23 @@ def violation(target: str, env: Mapping[str, str], homes: Sequence[str]) -> Opti
     if not target or not str(target).strip():
         return "empty path"
     t = normalize(target)
+    if t.startswith("\\\\"):
+        return f"UNC paths are never deleted: {target}"
     if not _is_absolute(t):
         return f"not an absolute Windows path: {target}"
     if _is_root(t):
-        return f"refusing drive or share root: {target}"
+        return f"refusing drive root: {target}"
     tp = _parts(t)
 
-    sysroot = normalize(_env(env, "SystemRoot"))
-    sysdrive = normalize(_env(env, "SystemDrive")).rstrip("\\")
-    pf = normalize(_env(env, "ProgramFiles"))
-    pf86 = normalize(_env(env, "ProgramFiles(x86)"))
-    pdata = normalize(_env(env, "ProgramData"))
+    sysroots = _both(env, "SystemRoot")
+    sysdrives = _both(env, "SystemDrive")
+    pfs = _both(env, "ProgramFiles") + _both(env, "ProgramFiles(x86)")
+    pdatas = _both(env, "ProgramData")
 
-    protected = [sysroot, pf, pf86, pdata]
-    protected += [sysdrive + "\\" + n for n in
-                  ("users", "system volume information", "$recycle.bin", "recovery", "boot")]
+    protected = sysroots + pfs + pdatas
+    for sd in sysdrives:
+        protected += [sd + "\\" + n for n in
+                      ("users", "system volume information", "$recycle.bin", "recovery", "boot")]
     for home in homes:
         h = normalize(home)
         protected.append(h)
@@ -111,14 +139,19 @@ def violation(target: str, env: Mapping[str, str], homes: Sequence[str]) -> Opti
         if _is_absolute(root) and _is_under(_parts(root), tp):
             return f"protected location (or contains one): {target}"
 
-    sp = _parts(sysroot)
-    if _is_under(tp, sp):
-        for allowed in SYSTEMROOT_ALLOWED:
-            if _is_under(tp, sp + _parts("x:\\" + allowed)[1:]):
-                return None
-        return f"inside the Windows directory and not an allowed cleanup path: {target}"
+    for sysroot in sysroots:
+        sp = _parts(sysroot)
+        if _is_under(tp, sp):
+            for allowed in SYSTEMROOT_ALLOWED:
+                ap = sp + _parts("x:\\" + allowed)[1:]
+                if allowed in _ALLOWED_FILES:
+                    if _is_under(tp, ap):
+                        return None
+                elif len(tp) > len(ap) and _is_under(tp, ap):
+                    return None  # strictly below an allowed directory
+            return f"inside the Windows directory and not an allowed cleanup path: {target}"
 
-    for pfroot in (pf, pf86):
+    for pfroot in pfs:
         if _is_under(tp, _parts(pfroot)):
             return f"inside Program Files: {target}"
     return None

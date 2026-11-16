@@ -68,6 +68,56 @@ def test_custom_env_respected():
     assert v(r"D:\WinNT\System32", {"SystemRoot": r"D:\WinNT"}) is not None
     assert v(r"D:\WinNT\Temp\x", {"SystemRoot": r"D:\WinNT"}) is None
     assert v(r"d:\winnt\system32", {"SYSTEMROOT": r"D:\WinNT"}) is not None
+    # the documented default stays protected too
+    assert v(r"C:\Windows\System32", {"SystemRoot": r"D:\WinNT"}) is not None
+    assert v(r"D:\WinNT", {"SystemRoot": r"D:\WinNT"}) is not None
+
+
+@pytest.mark.parametrize("p", ["//?\\C:\\Windows", "\\\\?/C:\\Windows", "\\/?\\C:\\Windows\\System32",
+                               "//?/C:/Windows", "\\\\.\\C:\\Windows"])
+def test_mixed_separator_prefix_refused(p):
+    assert v(p) is not None
+
+
+@pytest.mark.parametrize("p", ["\\\\?\\unc\\srv\\share", "\\\\localhost\\C$\\Windows",
+                               "\\\\127.0.0.1\\c$\\Users\\bob\\Documents",
+                               "\\\\?\\UNC\\localhost\\C$\\Windows\\System32",
+                               "//srv/share/x", "\\\\srv\\share\\cache\\x"])
+def test_every_unc_path_refused(p):
+    assert "UNC" in v(p)
+
+
+@pytest.mark.parametrize("p", ["C:\\Windows.", "C:\\Windows ", "C:\\Users\\bob\\Documents.",
+                               "C:\\Program Files.", "C:\\Windows::$INDEX_ALLOCATION",
+                               "C:\\Windows:$I30:$INDEX_ALLOCATION",
+                               "C:\\Users\\bob\\Documents::$INDEX_ALLOCATION",
+                               "C:\\Windows\\System32. \\x", "C:\\Windows\\Temp\\..."])
+def test_trailing_dots_spaces_and_streams_refused(p):
+    assert v(p) is not None
+
+
+def test_stream_under_allowed_prefix_still_allowed():
+    assert v("C:\\Windows\\Temp\\x:stream") is None
+    assert v("C:\\Windows\\Temp\\x.tmp. ") is None
+
+
+@pytest.mark.parametrize("bad", ["Windows", "%SystemDrive%\\Windows", " ", "x", "\\\\srv\\share", "C:\\"])
+def test_malformed_env_fails_closed(bad):
+    env = {"SystemRoot": bad, "ProgramFiles": bad, "ProgramFiles(x86)": bad,
+           "ProgramData": bad, "SystemDrive": bad}
+    assert v("C:\\Windows\\System32", env) is not None
+    assert v("C:\\Program Files\\App", env) is not None
+    assert v("C:\\ProgramData", env) is not None
+    assert v("C:\\Users", env) is not None
+
+
+def test_allowed_directories_themselves_refused():
+    for d in ["Temp", "SoftwareDistribution\\Download", "Prefetch", "Minidump",
+              "LiveKernelReports", "Logs\\CBS",
+              "ServiceProfiles\\NetworkService\\AppData\\Local\\Microsoft\\Windows\\DeliveryOptimization\\Cache"]:
+        assert v("C:\\Windows\\" + d) is not None
+        assert v("C:\\Windows\\" + d + "\\x") is None
+    assert v("C:\\Windows\\MEMORY.DMP") is None
 
 
 def test_non_ascii_and_spaces_home():
