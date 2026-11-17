@@ -7,7 +7,9 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import QSettings, QTimer, Slot
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QMainWindow, QStackedWidget, QToolBar, QWidget
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QSizePolicy, QStackedWidget, QToolBar, QWidget,
+)
 
 from cleanix.config import Config
 from cleanix.gui import elevation, workers
@@ -233,7 +235,15 @@ class MainWindow(QMainWindow):
         self.power_action.blockSignals(True)
         self.power_action.setChecked(mode == POWER)
         self.power_action.blockSignals(False)
-        self.stack.setCurrentWidget(self.power_page if mode == POWER else self.simple_page)
+        current = self.power_page if mode == POWER else self.simple_page
+        hidden = self.simple_page if mode == POWER else self.power_page
+        # The hidden page must not constrain the window's minimum size.
+        for page, policy in ((hidden, QSizePolicy.Policy.Ignored),
+                             (current, QSizePolicy.Policy.Preferred)):
+            sp = page.sizePolicy()
+            sp.setHorizontalPolicy(policy)
+            page.setSizePolicy(sp)
+        self.stack.setCurrentWidget(current)
         if persist:
             _save_mode(mode)
 

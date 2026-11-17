@@ -284,6 +284,39 @@ def test_close_with_unstoppable_worker_hides_and_quits_when_done(qtbot, qapp):
         w._quit_timer = None  # let qtbot's teardown close the window normally
 
 
+# ---- minimum width (I-7) -----------------------------------------------------
+@pytest.mark.parametrize("mode", ["power", "simple"])
+def test_main_window_fits_a_1024_pixel_screen(qtbot, mode):
+    from cleanix.gui import main_window as mw
+
+    w = _window(qtbot)
+    w.set_mode(mode, persist=False)
+    w.layout().activate()
+    assert w.minimumSizeHint().width() <= 1024
+    assert w.minimumSize().width() <= 1024
+    # The hidden page never constrains the window.
+    hidden = w.simple_page if mode == mw.POWER else w.power_page
+    shown = w.power_page if mode == mw.POWER else w.simple_page
+    from PySide6.QtWidgets import QSizePolicy
+
+    assert hidden.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Ignored
+    assert shown.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Preferred
+
+
+def test_power_toolbar_has_two_rows(qtbot):
+    w = _window(qtbot)
+    pv = w.power_view
+    row1, row2 = pv.toolbar_rows
+    widgets1 = [row1.itemAt(i).widget() for i in range(row1.count())]
+    widgets2 = [row2.itemAt(i).widget() for i in range(row2.count())]
+    assert [x for x in widgets1 if x] == [pv.scan_button, pv.clean_button, pv.cancel_button,
+                                         pv.filter_edit]
+    assert [x for x in widgets2 if x] == [pv.select_visible_button, pv.select_none_button,
+                                         pv.dry_run_check, pv.quarantine_check,
+                                         pv.export_button]
+    assert pv.filter_edit.minimumWidth() == 160
+
+
 # ---- settings apply to the running session (I-3) --------------------------
 def test_saved_protected_glob_is_honoured_by_the_next_clean(qtbot, app_env, monkeypatch):
     """A protected_globs entry saved in the Settings tab protects files in

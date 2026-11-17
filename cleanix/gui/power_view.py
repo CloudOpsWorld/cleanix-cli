@@ -163,13 +163,20 @@ class PowerView(QWidget):
         for tb in self.filter_edit.findChildren(QToolButton):
             tb.setAccessibleName("Clear filter")
 
-        toolbar = QHBoxLayout()
-        for w in (self.scan_button, self.clean_button, self.cancel_button,
-                  self.select_visible_button, self.select_none_button,
-                  self.dry_run_check, self.quarantine_check, self.export_button):
-            toolbar.addWidget(w)
-        toolbar.addStretch(1)
-        toolbar.addWidget(self.filter_edit)
+        # Two rows keep the window narrow enough for small screens.
+        self.filter_edit.setMinimumWidth(160)
+        row1 = QHBoxLayout()
+        for w in (self.scan_button, self.clean_button, self.cancel_button):
+            row1.addWidget(w)
+        row1.addStretch(1)
+        row1.addWidget(self.filter_edit, 1)
+        row2 = QHBoxLayout()
+        for w in (self.select_visible_button, self.select_none_button,
+                  self.dry_run_check, self.quarantine_check):
+            row2.addWidget(w)
+        row2.addStretch(1)
+        row2.addWidget(self.export_button)
+        self.toolbar_rows = (row1, row2)
 
         self.cleaner_list = QListView()
         self.cleaner_list.setModel(self.cleaner_model)
@@ -219,7 +226,8 @@ class PowerView(QWidget):
         split.setStretchFactor(1, 3)
 
         lay = QVBoxLayout(self.scan_tab)
-        lay.addLayout(toolbar)
+        lay.addLayout(row1)
+        lay.addLayout(row2)
         lay.addWidget(split, 1)
         lay.addWidget(self.status_label)
 
