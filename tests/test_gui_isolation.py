@@ -47,6 +47,23 @@ def test_completion_scripts_offer_gui_command():
         assert "gui" in re.split(r'[\s"()]+', generate(shell)), shell
 
 
+def test_packaging_declares_gui_extras_and_entry_point():
+    import pathlib
+
+    import pytest
+
+    tomllib = pytest.importorskip("tomllib")
+    root = pathlib.Path(__file__).resolve().parent.parent
+    data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    project = data["project"]
+    assert all("PySide6" not in d for d in project["dependencies"])
+    extras = project["optional-dependencies"]
+    assert any(d.startswith("PySide6") for d in extras["gui"])
+    assert any(d.startswith("pytest-qt") for d in extras["gui-test"])
+    assert project["gui-scripts"]["cleanix-gui"] == "cleanix.gui.app:main"
+    assert project["scripts"]["cleanix"] == "cleanix.cli:main"
+
+
 def test_cmd_gui_without_qt_prints_hint(monkeypatch, capsys):
     from cleanix.gui import app
 

@@ -16,7 +16,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux, macOS and Windows are all supported platforms.
+        # Linux, macOS and Windows are all supported platforms. This job
+        # installs the base package only (no PySide6): the GUI tests skip
+        # here and run in the gui-test job below.
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
@@ -37,6 +39,39 @@ jobs:
 
       - name: Run tests
         run: pytest -v
+
+  gui-test:
+    name: GUI tests on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      # Headless Qt: no display server needed.
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Qt runtime libraries (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon0 libdbus-1-3 libxcb-cursor0 libgl1 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0
+
+      - name: Install dependencies (with the GUI extra)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[gui-test]" pytest
+
+      - name: Run GUI and elevation tests
+        run: pytest tests/gui tests/test_gui_isolation.py tests/test_elevate.py tests/test_elevate_launch.py tests/test_service.py tests/test_catalog.py -v
 
   lint:
     name: Lint (advisory)

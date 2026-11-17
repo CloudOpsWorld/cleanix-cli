@@ -60,6 +60,14 @@ def main() -> int:
         "after confirmation. Report\\-only findings are surfaced but never "
         "auto\\-deleted."
     )
+    out.append(
+        ".PP\nAn optional desktop interface is started with \\fBcleanix gui\\fR "
+        "(or \\fBcleanix\\-gui\\fR). It needs the \\fIgui\\fR extra "
+        "(\\fBpip install \"cleanix\\-cli[gui]\"\\fR); without it, \\fBcleanix gui\\fR "
+        "prints that hint and exits with status 1. Items that need administrator "
+        "rights are removed by a separate helper after one operating\\-system "
+        "prompt (UAC, pkexec or the macOS password dialog), permanently."
+    )
     out.append(".SH COMMANDS")
 
     subparsers_action = next(

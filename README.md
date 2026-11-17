@@ -169,7 +169,9 @@ directories and the generic `~/.cache` catch-all defers to them.
 
 ## Install & packaging
 
-- **PyPI:** `pip install cleanix-cli` (or `pipx install cleanix-cli`).
+- **PyPI:** `pip install cleanix-cli` (or `pipx install cleanix-cli`); add the
+  `gui` extra for the desktop GUI (see [Graphical interface](#graphical-interface)).
+  Standalone GUI installers are planned (Plan 2B).
 - **Standalone binaries** are attached to each [GitHub Release] alongside a
   `SHA256SUMS` file and keyless **build-provenance attestations** — verify a
   download with `gh attestation verify <file> --repo CloudOpsWorld/cleanix-cli`.
@@ -295,6 +297,94 @@ cd cleanix-cli && pip install -e .
 
 This installs the `cleanix` command. Standalone Linux/macOS binaries are also
 attached to each [GitHub Release](https://github.com/CloudOpsWorld/cleanix-cli/releases).
+
+## Graphical interface
+
+An optional desktop GUI (Qt / PySide6) runs the same engine as the CLI, in
+the same process: the same scan, the same safety guard, the same quarantine
+and history.
+
+```bash
+pip install "cleanix-cli[gui]"    # adds PySide6; the CLI never needs it
+cleanix gui                       # or: cleanix-gui
+```
+
+Without the extra, `cleanix gui` prints the install hint and the CLI keeps
+working. Standalone GUI installers (Windows installer, macOS `.dmg`, Linux
+AppImage) are coming in a later release (Plan 2B); for now install with pip.
+
+**Simple mode** (the default) is Scan, review, Clean, Undo. Results are
+grouped into category cards. Only files from reviewed-safe cleaners that your
+normal user can delete are pre-selected. Everything else sits unticked in the
+collapsed "Also found" section: Trash / Recycle Bin and system files can be
+ticked there; report-only findings, unreviewed cleaners and the other
+categories are shown for review only. Nothing that
+needs administrator permission, nothing irreversible and no personal data is
+ever pre-selected. Before cleaning, a confirmation shows the count and size and
+offers **"Keep a copy so I can undo"**, ticked by default: files are moved into
+quarantine instead of deleted (they use disk space until you empty it).
+
+**Power mode** (toolbar toggle; the choice is remembered) shows every cleaner
+and every item in a sortable, filterable table with a detail pane, JSON export,
+and tabs for Quarantine (restore, delete a run, empty all), History, Schedule,
+Settings (every config key, including `protected_globs`) and Findings
+(report-only items, with Reveal in the file manager; never deleted). **Dry run
+is ticked by default**; untick it to clean for real. "Keep a copy (undo)" is
+also ticked by default.
+
+**What Undo covers.** Undo (Simple mode, or Restore in the Quarantine tab) only
+brings back *files* that were cleaned as your normal user with a copy kept.
+These are always permanent and cannot be undone:
+
+- items that need administrator permission (the helper never quarantines);
+- command items, such as emptying the Recycle Bin / Trash or pruning
+  containers;
+- anything cleaned with "keep a copy" unticked.
+
+**Administrator permission.** The GUI never runs as root. When you clean items
+that need administrator rights, you are asked once per clean, through the
+operating system's own prompt, and a separate helper (`python -m
+cleanix.elevated`) removes them:
+
+- **Windows:** the UAC prompt.
+- **Linux:** `pkexec`, which needs polkit and a running polkit authentication
+  agent (normal in desktop sessions). Without `pkexec` such items are shown for
+  review only.
+- **macOS:** the standard administrator password prompt.
+
+The prompt itself does not list what will be removed; the GUI's confirmation is
+the place to check. The helper trusts only cleaner ids and item keys from the
+request, re-scans by itself and cleans only items it finds eligible. It runs
+only a narrow allowlist of system cleaners (plus `temp`), uses built-in default
+settings and ignores most of your config: only `protected_globs` is honoured,
+since it can only add protection. It never writes history or quarantine; the
+GUI records one history entry for its work.
+
+**Headless / SSH.** The GUI needs a desktop session; over SSH or on a server
+use the CLI. (The test suite runs the GUI headless with
+`QT_QPA_PLATFORM=offscreen`.) Scheduled runs set up from the Schedule tab are
+the same as `cleanix schedule`: they only scan and report, never delete.
+
+### Security notes for the administrator helper
+
+Known residuals, accepted for now (details in `cleanix/elevated.py`):
+
+- **POSIX check-then-delete is path-based.** Every directory above an item is
+  re-checked right before deletion, but a service account or group that owns a
+  trusted parent could swap a path component between the check and the delete.
+  Descriptor-anchored deletion is future work.
+- **Code-location trust.** The helper is started with `python -I`, which
+  ignores `PYTHONPATH`, the current directory and the user site directory.
+  Consequently a `pip install --user` install cannot run the helper (install
+  into a venv or system-wide). A user-writable interpreter or venv is still
+  user-writable code run as administrator; a root-owned install location is
+  planned with the installers (Plan 2B).
+- **POSIX ACLs are not inspected**; only owner, group and mode bits are.
+- **Windows: the result file is written by path**, as administrator, into the
+  requesting user's directory; a junction swap after validation could redirect
+  that write. Handle-based writing is future work.
+- **macOS:** the administrator path has been reasoned about from the code and
+  unit-tested with mocks, but not yet run on a real Mac.
 
 ## Usage
 
