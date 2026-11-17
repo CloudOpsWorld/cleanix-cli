@@ -97,9 +97,13 @@ class MainWindow(QMainWindow):
             except Exception:  # noqa: BLE001 - never block startup on a bad file
                 config = Config()
         self.config = config
+        reason = ""
         if allow is None:
             allow = elevation.elevation_available()
+            if not allow:
+                reason = elevation.elevation_unavailable_reason()
         self.elevation_allowed = bool(allow)
+        self.admin_unavailable_reason = reason
         self._scan_factory = scan_factory or workers.ScanWorker
         if clean_factory is None:
             clean_factory = elevation.make_clean_worker_factory(
@@ -109,11 +113,13 @@ class MainWindow(QMainWindow):
         self.simple_view = SimpleView(
             config, scan_worker_factory=self._make_simple_scan_worker,
             clean_worker_factory=clean_factory,
-            allow_admin_items=self.elevation_allowed)
+            allow_admin_items=self.elevation_allowed,
+            admin_unavailable_reason=reason)
         self.power_view = PowerView(
             config, scan_worker_factory=self._make_power_scan_worker,
             clean_worker_factory=clean_factory,
-            allow_admin_items=self.elevation_allowed)
+            allow_admin_items=self.elevation_allowed,
+            admin_unavailable_reason=reason)
 
         self.quarantine_panel = QuarantinePanel()
         self.history_panel = HistoryPanel()

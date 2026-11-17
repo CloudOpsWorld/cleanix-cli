@@ -17,7 +17,20 @@ def settings_isolation(tmp_path):
     yield
 
 
-FAKE_ADMIN_IDS = frozenset({"apt", "logs", "journal", "temp"})
+@pytest.fixture(autouse=True)
+def helper_probe_isolation(monkeypatch):
+    """Never start a real interpreter for the helper-start probe: it reports
+    success unless a test replaces ``_run_helper_probe``; the per-process
+    cache is reset around every test."""
+    from cleanix.gui import elevation
+
+    elevation.reset_helper_probe()
+    monkeypatch.setattr(elevation, "_run_helper_probe", lambda: True)
+    yield
+    elevation.reset_helper_probe()
+
+
+FAKE_ADMIN_IDS =frozenset({"apt", "logs", "journal", "temp"})
 
 
 @pytest.fixture

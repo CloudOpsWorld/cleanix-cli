@@ -88,6 +88,7 @@ class PowerView(QWidget):
                  scan_worker_factory: Optional[Callable[[List[str]], object]] = None,
                  clean_worker_factory: Optional[Callable[..., object]] = None,
                  allow_admin_items: bool = False,
+                 admin_unavailable_reason: str = "",
                  parent: Optional[QWidget] = None) -> None:
         """``scan_worker_factory(only_ids)`` and
         ``clean_worker_factory(items, dry_run=..., use_quarantine=...)`` return
@@ -95,6 +96,7 @@ class PowerView(QWidget):
         super().__init__(parent)
         self._config = config
         self._allow_admin = allow_admin_items
+        self._admin_reason = admin_unavailable_reason
         self._scan_factory = scan_worker_factory or self._default_scan_worker
         self._clean_factory = clean_worker_factory or self._default_clean_worker
         self._result: Optional[ScanResult] = None
@@ -238,7 +240,8 @@ class PowerView(QWidget):
         row = self.proxy.mapToSource(current).row()
         item = self.item_model.item_at(row)
         self._set_detail(self.detail_text(item, allow_admin=self._allow_admin,
-                                          problem=self.item_model.admin_problem(item)))
+                                          problem=self.item_model.admin_problem(item),
+                                          unavailable_reason=self._admin_reason))
 
     def _set_detail(self, text: str) -> None:
         self.detail_label.setPlainText(text)
@@ -246,7 +249,8 @@ class PowerView(QWidget):
 
     @staticmethod
     def detail_text(item: CleanableItem, allow_admin: bool = True,
-                    problem: Optional[str] = None) -> str:
+                    problem: Optional[str] = None,
+                    unavailable_reason: str = "") -> str:
         lines = [item.description]
         if item.kind is ItemKind.COMMAND:
             lines.append("Command: " + " ".join(item.command or []))
@@ -260,8 +264,9 @@ class PowerView(QWidget):
         if item.requires_root:
             lines.append("Requires administrator")
             if not allow_admin:
-                lines.append("Needs administrator permission; not available "
-                             "until elevation is supported.")
+                lines.append(unavailable_reason or (
+                    "Needs administrator permission; not available "
+                    "until elevation is supported."))
             elif problem:
                 lines.append(f"Not selectable: {problem}.")
         return "\n".join(lines)

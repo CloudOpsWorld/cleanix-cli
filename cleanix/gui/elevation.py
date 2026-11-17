@@ -110,19 +110,83 @@ LATE_CANCEL_LINE = ("Cancel arrived after administrator permission was given; "
 # --------------------------------------------------------------------------
 # availability
 # --------------------------------------------------------------------------
-def elevation_available() -> bool:
-    """Can this system show an elevation prompt? Never raises."""
+HELPER_UNAVAILABLE_REASON = (
+    "Administrator cleaning is not available: the helper cannot be started from "
+    "this installation (a `pip install --user` or source-tree run); install "
+    "cleanix into the system or a venv")
+PROBE_TIMEOUT = 10  # seconds
+
+# (ok, reason) of the helper start probe; None until it ran (once per process).
+_probe_state: Optional[Tuple[bool, str]] = None
+
+
+def reset_helper_probe() -> None:
+    """Forget the cached probe result (tests)."""
+    global _probe_state
+    _probe_state = None
+
+
+def _run_helper_probe() -> bool:
+    """Can ``python -I`` import the helper the way the launcher will start
+    it? Unprivileged, no shell, stdin closed, neutral cwd, short timeout.
+    (``-I`` ignores PYTHONPATH, the user site directory and the current
+    directory, so a ``pip install --user`` or source-tree run fails here
+    instead of after the user typed the administrator password.)"""
+    import sys
+    import tempfile
+
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        osname = current_os()
-        if osname == WINDOWS:
-            return True
-        if osname == LINUX:
-            return bool(utils.safe_which("pkexec"))
-        if osname == MACOS:
-            return os.path.exists(elevate_launch._OSASCRIPT)
+        proc = subprocess.run(
+            [sys.executable, "-I", "-c", "import cleanix.elevated"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=PROBE_TIMEOUT,
+            cwd=tempfile.gettempdir(), check=False, **kwargs)
+    except Exception:  # noqa: BLE001 - any failure means "cannot start"
+        return False
+    return proc.returncode == 0
+
+
+def _helper_starts() -> bool:
+    global _probe_state
+    if _probe_state is None:
+        try:
+            ok = bool(_run_helper_probe())
+        except Exception:  # noqa: BLE001
+            ok = False
+        _probe_state = (ok, "" if ok else HELPER_UNAVAILABLE_REASON)
+    return _probe_state[0]
+
+
+def elevation_unavailable_reason() -> str:
+    """Why administrator cleaning is unavailable because the helper cannot
+    start ("" if the probe has not run or succeeded)."""
+    return _probe_state[1] if _probe_state is not None else ""
+
+
+def _platform_can_prompt() -> bool:
+    osname = current_os()
+    if osname == WINDOWS:
+        return True
+    if osname == LINUX:
+        return bool(utils.safe_which("pkexec"))
+    if osname == MACOS:
+        return os.path.exists(elevate_launch._OSASCRIPT)
+    return False
+
+
+def elevation_available() -> bool:
+    """Can this system show an elevation prompt AND start the helper?
+    The helper probe runs once per process, only when the platform check
+    passes. Never raises."""
+    try:
+        if not _platform_can_prompt():
+            return False
+        return _helper_starts()
     except Exception:  # noqa: BLE001 - availability probe only
         return False
-    return False
 
 
 # --------------------------------------------------------------------------

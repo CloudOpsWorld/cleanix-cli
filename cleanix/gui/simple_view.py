@@ -127,6 +127,7 @@ class CategoryCard(QFrame):
                  mode: str = "select", checked: bool = False,
                  admin_blocked: bool = False,
                  problems: Optional[Dict[int, str]] = None,
+                 admin_blocked_reason: str = "",
                  parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.category = category
@@ -161,7 +162,7 @@ class CategoryCard(QFrame):
                 if id(i) in problems:
                     r = problems[id(i)]
                 elif i.requires_root and admin_blocked and not i.report_only:
-                    r = "Needs administrator permission"
+                    r = admin_blocked_reason or "Needs administrator permission"
                 else:
                     r = i.hint or "Shown for review; not cleaned from Simple mode."
                 if r not in reasons:
@@ -278,10 +279,14 @@ class SimpleView(QWidget):
                  clean_worker_factory: Optional[Callable] = None,
                  confirm: Optional[Callable[[ConfirmInfo], Tuple[bool, bool]]] = None,
                  allow_admin_items: bool = False,
+                 admin_unavailable_reason: str = "",
                  parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._config = config
         self._allow_admin = allow_admin_items
+        # Shown for administrator items when they cannot be offered (e.g.
+        # the helper cannot start from this installation).
+        self._admin_reason = admin_unavailable_reason
         self._kept_copy = True
         self._all_irreversible = False
         # Factories mirror the worker constructors: scan(config) and
@@ -540,7 +545,8 @@ class SimpleView(QWidget):
                 card = CategoryCard(category, label, items, mode=mode,
                                     checked=(mode == "select"),
                                     admin_blocked=not self._allow_admin,
-                                    problems=problems)
+                                    problems=problems,
+                                    admin_blocked_reason=self._admin_reason)
                 card.toggled.connect(self._refresh_clean_button)
                 self._cards.append(card)
                 (self._main_cards_layout if mode == "select" else self._also_layout
