@@ -126,6 +126,7 @@ class CategoryCard(QFrame):
     def __init__(self, category: str, label: str, items: List[CleanableItem], *,
                  mode: str = "select", checked: bool = False,
                  admin_blocked: bool = False,
+                 problems: Optional[Dict[int, str]] = None,
                  parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.category = category
@@ -155,8 +156,11 @@ class CategoryCard(QFrame):
         if mode == "readonly":
             # Each item contributes its own reason (distinct, in order).
             reasons: List[str] = []
+            problems = problems or {}
             for i in self.items:
-                if i.requires_root and admin_blocked and not i.report_only:
+                if id(i) in problems:
+                    r = problems[id(i)]
+                elif i.requires_root and admin_blocked and not i.report_only:
                     r = "Needs administrator permission"
                 else:
                     r = i.hint or "Shown for review; not cleaned from Simple mode."
@@ -505,12 +509,14 @@ class SimpleView(QWidget):
         infos: Dict[str, catalog.CleanerInfo] = {
             i.id: i for i in catalog.list_cleaners(self._config, include_unsupported=True)}
         groups: Dict[Tuple[str, str], List[CleanableItem]] = {}
+        # Administrator items the elevated helper would always refuse.
+        problems = elevation.admin_problems(result.all_items()) if self._allow_admin else {}
         for item in result.all_items():
             category = catalog.category_of(item.cleaner_id)
             info = infos.get(item.cleaner_id)
             if item.report_only or info is None:
                 mode = "readonly"
-            elif item.requires_root and not self._allow_admin:
+            elif item.requires_root and (not self._allow_admin or id(item) in problems):
                 mode = "readonly"
             elif category in _OPT_IN:
                 mode = "optin"
@@ -533,7 +539,8 @@ class SimpleView(QWidget):
                     label += " (review only)"
                 card = CategoryCard(category, label, items, mode=mode,
                                     checked=(mode == "select"),
-                                    admin_blocked=not self._allow_admin)
+                                    admin_blocked=not self._allow_admin,
+                                    problems=problems)
                 card.toggled.connect(self._refresh_clean_button)
                 self._cards.append(card)
                 (self._main_cards_layout if mode == "select" else self._also_layout

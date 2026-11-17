@@ -20,6 +20,9 @@ from cleanix.gui import workers  # noqa: E402
 
 MB = 1024 * 1024
 
+# Fake cleaner ids (apt/logs/temp) count as helper-allowlisted here.
+pytestmark = pytest.mark.usefixtures("fake_admin_allowlist")
+
 
 def _info(cid, name, *, root=False, default=True, category="temp"):
     return catalog.CleanerInfo(

@@ -34,7 +34,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, FrozenSet, List, Optional, Sequence, Tuple
 
 from cleanix.core import elevate, elevate_launch, service, utils
 from cleanix.core.models import CleanableItem, item_key
@@ -84,6 +84,10 @@ class CombinedSummary(service.CleanSummary):
     ``late_cancel`` is True when Cancel was requested after the administrator
     prompt/helper had been launched: that step cannot be stopped, so it ran
     to completion (``cancelled`` stays False because nothing stopped early).
+
+    Dry run: nothing is elevated (``admin`` None, ``admin_selected`` 0); the
+    administrator items are a preview, ``admin_preview_count`` items of
+    ``admin_preview_size`` bytes, already included in ``freed``/``removed``.
     """
 
     admin: Optional[ElevatedOutcome] = None
@@ -91,6 +95,8 @@ class CombinedSummary(service.CleanSummary):
     user_freed: int = 0
     user_removed: int = 0
     late_cancel: bool = False
+    admin_preview_count: int = 0
+    admin_preview_size: int = 0
 
 
 # Progress text the worker emits right before the (unstoppable) elevated
@@ -117,6 +123,47 @@ def elevation_available() -> bool:
     except Exception:  # noqa: BLE001 - availability probe only
         return False
     return False
+
+
+# --------------------------------------------------------------------------
+# which administrator items can be offered at all
+# --------------------------------------------------------------------------
+def admin_allowlist() -> FrozenSet[str]:
+    """The helper's cleaner allowlist (``elevated.admin_cleaner_ids``).
+    Compute once per scan result; never raises (empty on failure)."""
+    try:
+        from cleanix import elevated
+
+        return frozenset(elevated.admin_cleaner_ids())
+    except Exception:  # noqa: BLE001 - then no administrator item is offered
+        return frozenset()
+
+
+def admin_item_problem(item: CleanableItem, allowlist) -> Optional[str]:
+    """Why the helper would always refuse ``item`` (plain language), or None.
+    Only meaningful for ``requires_root`` items; never raises."""
+    try:
+        from cleanix import elevated
+
+        return elevated.static_admin_problem(item, allowlist)
+    except Exception:  # noqa: BLE001 - fail closed: do not offer it
+        return "Cannot be checked for administrator cleaning"
+
+
+def admin_problems(items: Sequence[CleanableItem]) -> dict:
+    """``{id(item): reason}`` for the ``requires_root`` items (not
+    report-only) that the helper would always refuse. The allowlist is
+    computed once, only when there is such an item."""
+    candidates = [i for i in items if i.requires_root and not i.report_only]
+    if not candidates:
+        return {}
+    allow = admin_allowlist()
+    out = {}
+    for item in candidates:
+        reason = admin_item_problem(item, allow)
+        if reason:
+            out[id(item)] = reason
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -300,9 +347,18 @@ def record_admin_history(outcome: Optional[ElevatedOutcome]) -> None:
 MAX_SHOWN_ERRORS = 5
 
 
+def admin_preview_line(count: int, size: int) -> str:
+    """Dry-run line for administrator items (nothing was elevated)."""
+    return (f"{count} administrator item(s) ({human_size(int(size or 0))}) would be "
+            "removed after one administrator prompt; they cannot be undone")
+
+
 def admin_outcome_lines(summary) -> List[str]:
     """Plain-language lines describing the administrator part of ``summary``
     (empty when there were no administrator items)."""
+    preview = int(getattr(summary, "admin_preview_count", 0) or 0)
+    if preview:
+        return [admin_preview_line(preview, getattr(summary, "admin_preview_size", 0))]
     selected = int(getattr(summary, "admin_selected", 0) or 0)
     outcome: Optional[ElevatedOutcome] = getattr(summary, "admin", None)
     if not selected:
@@ -334,10 +390,13 @@ def admin_outcome_lines(summary) -> List[str]:
         if outcome.detail:
             lines.append(f"Details: {outcome.detail}")
     if res is not None:
-        skipped = res.refused + res.unmatched
-        if skipped:
-            lines.append(f"{skipped} administrator items were not cleaned because the "
-                         "helper did not consider them eligible; scan again")
+        if res.refused:
+            lines.append(f"{res.refused} administrator item(s) were not cleaned because "
+                         "the administrator helper refused them (for safety it only "
+                         "cleans a fixed list of system locations)")
+        if res.unmatched:
+            lines.append(f"{res.unmatched} administrator item(s) were not cleaned because "
+                         "the administrator helper no longer found them; scan again")
         if res.deadline_hit:
             lines.append("The administrator helper reached its time limit; "
                          "some items were not cleaned.")

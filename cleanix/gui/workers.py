@@ -128,7 +128,9 @@ class ElevatedCleanWorker(_BaseWorker):
     cancel was requested, the administrator items go to the elevated helper
     (``elevation.run_elevated_part``, one prompt, permanent removal) and one
     history entry is recorded for what it removed. A dry run never elevates:
-    every item is dry-run in-process, exactly like ``CleanWorker``.
+    the user items are dry-run in-process and the administrator items are
+    only previewed (``admin_preview_count``/``admin_preview_size``; included
+    in ``freed``/``removed``), never reported as errors.
 
     Terminal signals: ``finished(CombinedSummary)`` (also when the
     administrator part is declined/unavailable/failed: the user part is never
@@ -154,12 +156,12 @@ class ElevatedCleanWorker(_BaseWorker):
         from cleanix.core.models import CleanResult
         from cleanix.gui import elevation
 
+        user_items, admin_items = elevation.split_items(self._items)
         if self._dry_run:
-            user_items, admin_items = self._items, []
-        else:
-            user_items, admin_items = elevation.split_items(self._items)
+            self._run_dry(user_items, admin_items)
+            return
         try:
-            if user_items or self._dry_run:
+            if user_items:
                 user = service.clean(
                     user_items, self._config, dry_run=self._dry_run,
                     use_quarantine=self._use_quarantine,
@@ -204,6 +206,43 @@ class ElevatedCleanWorker(_BaseWorker):
             user_freed=user.freed,
             user_removed=user.removed,
             late_cancel=late_cancel,
+        )
+        self._emit(self.finished, combined)
+
+    def _run_dry(self, user_items, admin_items) -> None:
+        """Dry run: the user items are dry-run in-process; the administrator
+        items are only previewed (no prompt, no helper, no errors: the
+        in-process engine cannot judge what the helper may remove)."""
+        from cleanix.gui import elevation
+
+        try:
+            # Called even with no user items so the result says dry_run.
+            user = service.clean(
+                user_items, self._config, dry_run=True,
+                use_quarantine=self._use_quarantine,
+                progress=self._on_progress, cancel=self._cancel.is_set,
+            )
+        except service.Cancelled:
+            self._emit(self.cancelled)
+            return
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+            self._emit(self.failed, str(exc) or exc.__class__.__name__)
+            return
+        preview_size = sum(int(i.size or 0) for i in admin_items)
+        combined = elevation.CombinedSummary(
+            result=user.result,
+            quarantine_run=user.quarantine_run,
+            manifest_path=user.manifest_path,
+            freed=user.freed + preview_size,
+            removed=user.removed + len(admin_items),
+            errors=list(user.errors),
+            cancelled=bool(getattr(user, "cancelled", False)),
+            admin=None,
+            admin_selected=0,
+            user_freed=user.freed,
+            user_removed=user.removed,
+            admin_preview_count=len(admin_items),
+            admin_preview_size=preview_size,
         )
         self._emit(self.finished, combined)
 

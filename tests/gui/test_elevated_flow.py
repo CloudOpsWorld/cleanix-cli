@@ -38,6 +38,9 @@ from cleanix.gui import power_view as pv  # noqa: E402
 from cleanix.gui.simple_view import ConfirmCleanDialog, ConfirmInfo, SimpleState, SimpleView  # noqa: E402
 
 POSIX = os.name != "nt"
+
+# Fake cleaner ids (apt/logs/temp) count as helper-allowlisted here.
+pytestmark = pytest.mark.usefixtures("fake_admin_allowlist")
 UID = os.getuid() if POSIX else 1000
 
 
@@ -242,11 +245,84 @@ def test_helper_never_launched_when_there_are_no_admin_items(monkeypatch, isolat
 def test_dry_run_never_elevates(monkeypatch, isolation):
     seen = []
     fake_clean(monkeypatch, seen=seen)
-    items = [it("u"), it("r", root=True)]
-    rec = run_sync(items, dry_run=True)
-    assert seen[0]["items"] == items and seen[0]["dry_run"] is True
+    u, r = it("u"), it("r", root=True, size=70)
+    rec = run_sync([u, r], dry_run=True)
+    # Only the user items are dry-run in-process; admin items are previewed.
+    assert seen[0]["items"] == [u] and seen[0]["dry_run"] is True
     assert isolation.made == []
-    assert rec.summary.admin is None and rec.summary.admin_selected == 0
+    s = rec.summary
+    assert s.admin is None and s.admin_selected == 0 and s.cancelled is False
+    assert s.admin_preview_count == 1 and s.admin_preview_size == 70
+
+
+def test_dry_run_of_a_mix_reports_no_errors_for_admin_items(monkeypatch, isolation, tmp_path):
+    """Real service.clean (dry run): administrator items are never sent
+    through the in-process engine, so no "requires root" errors; they are a
+    preview included in "Would free"; the launcher is never called."""
+    calls = []
+    monkeypatch.setattr(elevate_launch, "launch_elevated",
+                        lambda *a, **k: calls.append(a) or 0)
+    f = tmp_path / "user-file.tmp"
+    f.write_bytes(b"x" * 40)
+    user_item = CleanableItem("temp", "user file", size=40, path=str(f))
+    admins = [CleanableItem("logs", "sys log a", size=1000, path="/var/log/a",
+                            requires_root=True),
+              CleanableItem("logs", "sys cmd", size=500, kind=ItemKind.COMMAND,
+                            command=["tool", "x"], requires_root=True)]
+    s = run_sync([user_item] + admins, dry_run=True).summary
+    assert calls == [] and isolation.made == [] and isolation.history == []
+    assert s.errors == [] and s.admin is None and s.admin_selected == 0
+    assert s.result.dry_run is True
+    assert s.admin_preview_count == 2 and s.admin_preview_size == 1500
+    assert s.user_freed == 40 and s.freed == 40 + 1500
+    assert s.removed == s.user_removed + 2
+    assert f.exists()  # dry run
+    lines = elevation.admin_outcome_lines(s)
+    assert lines == ["2 administrator item(s) (1.5 KiB) would be removed after one "
+                     "administrator prompt; they cannot be undone"]
+
+
+def test_dry_run_with_only_admin_items_is_still_a_dry_run(monkeypatch, isolation):
+    s = run_sync([it("r", root=True, size=9)], dry_run=True).summary
+    assert s.result.dry_run is True and s.errors == [] and s.cancelled is False
+    assert s.freed == 9 and s.admin_preview_count == 1
+
+
+def test_power_view_dry_run_shows_admin_preview_line(qtbot, monkeypatch, isolation):
+    monkeypatch.setattr(workers, "start_worker", lambda w: w.run())
+    shown = []
+    monkeypatch.setattr(pv.PowerView, "show_results", lambda self, s, text: shown.append(text))
+    monkeypatch.setattr(elevation, "admin_allowlist", lambda: frozenset({"logs", "temp"}))
+    factory = elevation.make_clean_worker_factory(Config(), elevation=True)
+    v = pv.PowerView(Config(), clean_worker_factory=factory, allow_admin_items=True)
+    qtbot.addWidget(v)
+    items = [it("u", size=10), it("r", root=True, size=2048)]
+    v._on_scan_finished(ScanResult(reports=[
+        CleanerReport("temp", "Temp", "t", items=[items[0]]),
+        CleanerReport("logs", "Logs", "l", items=[items[1]])]))
+    m = v.item_model
+    for r in range(m.rowCount()):
+        assert m.set_checked(r, True)
+    assert v.dry_run_check.isChecked()
+    v.start_clean()
+    status = v.status_label.text()
+    assert status.startswith("Would free")
+    assert "1 administrator item(s) (2.0 KiB) would be removed after one administrator " \
+           "prompt" in status
+    assert "errors" not in status
+    assert "would be removed after one administrator prompt" in shown[0]
+
+
+def test_simple_view_shows_admin_preview_line(qtbot):
+    v = SimpleView(Config(), allow_admin_items=True)
+    qtbot.addWidget(v)
+    v._set_state(SimpleState.CLEANING)
+    s = elevation.CombinedSummary(result=CleanResult(dry_run=True), freed=30, removed=2,
+                                  admin_preview_count=1, admin_preview_size=20)
+    v._on_clean_finished(s)
+    assert "1 administrator item(s) (20 B) would be removed after one administrator " \
+           "prompt; they cannot be undone" in v.admin_label.text()
+    assert not v.admin_label.isHidden()
 
 
 # --------------------------------------------------------------------------
@@ -501,8 +577,11 @@ def test_combined_summary_fields(monkeypatch, isolation):
     lines = elevation.admin_outcome_lines(s)
     assert lines[0] == f"Administrator items: removed 2, freed {utils.human_size(30)}"
     text = "\n".join(lines)
-    assert ("2 administrator items were not cleaned because the helper did not "
-            "consider them eligible; scan again") in text
+    assert ("1 administrator item(s) were not cleaned because the administrator helper "
+            "refused them (for safety it only cleans a fixed list of system "
+            "locations)") in text
+    assert ("1 administrator item(s) were not cleaned because the administrator helper "
+            "no longer found them; scan again") in text
     assert "x: denied" in text and "cannot be undone" in text
     assert "Scan again to refresh the list." in text
 
@@ -943,8 +1022,11 @@ def test_end_to_end_with_real_helper(monkeypatch, isolation, helper_env):
     assert s.admin_selected == 4
     lines = elevation.admin_outcome_lines(s)
     assert lines[0] == f"Administrator items: removed 1, freed {utils.human_size(10)}"
-    assert ("3 administrator items were not cleaned because the helper did not "
-            "consider them eligible; scan again") in lines
+    assert ("2 administrator item(s) were not cleaned because the administrator helper "
+            "refused them (for safety it only cleans a fixed list of system "
+            "locations)") in lines
+    assert ("1 administrator item(s) were not cleaned because the administrator helper "
+            "no longer found them; scan again") in lines
     # history: the user part (service.clean) and one in-process admin entry
     assert (10, 1, "delete") in isolation.history
     assert isolation.history[-1] == (10, 1, "delete")

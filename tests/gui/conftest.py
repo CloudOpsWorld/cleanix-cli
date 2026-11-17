@@ -17,6 +17,20 @@ def settings_isolation(tmp_path):
     yield
 
 
+FAKE_ADMIN_IDS = frozenset({"apt", "logs", "journal", "temp"})
+
+
+@pytest.fixture
+def fake_admin_allowlist(monkeypatch):
+    """Treat the fake cleaner ids used by view tests as helper-allowlisted, so
+    their ``requires_root`` items stay offerable on every OS (the real
+    allowlist differs per platform; see test_admin_eligibility.py)."""
+    from cleanix.gui import elevation
+
+    monkeypatch.setattr(elevation, "admin_allowlist", lambda: FAKE_ADMIN_IDS)
+    return FAKE_ADMIN_IDS
+
+
 class _FakeScheduleBackend:
     FREQUENCIES = {"daily": "d", "weekly": "w", "monthly": "m"}
 

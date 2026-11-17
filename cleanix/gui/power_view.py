@@ -236,15 +236,17 @@ class PowerView(QWidget):
             self._set_detail("Select an item to see details.")
             return
         row = self.proxy.mapToSource(current).row()
-        self._set_detail(self.detail_text(self.item_model.item_at(row),
-                                          allow_admin=self._allow_admin))
+        item = self.item_model.item_at(row)
+        self._set_detail(self.detail_text(item, allow_admin=self._allow_admin,
+                                          problem=self.item_model.admin_problem(item)))
 
     def _set_detail(self, text: str) -> None:
         self.detail_label.setPlainText(text)
         self.detail_label.setToolTip(text)  # full text
 
     @staticmethod
-    def detail_text(item: CleanableItem, allow_admin: bool = True) -> str:
+    def detail_text(item: CleanableItem, allow_admin: bool = True,
+                    problem: Optional[str] = None) -> str:
         lines = [item.description]
         if item.kind is ItemKind.COMMAND:
             lines.append("Command: " + " ".join(item.command or []))
@@ -260,6 +262,8 @@ class PowerView(QWidget):
             if not allow_admin:
                 lines.append("Needs administrator permission; not available "
                              "until elevation is supported.")
+            elif problem:
+                lines.append(f"Not selectable: {problem}.")
         return "\n".join(lines)
 
     # ----- busy state -----

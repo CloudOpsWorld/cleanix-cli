@@ -440,6 +440,57 @@ def _is_under(path: str, root: str) -> bool:
     return bool(r) and (p == r or p.startswith(r + "\\"))
 
 
+def _static_win_dirs():
+    """(ProgramData, SystemRoot) for ``static_admin_problem``: the Windows
+    API values the helper itself uses, the environment only as a fallback.
+    Never raises; an empty string means unknown."""
+    try:
+        windir, _sysdir, programdata, _pf, _pf86 = _win_known_dirs()
+        return programdata, windir
+    except Exception:  # noqa: BLE001 - fall back to the (unsanitised) env
+        return os.environ.get("ProgramData", ""), os.environ.get("SystemRoot", "")
+
+
+def static_admin_problem(item, cleaner_id_allowlist=None) -> Optional[str]:
+    """Why the helper can NEVER clean ``item``, in plain language, or None.
+
+    Pure and side-effect free (for the GUI, which offers only items this
+    accepts): it mirrors the helper's fixed rules -- report-only and
+    non-``requires_root`` items, cleaners not on ``admin_cleaner_ids()``
+    (pass ``cleaner_id_allowlist`` to compute that once) and, on Windows,
+    anything under ProgramData or a non-file under ``Windows\\Temp``. The only
+    filesystem access is one ``lstat`` of an existing item under
+    ``Windows\\Temp``. Rules that depend on the moment of deletion (parent
+    links/junctions, ownership) are still enforced by the helper alone.
+    """
+    if item.report_only:
+        return "Review only: Cleanix never deletes this item"
+    if not item.requires_root:
+        return "Does not need administrator permission"
+    allowed = admin_cleaner_ids() if cleaner_id_allowlist is None else cleaner_id_allowlist
+    if item.cleaner_id not in allowed:
+        return ("Cannot be cleaned with administrator permission from the GUI: "
+                "the administrator helper only cleans a fixed list of system locations")
+    if _is_posix() or item.kind is not ItemKind.PATH or not item.path:
+        return None
+    programdata, system_root = _static_win_dirs()
+    if programdata and _is_under(item.path, programdata):
+        return ("Cannot be cleaned with administrator permission: items under "
+                "ProgramData are never cleaned with administrator rights")
+    if system_root and _is_under(item.path, ntpath.join(system_root, "Temp")):
+        try:
+            st = _lstat(item.path)
+        except OSError:
+            return None  # gone or not inspectable here: the helper decides
+        import stat as _stat
+
+        if (_stat.S_ISDIR(st.st_mode) or not _stat.S_ISREG(st.st_mode)
+                or getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT):
+            return ("Cannot be cleaned with administrator permission: folders in "
+                    "Windows\\Temp are never cleaned with administrator rights")
+    return None
+
+
 def _path_chain_problem(path: str, expected_uid: Optional[int],
                         group_ids: Optional[FrozenSet[int]]) -> Optional[str]:
     """Check every directory from the filesystem root down to the item's

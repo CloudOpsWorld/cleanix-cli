@@ -10,6 +10,7 @@ from cleanix.config import Config
 from cleanix.core import catalog
 from cleanix.core.models import CleanableItem, ItemKind, ScanResult, item_key
 from cleanix.core.utils import human_size
+from cleanix.gui import elevation
 
 # Custom roles for CleanerListModel.
 IdRole = Qt.ItemDataRole.UserRole + 1
@@ -106,6 +107,8 @@ class ItemTableModel(QAbstractTableModel):
         self._items: List[CleanableItem] = []
         self._names: Dict[str, str] = {}
         self._checked: List[bool] = []
+        # id(item) -> why the elevated helper would always refuse it.
+        self._problems: Dict[int, str] = {}
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self._items)
@@ -129,6 +132,7 @@ class ItemTableModel(QAbstractTableModel):
             for rep in result.reports:
                 self._names[rep.cleaner_id] = rep.name
                 self._items.extend(rep.items)
+        self._problems = elevation.admin_problems(self._items) if self._allow_admin else {}
         # Checked only when the caller's preselect rule says so (never for
         # report-only rows); with no rule everything starts unchecked.
         self._checked = [
@@ -143,6 +147,7 @@ class ItemTableModel(QAbstractTableModel):
     def set_allow_admin_items(self, allow: bool) -> None:
         self.beginResetModel()
         self._allow_admin = bool(allow)
+        self._problems = elevation.admin_problems(self._items) if self._allow_admin else {}
         self._checked = [c and self._checkable(i)
                          for c, i in zip(self._checked, self._items)]
         self.endResetModel()
@@ -150,7 +155,13 @@ class ItemTableModel(QAbstractTableModel):
     def _checkable(self, item: CleanableItem) -> bool:
         if item.report_only:
             return False
-        return self._allow_admin or not item.requires_root
+        if not item.requires_root:
+            return True
+        return self._allow_admin and id(item) not in self._problems
+
+    def admin_problem(self, item: CleanableItem) -> Optional[str]:
+        """Why this administrator item can never be cleaned from the GUI."""
+        return self._problems.get(id(item))
 
     def is_checked(self, row: int) -> bool:
         return self._checked[row] and self._checkable(self._items[row])
@@ -217,10 +228,13 @@ class ItemTableModel(QAbstractTableModel):
                 return int(self._checked[index.row()])
             return self._text(item, col).lower()
         if role == Qt.ItemDataRole.ToolTipRole:
+            problem = self._problems.get(id(item))
             if col == 0:
-                return None
+                return problem
             if col == 4:
-                return ADMIN_TOOLTIP if item.requires_root else None
+                if not item.requires_root:
+                    return None
+                return f"{ADMIN_TOOLTIP}. {problem}" if problem else ADMIN_TOOLTIP
             if col == 2:
                 return f"{item.description}\n{_target_text(item)}"
             return self._text(item, col) if col != 3 else human_size(item.size)
