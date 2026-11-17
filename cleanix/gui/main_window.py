@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Callable, Optional
 
 from PySide6.QtCore import QSettings, QTimer, Slot
@@ -139,6 +140,7 @@ class MainWindow(QMainWindow):
         self.power_view.clean_finished.connect(self._on_clean_finished)
         self.simple_view.clean_finished.connect(self._on_clean_finished)
         self.simple_view.undone.connect(self.refresh_data_panels)
+        self.settings_panel.saved.connect(self._on_settings_saved)
 
         self.set_simple_page(self.simple_view)
         self.set_power_page(self.power_view)
@@ -153,6 +155,27 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_clean_finished(self, _summary) -> None:
         self.refresh_data_panels()
+
+    APPLIED_TEXT = "Settings saved and applied to the next scan."
+
+    @Slot()
+    def _on_settings_saved(self) -> None:
+        """Reload the config file into the SHARED Config object, in place, so
+        both views (which hold the same object) use it from the next scan
+        or clean. Never raises."""
+        try:
+            fresh = Config.load()
+            for f in dataclasses.fields(Config):
+                setattr(self.config, f.name, getattr(fresh, f.name))
+        except Exception as exc:  # noqa: BLE001 - never raise into Qt
+            self.settings_panel.append_message(
+                f"Saved, but the settings could not be applied to this session: {exc}")
+            return
+        self.settings_panel.append_message(self.APPLIED_TEXT)
+        try:
+            self.power_view.status_label.setText(self.APPLIED_TEXT)
+        except RuntimeError:
+            pass
 
     @Slot()
     def refresh_data_panels(self) -> None:

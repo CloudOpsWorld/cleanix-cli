@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -182,6 +182,10 @@ _INT_MAX = 2**31 - 1
 
 
 class SettingsPanel(QWidget):
+    # Emitted after a successful save (with changes) or reset: the config
+    # file changed and the running session should reload it.
+    saved = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.editors: Dict[str, QWidget] = {}
@@ -322,6 +326,13 @@ class SettingsPanel(QWidget):
             self.message_label,
             f"Saved: {', '.join(saved)}" if saved else "No changes to save.",
         )
+        if saved:
+            self.saved.emit()
+
+    def append_message(self, text: str) -> None:
+        """Add a sentence to the current message (e.g. "applied")."""
+        current = self.message_label.text()
+        _set_message(self.message_label, f"{current} {text}".strip())
 
     def _reset(self, key: str) -> None:
         try:
@@ -336,6 +347,8 @@ class SettingsPanel(QWidget):
             self.message_label,
             f"{key} reset to default." if removed else f"{key} had no override.",
         )
+        if removed:
+            self.saved.emit()
 
 
 # ---------------------------------------------------------------- findings

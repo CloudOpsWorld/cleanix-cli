@@ -282,3 +282,72 @@ def test_close_with_unstoppable_worker_hides_and_quits_when_done(qtbot, qapp):
         QApplication.setQuitOnLastWindowClosed(True)
         qtbot.waitUntil(lambda: workers.active_count() == 0, timeout=5000)
         w._quit_timer = None  # let qtbot's teardown close the window normally
+
+
+# ---- settings apply to the running session (I-3) --------------------------
+def test_saved_protected_glob_is_honoured_by_the_next_clean(qtbot, app_env, monkeypatch):
+    """A protected_globs entry saved in the Settings tab protects files in
+    the SAME session: the shared Config is updated in place and service.clean
+    applies it on the next call (no quarantine, so only the guard decides)."""
+    import os
+
+    from cleanix.core import safety, service
+    from cleanix.core.models import CleanableItem
+
+    monkeypatch.setattr(safety, "_EXTRA_GLOBS", [])  # restored after the test
+
+    keep = app_env / "keep"
+    keep.mkdir()
+    victim = keep / "precious.tmp"
+    victim.write_bytes(b"x" * 10)
+    w = _window(qtbot)  # config from Config.load() (tmp path, no file yet)
+    cfg = w.config
+    assert cfg.protected_globs == []
+    panel = w.settings_panel
+    panel.editors["protected_globs"].setPlainText(os.path.join(str(keep), "*"))
+    panel.save_button.click()
+    assert w.config is cfg  # same object, updated in place
+    assert w.simple_view._config is cfg and w.power_view._config is cfg
+    assert cfg.protected_globs == [os.path.join(str(keep), "*")]
+    assert "Settings saved and applied to the next scan" in panel.message_label.text()
+    assert panel.message_label.text().startswith("Saved: protected_globs")
+    # Control: an identical file outside the protected folder IS removed.
+    other = app_env / "other"
+    other.mkdir()
+    control = other / "plain.tmp"
+    control.write_bytes(b"x" * 10)
+    items = [CleanableItem("temp", "precious", size=10, path=str(victim)),
+             CleanableItem("temp", "plain", size=10, path=str(control))]
+    summary = service.clean(items, w.config, dry_run=False, use_quarantine=False)
+    assert victim.exists() and not control.exists()
+    assert summary.removed == 1 and len(summary.errors) == 1
+    assert summary.errors[0].item.path == str(victim)
+    assert "safety guard" in summary.errors[0].error
+
+
+def test_every_config_field_is_reloaded_in_place(qtbot, app_env):
+    w = _window(qtbot)
+    cfg = w.config
+    panel = w.settings_panel
+    panel.editors["temp_min_age_days"].setValue(42.0)
+    panel.editors["browsers"].setPlainText("firefox")
+    panel.save_button.click()
+    assert cfg.temp_min_age_days == 42.0 and cfg.browsers == ["firefox"]
+    # Reset also applies (the default comes back into the same object).
+    panel.reset_buttons["temp_min_age_days"].click()
+    assert cfg.temp_min_age_days == Config().temp_min_age_days
+    assert "applied to the next scan" in panel.message_label.text()
+
+
+def test_settings_apply_failure_is_shown_not_raised(qtbot, app_env, monkeypatch):
+    w = _window(qtbot)
+    before = w.config.temp_min_age_days
+    w.settings_panel.editors["temp_min_age_days"].setValue(9.0)
+
+    def boom(*a, **k):
+        raise ValueError("unreadable")
+
+    monkeypatch.setattr(Config, "load", staticmethod(boom))
+    w.settings_panel.save_button.click()
+    assert "could not be applied" in w.settings_panel.message_label.text()
+    assert w.config.temp_min_age_days == before
