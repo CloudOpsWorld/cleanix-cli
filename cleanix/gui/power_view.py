@@ -32,7 +32,7 @@ from cleanix.config import Config
 from cleanix.core import catalog, report
 from cleanix.core.models import CleanableItem, ItemKind, ScanResult, item_key
 from cleanix.core.utils import human_size
-from cleanix.gui import workers
+from cleanix.gui import elevation, workers
 from cleanix.gui.models import (
     BadgeRole,
     CleanerListModel,
@@ -355,13 +355,20 @@ class PowerView(QWidget):
     def confirm_text(items: List[CleanableItem], hidden: int, keep_copy: bool) -> str:
         size = human_size(sum(i.size for i in items))
         lines = [f"{len(items)} selected item(s), {size}."]
-        commands = sum(1 for i in items if i.kind is ItemKind.COMMAND)
+        admin = sum(1 for i in items if i.requires_root)
+        commands = sum(1 for i in items
+                       if i.kind is ItemKind.COMMAND and not i.requires_root)
         if keep_copy:
-            lines.append("A copy of each removed file is kept so you can restore it.")
+            if admin < len(items):
+                lines.append("A copy of each removed file is kept so you can restore it"
+                             + (" (except administrator items)." if admin else "."))
             if commands:
                 lines.append(f"{commands} command item(s) cannot be kept or undone.")
         else:
             lines.append("These items will be permanently removed. This cannot be undone.")
+        if admin:
+            lines.append(f"{admin} item(s) need administrator permission: you will be "
+                         "asked once, and they are removed permanently (cannot be undone).")
         if hidden:
             lines.append(f"{hidden} more checked item(s) are hidden by the filter "
                          "and will NOT be cleaned.")
@@ -407,14 +414,18 @@ class PowerView(QWidget):
             text = "Cancelled. " + text
         if summary.errors:
             text += f", {len(summary.errors)} errors"
-        self.status_label.setText(text)
+        admin_lines = elevation.admin_outcome_lines(summary)
+        # Administrator rows stay in the table: the helper only returns
+        # counts, so they cannot be matched to outcomes; the text says to
+        # scan again.
+        self.status_label.setText(f"{text}. {admin_lines[0]}" if admin_lines else text)
         if not dry:
             # Done rows leave the table; a rescan is needed for fresh state.
             done = {item_key(o.item) for o in summary.result.outcomes if o.removed}
             self.item_model.remove_keys(done)
             self._removed_keys |= done
             self._on_current_changed(self.table.currentIndex())
-        self.show_results(summary, text)
+        self.show_results(summary, "\n".join([text] + admin_lines))
         self.clean_finished.emit(summary)
 
     def show_results(self, summary, text: str) -> None:

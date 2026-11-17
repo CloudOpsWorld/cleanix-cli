@@ -37,7 +37,7 @@ from cleanix.config import Config
 from cleanix.core import catalog, quarantine
 from cleanix.core.models import CleanableItem, ItemKind, ScanResult
 from cleanix.core.utils import human_size
-from cleanix.gui import workers
+from cleanix.gui import elevation, workers
 
 # Category cards that are opt-in (shown under "Also found", unchecked).
 _OPT_IN = ("trash", "system")
@@ -60,6 +60,15 @@ class ConfirmInfo:
     # Recycle Bin or pruning containers): never quarantined, never undoable.
     irreversible: int = 0
     trash_items: int = 0
+    # Selected items that need administrator permission (requires_root): the
+    # elevated helper removes them permanently, never into quarantine. Not
+    # counted in ``irreversible``.
+    admin_items: int = 0
+
+
+def admin_confirm_text(n: int) -> str:
+    return (f"{n} item(s) need administrator permission: you will be asked once, "
+            "and they are removed permanently (cannot be undone).")
 
 
 class ElidedLabel(QLabel):
@@ -177,6 +186,7 @@ class ConfirmCleanDialog(QDialog):
         self._size = info.size
         self._irreversible = info.irreversible
         self._trash_items = info.trash_items
+        self._admin = info.admin_items
         self.summary_label = QLabel(
             f"Clean {info.count} item{'s' if info.count != 1 else ''} "
             f"({human_size(info.size)})?")
@@ -186,7 +196,7 @@ class ConfirmCleanDialog(QDialog):
             "Keep a copy so I can undo (uses disk space until emptied)")
         self.keep_copy_checkbox.setChecked(info.keep_copy)
         self.keep_copy_checkbox.toggled.connect(self._update_warning)
-        if info.irreversible >= info.count:
+        if info.irreversible + info.admin_items >= info.count:
             # Nothing selected can be kept: a copy is meaningless.
             self.keep_copy_checkbox.setChecked(False)
             self.keep_copy_checkbox.setEnabled(False)
@@ -210,11 +220,15 @@ class ConfirmCleanDialog(QDialog):
     @Slot()
     def _update_warning(self, *_args) -> None:
         n = self._irreversible
+        a = self._admin
         parts = []
         if n:
             parts.append(
                 f"{n} selected item{'s' if n != 1 else ''} cannot be undone "
                 "(for example emptying the Recycle Bin or pruning containers).")
+        if a:
+            parts.append(admin_confirm_text(a))
+        n += a
         if n >= self._count:
             pass
         elif self.keep_copy_checkbox.isChecked():
@@ -369,13 +383,17 @@ class SimpleView(QWidget):
         self.done_label = QLabel("")
         self.done_label.setWordWrap(True)
         self.errors_label = QLabel("")
+        # Outcome of the administrator part (empty when there was none).
+        self.admin_label = QLabel("")
+        self.admin_label.setWordWrap(True)
+        self.admin_label.setTextFormat(Qt.TextFormat.PlainText)
         self.undo_label = QLabel("")
         self.undo_label.setWordWrap(True)
         self.undo_button = _button("Undo", "Undo this clean")
         self.undo_button.clicked.connect(self.undo)
         self.again_button = _button("Scan again")
         self.again_button.clicked.connect(self.start_scan)
-        for w in (self.done_label, self.errors_label, self.undo_label):
+        for w in (self.done_label, self.errors_label, self.admin_label, self.undo_label):
             lay.addWidget(w)
         row = QHBoxLayout()
         row.addWidget(self.undo_button)
@@ -554,10 +572,13 @@ class SimpleView(QWidget):
         items = self.selected_items()
         if not items or self._state is not SimpleState.RESULTS:
             return
-        irreversible = sum(1 for i in items if i.kind is not ItemKind.PATH)
+        admin = sum(1 for i in items if i.requires_root)
+        irreversible = sum(1 for i in items
+                           if i.kind is not ItemKind.PATH and not i.requires_root)
         accepted, keep_copy = self._confirm(ConfirmInfo(
             len(items), sum(i.size for i in items), True, irreversible,
-            sum(1 for i in items if catalog.category_of(i.cleaner_id) == "trash")))
+            sum(1 for i in items if catalog.category_of(i.cleaner_id) == "trash"),
+            admin_items=admin))
         if not accepted:
             return
         self.request_clean.emit(items)
@@ -566,7 +587,8 @@ class SimpleView(QWidget):
     def _start_clean(self, items: List[CleanableItem], keep_copy: bool) -> None:
         self._cancel_requested = False
         self._kept_copy = keep_copy
-        self._all_irreversible = all(i.kind is not ItemKind.PATH for i in items)
+        self._all_irreversible = all(i.kind is not ItemKind.PATH or i.requires_root
+                                     for i in items)
         self.clean_progress.setRange(0, 0)
         self.clean_status.setText("Cleaning...")
         worker = self._clean_factory(
@@ -600,8 +622,13 @@ class SimpleView(QWidget):
             if stopped else f"Freed {freed} ({summary.removed} items removed).")
         n_err = len(summary.errors)
         self.errors_label.setText(f"{n_err} error{'s' if n_err != 1 else ''}")
+        admin_lines = elevation.admin_outcome_lines(summary)
+        self.admin_label.setText("\n".join(admin_lines))
+        self.admin_label.setVisible(bool(admin_lines))
         if summary.quarantine_run:
-            self.undo_label.setText("")
+            self.undo_label.setText(
+                "Undo restores only the files kept in quarantine; administrator "
+                "items cannot be undone." if admin_lines else "")
         elif self._all_irreversible:
             self.undo_label.setText(
                 "Nothing was kept: the selected items cannot be undone.")

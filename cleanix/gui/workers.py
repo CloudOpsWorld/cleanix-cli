@@ -121,6 +121,86 @@ class CleanWorker(_BaseWorker):
         self._emit(self.finished, summary)
 
 
+class ElevatedCleanWorker(_BaseWorker):
+    """Clean with a single administrator prompt for ``requires_root`` items.
+
+    Real clean: the user items are cleaned in-process first (``service.clean``,
+    with the user's quarantine choice and normal history); then, unless a
+    cancel was requested, the administrator items go to the elevated helper
+    (``elevation.run_elevated_part``, one prompt, permanent removal) and one
+    history entry is recorded for what it removed. A dry run never elevates:
+    every item is dry-run in-process, exactly like ``CleanWorker``.
+
+    Terminal signals: ``finished(CombinedSummary)`` (also when the
+    administrator part is declined/unavailable/failed: the user part is never
+    lost), ``cancelled`` / ``failed`` only if the user part itself did so.
+    The prompt and the helper cannot be interrupted once launched;
+    ``cancel_all_and_wait`` may time out while they run.
+    """
+
+    def __init__(self, items: Sequence[CleanableItem], config: Config, *,
+                 dry_run: bool, use_quarantine: bool, launcher=None) -> None:
+        super().__init__()
+        self._items = list(items)
+        self._config = config
+        self._dry_run = dry_run
+        self._use_quarantine = use_quarantine
+        self._launcher = launcher
+
+    @Slot()
+    def run(self) -> None:
+        self._guarded()
+
+    def _run(self) -> None:
+        from cleanix.core.models import CleanResult
+        from cleanix.gui import elevation
+
+        if self._dry_run:
+            user_items, admin_items = self._items, []
+        else:
+            user_items, admin_items = elevation.split_items(self._items)
+        try:
+            if user_items or self._dry_run:
+                user = service.clean(
+                    user_items, self._config, dry_run=self._dry_run,
+                    use_quarantine=self._use_quarantine,
+                    progress=self._on_progress, cancel=self._cancel.is_set,
+                )
+            else:
+                user = service.CleanSummary(result=CleanResult(dry_run=False),
+                                            cancelled=self._cancel.is_set())
+        except service.Cancelled:
+            self._emit(self.cancelled)
+            return
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+            self._emit(self.failed, str(exc) or exc.__class__.__name__)
+            return
+
+        admin = None
+        stopped = bool(getattr(user, "cancelled", False)) or self._cancel.is_set()
+        if admin_items and not stopped:
+            self.progress.emit("Waiting for administrator permission...", 0, 0)
+            admin = elevation.run_elevated_part(
+                admin_items, self._config, use_quarantine=False, launcher=self._launcher)
+            elevation.record_admin_history(admin)
+        res = admin.result if admin is not None else None
+        combined = elevation.CombinedSummary(
+            result=user.result,
+            quarantine_run=user.quarantine_run,
+            manifest_path=user.manifest_path,
+            freed=user.freed + (res.freed if res else 0),
+            removed=user.removed + (res.removed if res else 0),
+            errors=list(user.errors),
+            cancelled=bool(getattr(user, "cancelled", False))
+            or bool(admin_items and admin is None),
+            admin=admin,
+            admin_selected=len(admin_items),
+            user_freed=user.freed,
+            user_removed=user.removed,
+        )
+        self._emit(self.finished, combined)
+
+
 def start_worker(worker: QObject) -> QThread:
     """Move ``worker`` to a new thread, start it, and clean up afterwards.
 
