@@ -251,3 +251,27 @@ def test_macos_cancel_text_in_middle_is_not_declined(monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", _fake_run([], rc=1, stderr="x (-128)\n"))
     with pytest.raises(el.ElevationDeclined):
         el.launch_elevated([PYX])
+
+
+def test_undecodable_helper_output_never_raises(monkeypatch):
+    """The launcher reads bytes and decodes them leniently: invalid UTF-8 on
+    stderr (after the helper already ran as root) must not raise
+    UnicodeDecodeError, and must still map to the right outcome."""
+    _os(monkeypatch, plat.LINUX)
+    monkeypatch.setattr(el.utils, "safe_which", lambda c: "/usr/bin/pkexec")
+    calls = []
+    monkeypatch.setattr(subprocess, "Popen",
+                        _fake_run(calls, rc=0, stderr=b"\xff\xfe bad \xc3"))
+    assert el.launch_elevated([PYX]) == 0
+    assert "text" not in calls[0][1] and "encoding" not in calls[0][1]
+    monkeypatch.setattr(subprocess, "Popen",
+                        _fake_run([], rc=2, stderr=b"crash \xff\xfe"))
+    with pytest.raises(el.ElevationFailed) as info:
+        el.launch_elevated([PYX])
+    assert info.value.exit_code == 2
+    assert "crash" in str(info.value) and "�" in str(info.value)
+    _os(monkeypatch, plat.MACOS)
+    monkeypatch.setattr(subprocess, "Popen",
+                        _fake_run([], rc=1, stderr=b"\xe9 User canceled. (-128)\n"))
+    with pytest.raises(el.ElevationDeclined):
+        el.launch_elevated([PYX])

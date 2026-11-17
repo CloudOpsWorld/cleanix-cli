@@ -1,3 +1,4 @@
+import ntpath
 import os
 import sys
 
@@ -219,7 +220,7 @@ def test_reveal_builds_per_platform_commands_without_shell(monkeypatch, tmp_path
 
     monkeypatch.setattr(reveal.plat, "current_os", lambda: "windows")
     assert reveal.reveal_in_file_manager(target) is True
-    assert calls[-1][0] == ["/abs/explorer", "/select," + target]
+    assert calls[-1][0] == ["/abs/explorer", "/select," + ntpath.normpath(target)]
     monkeypatch.setattr(reveal.plat, "current_os", lambda: "macos")
     assert reveal.reveal_in_file_manager(target) is True
     assert calls[-1][0] == ["/abs/open", "-R", target]

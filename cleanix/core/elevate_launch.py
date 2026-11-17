@@ -71,8 +71,10 @@ def _run(argv: List[str], timeout: int):
     fail and a plain wait() would block until the helper exits; never block.
     """
     try:
+        # Bytes, decoded leniently below: undecodable helper/prompt output
+        # must never raise after the elevated helper already ran.
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
+                                stderr=subprocess.PIPE)
     except OSError as exc:
         raise ElevationFailed(f"could not start the elevation prompt: {exc}") from exc
     try:
@@ -93,7 +95,19 @@ def _run(argv: List[str], timeout: int):
         except Exception:
             pass
         raise ElevationFailed("elevated helper timed out and may still be running") from exc
-    return proc.returncode, err or ""
+    return proc.returncode, _decode(err)
+
+
+def _decode(data) -> str:
+    """Text of a captured stream; never raises (bad bytes become U+FFFD)."""
+    if not data:
+        return ""
+    if isinstance(data, str):
+        return data
+    try:
+        return bytes(data).decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return ""
 
 
 def launch_elevated(argv: Sequence[str], *, timeout: int = 3600) -> int:
