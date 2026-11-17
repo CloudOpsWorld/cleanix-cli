@@ -488,5 +488,11 @@ class PowerView(QWidget):
     def _on_export_clicked(self) -> None:
         name, _ = QFileDialog.getSaveFileName(
             self, "Export scan as JSON", "cleanix-scan.json", "JSON (*.json)")
-        if name:
+        if not name:
+            return
+        try:
             self.export_scan_json(Path(name))
+        except (OSError, ValueError) as exc:  # never raise into the Qt slot
+            self.status_label.setText(f"Export failed: {exc}")
+            return
+        self.status_label.setText(f"Exported to {name}")

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import Optional, Sequence
 
 HINT = 'Install the GUI extra: pip install "cleanix-cli[gui]"'
+ROOT_MESSAGE = ("Cleanix GUI must not run as root: it asks for administrator "
+                "permission when needed")
 
 
 class GuiUnavailable(Exception):
@@ -20,8 +23,33 @@ def require_qt() -> None:
         raise GuiUnavailable(HINT) from exc
 
 
+def running_as_root() -> bool:
+    """POSIX: is the effective uid 0? (Windows has no geteuid: False.)"""
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return False
+    try:
+        return geteuid() == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _error(text: str) -> None:
+    # gui-scripts may have no console (sys.stderr is None): print is a no-op.
+    if sys.stderr is not None:
+        print(text, file=sys.stderr)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    require_qt()
+    # The GUI never runs as root: only the elevated helper does.
+    if running_as_root():
+        _error(ROOT_MESSAGE)
+        return 1
+    try:
+        require_qt()
+    except GuiUnavailable as exc:
+        _error(str(exc))
+        return 1
     from PySide6.QtWidgets import QApplication
 
     from cleanix.gui import theme

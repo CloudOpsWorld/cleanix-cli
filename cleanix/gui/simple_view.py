@@ -59,11 +59,15 @@ class ConfirmInfo:
     # Selected items that are not PATH items (commands such as emptying the
     # Recycle Bin or pruning containers): never quarantined, never undoable.
     irreversible: int = 0
+    # Selected Trash / Recycle Bin items, and how many of them are plain
+    # files the GUI cleans itself (PATH, not requires_root): those go to
+    # quarantine like any other file when a copy is kept.
     trash_items: int = 0
     # Selected items that need administrator permission (requires_root): the
     # elevated helper removes them permanently, never into quarantine. Not
     # counted in ``irreversible``.
     admin_items: int = 0
+    trash_path_items: int = 0
 
 
 def admin_confirm_text(n: int) -> str:
@@ -191,6 +195,7 @@ class ConfirmCleanDialog(QDialog):
         self._size = info.size
         self._irreversible = info.irreversible
         self._trash_items = info.trash_items
+        self._trash_paths = min(info.trash_path_items, info.trash_items)
         self._admin = info.admin_items
         self.summary_label = QLabel(
             f"Clean {info.count} item{'s' if info.count != 1 else ''} "
@@ -242,11 +247,16 @@ class ConfirmCleanDialog(QDialog):
                          + "this clean can be undone.")
         else:
             parts.append("The files will be deleted and this cannot be undone.")
-        t = self._trash_items
+        kept = self._trash_paths if self.keep_copy_checkbox.isChecked() else 0
+        t = self._trash_items - kept
         if t:
             parts.append(
                 f"Including {t} item{'s' if t != 1 else ''} from Trash / Recycle Bin "
                 "which are removed permanently.")
+        if kept:
+            parts.append(
+                f"{kept} item{'s' if kept != 1 else ''} from Trash / Recycle Bin "
+                f"{'are' if kept != 1 else 'is'} kept in quarantine like the other files.")
         self.warning_label.setText(" ".join(parts))
 
     def keep_copy(self) -> bool:
@@ -386,9 +396,17 @@ class SimpleView(QWidget):
         self.clean_progress = QProgressBar()
         self.clean_progress.setAccessibleName("Clean progress")
         self.clean_status = ElidedLabel("Cleaning...")
+        # The administrator wait message must be readable in full ("decline
+        # the prompt to skip..."): a word-wrapped label replaces the elided
+        # status line while it is shown.
+        self.clean_wait_label = QLabel("")
+        self.clean_wait_label.setWordWrap(True)
+        self.clean_wait_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.clean_wait_label.setVisible(False)
         self.cancel_clean_button = _button("Cancel", "Cancel clean")
         self.cancel_clean_button.clicked.connect(self.cancel)
-        for w in (self.clean_status, self.clean_progress, self.cancel_clean_button):
+        for w in (self.clean_status, self.clean_wait_label, self.clean_progress,
+                  self.cancel_clean_button):
             lay.addWidget(w)
         lay.addStretch(1)
 
@@ -603,7 +621,10 @@ class SimpleView(QWidget):
         accepted, keep_copy = self._confirm(ConfirmInfo(
             len(items), sum(i.size for i in items), True, irreversible,
             sum(1 for i in items if catalog.category_of(i.cleaner_id) == "trash"),
-            admin_items=admin))
+            admin_items=admin,
+            trash_path_items=sum(1 for i in items
+                                 if catalog.category_of(i.cleaner_id) == "trash"
+                                 and i.kind is ItemKind.PATH and not i.requires_root)))
         if not accepted:
             return
         self.request_clean.emit(items)
@@ -616,9 +637,7 @@ class SimpleView(QWidget):
         self._kept_copy = keep_copy
         self._all_irreversible = all(i.kind is not ItemKind.PATH or i.requires_root
                                      for i in items)
-        self.clean_progress.setRange(0, 0)
-        self.clean_status.setText("Cleaning...")
-        self.cancel_clean_button.setEnabled(True)
+        self._start_clean_ui_reset()
         worker = self._clean_factory(
             items, self._config, dry_run=False, use_quarantine=keep_copy)
         self._worker = worker
@@ -629,6 +648,14 @@ class SimpleView(QWidget):
         self._set_state(SimpleState.CLEANING)
         workers.start_worker(worker)
 
+    def _start_clean_ui_reset(self) -> None:
+        self.clean_progress.setRange(0, 0)
+        self.clean_status.setText("Cleaning...")
+        self.clean_status.setVisible(True)
+        self.clean_wait_label.setVisible(False)
+        self.clean_wait_label.setText("")
+        self.cancel_clean_button.setEnabled(True)
+
     @Slot(str, int, int)
     def _on_clean_progress(self, name: str, done: int, total: int) -> None:
         if self._state is not SimpleState.CLEANING:
@@ -637,7 +664,9 @@ class SimpleView(QWidget):
             # The elevated step cannot be stopped from here: Cancel would lie.
             self.cancel_clean_button.setEnabled(False)
             self.clean_progress.setRange(0, 0)
-            self.clean_status.setText(name)
+            self.clean_status.setVisible(False)
+            self.clean_wait_label.setText(name)
+            self.clean_wait_label.setVisible(True)
             return
         self.clean_progress.setRange(0, max(total, 1))
         self.clean_progress.setValue(done)

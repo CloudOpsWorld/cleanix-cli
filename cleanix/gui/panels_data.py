@@ -163,8 +163,10 @@ class QuarantinePanel(QWidget):
             return
         try:
             result = self._do_restore(run_id)
-        except (OSError, FileNotFoundError) as exc:
-            self.status_label.setText(f"Restore failed: {exc}")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            # OSError: filesystem; ValueError/KeyError/TypeError: corrupt manifest.
+            detail = str(exc) if not isinstance(exc, KeyError) else f"missing entry {exc}"
+            self.status_label.setText(f"Restore failed: {detail}")
             self.refresh()
             return
         restored, failed = len(result.get("restored", [])), result.get("failed", [])

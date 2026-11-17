@@ -280,6 +280,21 @@ def test_export_json_matches_cli_schema(view, tmp_path, monkeypatch):
         report.scan_to_json(view._result))
 
 
+def test_export_os_error_is_shown_in_status_not_raised(view, tmp_path, monkeypatch):
+    _load(view)
+    target = tmp_path / "a-directory"
+    target.mkdir()  # writing a file to a directory path raises OSError
+    monkeypatch.setattr(pv.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(target), "JSON (*.json)")))
+    view._on_export_clicked()  # must not raise into the Qt slot
+    assert view.status_label.text().startswith("Export failed:")
+    ok = tmp_path / "scan.json"
+    monkeypatch.setattr(pv.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(ok), "JSON (*.json)")))
+    view._on_export_clicked()
+    assert ok.exists() and view.status_label.text() == f"Exported to {ok}"
+
+
 def test_enabled_cleaners_are_passed_to_scan_as_only(qtbot, monkeypatch, sync_workers):
     monkeypatch.setattr(catalog, "list_cleaners", lambda cfg, **k: [
         _info("temp", "Temp"), _info("opt", "Optional", default=False)])

@@ -550,6 +550,66 @@ def test_confirm_dialog_mentions_trash_items(qtbot):
     assert infos[0].trash_items == 1
 
 
+PERMANENT_TRASH = "from Trash / Recycle Bin which are removed permanently"
+KEPT_TRASH = "from Trash / Recycle Bin are kept in quarantine like the other files"
+
+
+def test_trash_files_kept_in_quarantine_are_not_called_permanent(qtbot):
+    """Trash PATH items go to quarantine like other files when a copy is
+    kept; only command items (Recycle Bin) or a no-copy clean are permanent."""
+    infos = []
+    v = make_view(qtbot, confirm=lambda info: infos.append(info) or (False, True))
+    v.set_scan_result(result(item("temp", 10), item("trash", 5), item("trash", 6)))
+    v.also_found_toggle.setChecked(True)
+    next(c for c in v.cards() if c.category == "trash").checkbox.setChecked(True)
+    v.clean_button.click()
+    info = infos[0]
+    assert info.trash_items == 2 and info.trash_path_items == 2
+    d = ConfirmCleanDialog(info)
+    qtbot.addWidget(d)
+    assert d.keep_copy_checkbox.isChecked()
+    text = d.warning_label.text()
+    assert PERMANENT_TRASH not in text
+    assert "2 items " + KEPT_TRASH in text
+    d.keep_copy_checkbox.setChecked(False)
+    text = d.warning_label.text()
+    assert "Including 2 items " + PERMANENT_TRASH in text
+    assert KEPT_TRASH not in text
+
+
+def test_recycle_bin_command_is_permanent_even_with_keep_copy(qtbot):
+    d = ConfirmCleanDialog(ConfirmInfo(3, 10, irreversible=1, trash_items=2,
+                                       trash_path_items=1))
+    qtbot.addWidget(d)
+    text = d.warning_label.text()
+    assert "Including 1 item " + PERMANENT_TRASH in text
+    assert "1 item from Trash / Recycle Bin is kept in quarantine" in text
+    d.keep_copy_checkbox.setChecked(False)
+    text = d.warning_label.text()
+    assert "Including 2 items " + PERMANENT_TRASH in text
+    assert "kept in quarantine like" not in text
+
+
+def test_admin_wait_message_wraps_and_is_never_elided(qtbot):
+    from cleanix.gui import elevation
+
+    v = make_view(qtbot)
+    v._set_state(SimpleState.CLEANING)
+    v.resize(320, 400)
+    v.show()
+    v._on_clean_progress(elevation.ADMIN_WAIT_MESSAGE, 0, 0)
+    label = v.clean_wait_label
+    assert label.isVisible() and not v.clean_status.isVisible()
+    assert label.wordWrap() and label.text() == elevation.ADMIN_WAIT_MESSAGE
+    assert "decline the prompt to skip administrator items" in label.text()
+    assert not v.cancel_clean_button.isEnabled()
+    # A new clean shows the normal (single-line) status again.
+    v._set_state(SimpleState.RESULTS)
+    v._start_clean_ui_reset()
+    assert not v.clean_status.isHidden() and v.clean_wait_label.isHidden()
+    assert v.cancel_clean_button.isEnabled()
+
+
 def test_readonly_card_shows_each_items_own_hint(qtbot):
     v = make_view(qtbot)
     v.set_scan_result(result(

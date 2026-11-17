@@ -64,6 +64,39 @@ def test_packaging_declares_gui_extras_and_entry_point():
     assert project["scripts"]["cleanix"] == "cleanix.cli:main"
 
 
+def test_gui_script_without_pyside6_prints_hint_to_stderr(monkeypatch, capsys):
+    """The cleanix-gui entry point (app.main) never raises GuiUnavailable."""
+    from cleanix.gui import app
+
+    monkeypatch.setattr(app, "running_as_root", lambda: False)
+    monkeypatch.setitem(sys.modules, "PySide6", None)
+    monkeypatch.setitem(sys.modules, "PySide6.QtWidgets", None)
+    assert app.main(["cleanix-gui"]) == 1
+    captured = capsys.readouterr()
+    assert 'pip install "cleanix-cli[gui]"' in captured.err
+    assert captured.out == ""
+
+
+def test_gui_refuses_to_run_as_root(monkeypatch, capsys):
+    import os
+
+    import pytest
+
+    from cleanix.gui import app
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(app, "require_qt", lambda: pytest.fail("Qt must not be loaded as root"))
+    assert app.main(["cleanix-gui"]) == 1
+    assert ("Cleanix GUI must not run as root: it asks for administrator permission "
+            "when needed") in capsys.readouterr().err
+    # cleanix gui (CLI) goes through the same check.
+    monkeypatch.setattr(app, "require_qt", lambda: None)
+    assert cli.main(["gui"]) == 1
+    assert "must not run as root" in capsys.readouterr().err
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+    assert app.running_as_root() is False
+
+
 def test_cmd_gui_without_qt_prints_hint(monkeypatch, capsys):
     from cleanix.gui import app
 

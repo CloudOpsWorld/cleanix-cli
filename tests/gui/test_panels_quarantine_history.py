@@ -105,6 +105,39 @@ def test_delete_and_empty_os_errors_are_shown_not_raised(qtbot, fake_q, monkeypa
     assert p.table.rowCount() == 2  # refreshed
 
 
+@pytest.mark.parametrize("exc", [ValueError("bad manifest"), KeyError("original"),
+                                 TypeError("string indices must be integers")])
+def test_restore_corrupt_manifest_is_shown_not_raised(qtbot, fake_q, monkeypatch, exc):
+    def boom(rid):
+        raise exc
+
+    monkeypatch.setattr(quarantine, "restore", boom)
+    p = _panel(qtbot)
+    p.table.selectRow(0)
+    p.restore_btn.click()  # must not raise into the event loop
+    assert p.status_label.text().startswith("Restore failed:")
+    assert p.table.rowCount() == 2  # refreshed
+
+
+def test_restore_real_corrupt_manifest(qtbot, tmp_path, monkeypatch):
+    """A manifest whose item lacks "original" makes quarantine.restore raise
+    KeyError; the panel reports it."""
+    import json
+
+    root = tmp_path / "quarantine"
+    run = root / "run-x"
+    run.mkdir(parents=True)
+    (run / "manifest.json").write_text(json.dumps(
+        {"run_id": "run-x", "created": 1, "items": [{"stored": "s", "size": 1}]}),
+        encoding="utf-8")
+    monkeypatch.setattr(quarantine, "quarantine_root", lambda: root)
+    p = _panel(qtbot)
+    assert p.table.rowCount() == 1
+    p.table.selectRow(0)
+    p.restore_btn.click()
+    assert p.status_label.text() == "Restore failed: missing entry 'original'"
+
+
 def test_empty_all_requires_confirmation(qtbot, fake_q):
     calls, _ = fake_q
     p = _panel(qtbot, confirm=lambda m: False)
