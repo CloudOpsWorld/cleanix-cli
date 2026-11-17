@@ -366,11 +366,15 @@ The prompt itself does not list what will be removed; the GUI's confirmation is
 the place to check. The helper trusts only cleaner ids and item keys from the
 request, re-scans by itself and cleans only items it finds eligible. It runs
 only a fixed list of system cleaners (see `admin_cleaner_ids` in
-`cleanix/elevated.py`): on Linux, macOS and the BSDs the default-enabled
-system cleaners that need root and support the machine (package-manager
-caches, old kernels, Snap, system logs and crash dumps, ...) plus `temp` for
-other users' entries; the opt-in memory/swap actions are never included. On
-Windows it is `win_system_temp`, `win_system_dumps`, `win_update_cache` and
+`cleanix/elevated.py`). In 1.4.0 that is 23 cleaners on Linux: the package
+managers (`apt`, `dnf`, `pacman`, `zypper`, `apk`, `xbps`, `portage`,
+`eopkg`, `swupd`), `old_kernels`, `snap`, system logs, journal, coredumps and
+crash reports, `system_cache`, `var_backups`, `offline_updates`,
+`config_leftovers`, `localepurge`, `crictl`, plus `temp` for other users'
+entries. On macOS and the BSDs it is the same rule (default-enabled system
+cleaners that need root and support the platform, plus `temp`). The opt-in
+memory/swap actions are never included. On Windows it is 4 cleaners:
+`win_system_temp`, `win_system_dumps`, `win_update_cache` and
 `win_component_store` (not `temp`). The GUI offers only administrator items
 the helper would clean; the rest are shown read-only with the reason. It uses
 built-in default settings and ignores most of your config: only
