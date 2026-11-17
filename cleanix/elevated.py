@@ -51,6 +51,23 @@ What the design does and does not protect:
   root-relative ``requires_root`` and default-only config matter.
 * The elevation prompt (UAC / polkit / macOS) does not show what will be
   removed; the GUI's confirmation is the only place the user sees the list.
+* Windows: items under ProgramData are always refused in elevated runs
+  (e.g. ``WER\\ReportQueue`` grants standard users write/delete, so an empty
+  folder there can become a junction between the check and the delete);
+  ``win_system_dumps`` is thereby reduced to MEMORY.DMP, Minidump and
+  LiveKernelReports. The proper fix is handle-verified deletion
+  (``FILE_FLAG_OPEN_REPARSE_POINT`` + ``GetFinalPathNameByHandle``): future work.
+
+Known residuals, accepted for now:
+(a) POSIX check-then-delete is path-based: a service account or group that
+    owns a trusted parent could swap a component between the check and the
+    delete. fd-anchored deletion (openat-style directory descriptors) is the
+    proper fix: future work.
+(b) Code-location trust: ``-I`` ignores a user-controlled sys.path, but a
+    user-writable interpreter or site-packages (a venv in the home, a
+    per-user Python) is still user-writable code run as root. A root-owned
+    install location plus a launcher check is future work (Plan 2B packaging).
+(c) POSIX ACLs are not inspected; only owner, group and mode bits are.
 
 Exit codes (126/127 are never used: pkexec reserves them):
 0 completed (details in the result file), 1 request unreadable/refused
@@ -61,6 +78,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import math
 import ntpath
 import os
@@ -96,7 +114,9 @@ _POSIX_KEEP_PREFIXES = ("LC_",)
 # cleaner derives a deletion target from them (they use the API values below).
 _WIN_KEEP = {"USERNAME", "USERDOMAIN", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
              "LOCALAPPDATA", "APPDATA", "NUMBER_OF_PROCESSORS",
-             "PROCESSOR_ARCHITECTURE", "OS"}
+             "PROCESSOR_ARCHITECTURE", "OS",
+             # OneDrive roots only ever ADD protection in the safety guard.
+             "ONEDRIVE", "ONEDRIVECOMMERCIAL", "ONEDRIVECONSUMER"}
 _WIN_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 
 _monotonic = time.monotonic
@@ -122,7 +142,7 @@ def _trusted_environment(source, posix: bool, win_dirs=None) -> dict:
                 env[key] = value
         env["PATH"] = POSIX_PATH
         return env
-    windir, sysdir, programdata = win_dirs
+    windir, sysdir, programdata, programfiles, programfiles_x86 = win_dirs
     drive = ntpath.splitdrive(windir)[0]
     if not drive:
         raise Refused("could not determine the system drive")
@@ -133,6 +153,7 @@ def _trusted_environment(source, posix: bool, win_dirs=None) -> dict:
     env.update({
         "SystemRoot": windir, "windir": windir, "SystemDrive": drive,
         "ProgramData": programdata, "ComSpec": ntpath.join(sysdir, "cmd.exe"),
+        "ProgramFiles": programfiles, "ProgramFiles(x86)": programfiles_x86,
         "PATHEXT": _WIN_PATHEXT, "TEMP": temp, "TMP": temp,
         "PATH": ";".join([sysdir, windir, ntpath.join(sysdir, "Wbem"),
                           ntpath.join(sysdir, "WindowsPowerShell", "v1.0")]),
@@ -140,12 +161,46 @@ def _trusted_environment(source, posix: bool, win_dirs=None) -> dict:
     return env
 
 
-def _win_known_dirs():
-    """(windows dir, system32 dir, ProgramData) from the Windows API.
+_FOLDERID_PROGRAMDATA = "62AB5D82-FDC1-4DC3-A9DD-070D1D495D97"
+_FOLDERID_PROGRAMFILES = "905E63B6-C1BF-494E-B29C-65B732D3D21A"
+_FOLDERID_PROGRAMFILESX86 = "7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E"
 
-    Raises OSError if any call fails."""
+
+def _known_folder(guid_text: str) -> str:
+    """SHGetKnownFolderPath for one KNOWNFOLDERID; raises OSError on failure."""
     import ctypes
     import uuid as _uuid
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+    guid = GUID()
+    ctypes.memmove(ctypes.byref(guid), _uuid.UUID(guid_text).bytes_le, 16)
+    fn = ctypes.windll.shell32.SHGetKnownFolderPath
+    fn.argtypes = [ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+                   ctypes.POINTER(ctypes.c_void_p)]
+    fn.restype = ctypes.c_long
+    ptr = ctypes.c_void_p()
+    hr = fn(ctypes.byref(guid), 0, None, ctypes.byref(ptr))
+    try:
+        if hr != 0 or not ptr.value:
+            raise OSError("known folder lookup failed")
+        value = ctypes.wstring_at(ptr.value)
+    finally:
+        if ptr.value:
+            ctypes.windll.ole32.CoTaskMemFree(ptr)
+    if not value:
+        raise OSError("known folder lookup returned nothing")
+    return value
+
+
+def _win_known_dirs():
+    """(Windows dir, System32 dir, ProgramData, Program Files,
+    Program Files (x86)) from the Windows API. Raises OSError on failure
+    (Program Files (x86) falls back to Program Files on 32-bit Windows)."""
+    import ctypes
     from ctypes import wintypes
 
     k32 = ctypes.windll.kernel32
@@ -162,30 +217,15 @@ def _win_known_dirs():
 
     windir = call(k32.GetSystemWindowsDirectoryW)
     sysdir = call(k32.GetSystemDirectoryW)
-
-    class GUID(ctypes.Structure):
-        _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
-                    ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
-
-    guid = GUID()
-    raw = _uuid.UUID("62AB5D82-FDC1-4DC3-A9DD-070D1D495D97").bytes_le  # ProgramData
-    ctypes.memmove(ctypes.byref(guid), raw, 16)
-    fn = ctypes.windll.shell32.SHGetKnownFolderPath
-    fn.argtypes = [ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
-                   ctypes.POINTER(ctypes.c_void_p)]
-    fn.restype = ctypes.c_long
-    ptr = ctypes.c_void_p()
-    hr = fn(ctypes.byref(guid), 0, None, ctypes.byref(ptr))
+    programdata = _known_folder(_FOLDERID_PROGRAMDATA)
+    programfiles = _known_folder(_FOLDERID_PROGRAMFILES)
     try:
-        if hr != 0 or not ptr.value:
-            raise OSError("ProgramData lookup failed")
-        programdata = ctypes.wstring_at(ptr.value)
-    finally:
-        if ptr.value:
-            ctypes.windll.ole32.CoTaskMemFree(ptr)
-    if not (windir and sysdir and programdata):
+        programfiles_x86 = _known_folder(_FOLDERID_PROGRAMFILESX86)
+    except OSError:
+        programfiles_x86 = programfiles
+    if not (windir and sysdir):
         raise OSError("Windows directory lookup returned nothing")
-    return windir, sysdir, programdata
+    return windir, sysdir, programdata, programfiles, programfiles_x86
 
 
 def _sanitize_environment() -> None:
@@ -310,10 +350,36 @@ def admin_cleaner_ids() -> FrozenSet[str]:
 # --------------------------------------------------------------------------
 # parent-chain trust (the real defence against planted symlinks)
 # --------------------------------------------------------------------------
+_LOGIN_DEFS = "/etc/login.defs"
+_UID_FLOOR_RANGE = (500, 1000)
+
+
+def _read_uid_min(path: str, default: int) -> int:
+    """``UID_MIN`` from a login.defs file, clamped to [500, 1000]."""
+    value = default
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "UID_MIN":
+                    try:
+                        value = int(parts[1], 0)
+                    except ValueError:
+                        value = default
+    except OSError:
+        value = default
+    lo, hi = _UID_FLOOR_RANGE
+    return max(lo, min(hi, value))
+
+
+@functools.lru_cache(maxsize=1)
 def _human_uid_min() -> int:
+    """The lowest uid/gid of human accounts (below it: system accounts)."""
     from cleanix.core.platform import MACOS, current_os
 
-    return 500 if current_os() == MACOS else 1000
+    if current_os() == MACOS:
+        return 501
+    return _read_uid_min(_LOGIN_DEFS, 1000)
 
 
 def _trusted_owner(st, expected_uid: Optional[int]) -> bool:
@@ -322,14 +388,17 @@ def _trusted_owner(st, expected_uid: Optional[int]) -> bool:
     return uid == 0 or (uid < _human_uid_min() and uid != expected_uid)
 
 
-def _untrusted_group(st, group_ids: FrozenSet[int]) -> bool:
+def _untrusted_group(st, group_ids: Optional[FrozenSet[int]]) -> bool:
     """A group a human may belong to (non-system gid, or one of the
-    requesting user's groups)."""
+    requesting user's groups). ``group_ids=None`` means the user's groups are
+    unknown: every group is untrusted (fail closed)."""
+    if group_ids is None:
+        return True
     return st.st_gid >= _human_uid_min() or st.st_gid in group_ids
 
 
 def _component_problem(st, expected_uid: Optional[int],
-                       group_ids: FrozenSet[int]) -> Optional[str]:
+                       group_ids: Optional[FrozenSet[int]]) -> Optional[str]:
     """Why a directory on an item's parent chain cannot be trusted, or None.
 
     Trusted: a real directory (not a symlink) that only root/system accounts
@@ -354,15 +423,33 @@ def _component_problem(st, expected_uid: Optional[int],
     return None
 
 
-def _path_chain_problem(path: str, expected_uid: Optional[int],
-                        group_ids: FrozenSet[int]) -> Optional[str]:
-    """Check every directory from the filesystem root down to the item's
-    parent, with lstat, right before the item is deleted."""
-    if not _is_posix():
-        from cleanix.core import safety
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_lstat = os.lstat
 
+
+def _is_under(path: str, root: str) -> bool:
+    """Case-insensitive Windows containment test (``path`` inside ``root``)."""
+    p = ntpath.normcase(ntpath.normpath(str(path)))
+    r = ntpath.normcase(ntpath.normpath(str(root))).rstrip("\\")
+    return bool(r) and (p == r or p.startswith(r + "\\"))
+
+
+def _path_chain_problem(path: str, expected_uid: Optional[int],
+                        group_ids: Optional[FrozenSet[int]]) -> Optional[str]:
+    """Check every directory from the filesystem root down to the item's
+    parent, with lstat, right before the item is deleted. Fails closed: a
+    component that cannot be inspected is a refusal."""
+    if not _is_posix():
+        programdata = os.environ.get("ProgramData", "")  # API value (sanitised)
+        if programdata and _is_under(path, programdata):
+            return ("it lies under ProgramData, where standard users can turn "
+                    "folders into junctions")
         for parent in Path(path).parents:
-            if safety.is_reparse_point(parent):
+            try:
+                st = _lstat(parent)
+            except OSError:
+                return f"{parent} cannot be inspected"
+            if getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
                 return f"{parent} is a link or junction"
         return None
     from cleanix.core.utils import canonical_system_path
@@ -372,7 +459,7 @@ def _path_chain_problem(path: str, expected_uid: Optional[int],
     for i in range(len(parts)):
         comp = Path(*parts[: i + 1])
         try:
-            st = os.lstat(comp)
+            st = _lstat(comp)
         except OSError:
             return f"{comp} cannot be inspected"
         problem = _component_problem(st, expected_uid, group_ids)
@@ -381,11 +468,13 @@ def _path_chain_problem(path: str, expected_uid: Optional[int],
     return None
 
 
-def _user_groups(user: context.TargetUser) -> FrozenSet[int]:
+def _user_groups(user: context.TargetUser) -> Optional[FrozenSet[int]]:
+    """The requesting user's groups, or None if they cannot be determined
+    (then every group-writable parent is refused)."""
     try:
         return frozenset(os.getgrouplist(user.name, user.gid))
-    except (AttributeError, KeyError, OSError):
-        return frozenset({user.gid})
+    except Exception:  # noqa: BLE001 - fail closed
+        return None
 
 
 def _load_config(config_path: Optional[str], home: Path, expected_uid: Optional[int]):
@@ -624,7 +713,7 @@ def _clamp_command(item, remaining: float):
 
 def _execute(session: _Session, selection: elevate.Selection, config, cancel,
              deadline: float, start: float, expected_uid: Optional[int],
-             group_ids: FrozenSet[int]) -> int:
+             group_ids: Optional[FrozenSet[int]]) -> int:
     allowed = admin_cleaner_ids()
     wanted = set(selection.keys)
     # Keys of cleaners the helper never runs are refused without scanning.

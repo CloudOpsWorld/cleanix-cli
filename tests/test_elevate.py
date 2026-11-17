@@ -878,7 +878,8 @@ def test_trusted_environment_is_an_allowlist():
     win = elevated._trusted_environment(
         {"USERNAME": "u", "USERPROFILE": r"C:\Users\u", "ComSpec": r"C:\evil.exe",
          "TEMP": r"C:\evil", "PSModulePath": r"C:\evil"}, False,
-        (r"C:\Windows", r"C:\Windows\System32", r"C:\ProgramData"))
+        (r"C:\Windows", r"C:\Windows\System32", r"C:\ProgramData",
+         r"C:\Program Files", r"C:\Program Files (x86)"))
     assert win["ComSpec"] == r"C:\Windows\System32\cmd.exe"
     assert win["TEMP"] == win["TMP"] == r"C:\Windows\Temp"
     assert win["USERNAME"] == "u" and "PSModulePath" not in win
@@ -887,7 +888,8 @@ def test_trusted_environment_is_an_allowlist():
 def test_windows_environment_comes_from_api(monkeypatch):
     monkeypatch.setattr(elevated, "_is_posix", lambda: False)
     monkeypatch.setattr(elevated, "_win_known_dirs",
-                        lambda: (r"D:\Win", r"D:\Win\System32", r"D:\PD"))
+                        lambda: (r"D:\Win", r"D:\Win\System32", r"D:\PD",
+                                 r"D:\PF", r"D:\PF86"))
     for k, v in {"SystemRoot": r"C:\evil", "windir": r"C:\evil",
                  "SystemDrive": "E:", "ProgramData": r"C:\evil",
                  "PATH": r"C:\evil", "PYTHONPATH": r"C:\evil"}.items():
@@ -919,8 +921,9 @@ def test_windows_api_failure_refuses_run(env, monkeypatch):
 
 @pytest.mark.skipif(sys.platform != "win32", reason="real Windows API")
 def test_real_windows_known_dirs_override_tampered_env(monkeypatch):
-    windir, sysdir, programdata = elevated._win_known_dirs()
-    assert Path(windir).is_dir() and Path(sysdir).is_dir() and Path(programdata).is_dir()
+    windir, sysdir, programdata, pf, pf86 = elevated._win_known_dirs()
+    for d in (windir, sysdir, programdata, pf, pf86):
+        assert Path(d).is_dir()
     monkeypatch.setenv("SystemRoot", r"C:\evil")
     monkeypatch.setenv("ProgramData", r"C:\evil")
     elevated._sanitize_environment()
@@ -1198,11 +1201,18 @@ def test_recheck_catches_component_swapped_between_scan_and_clean(env, monkeypat
 def test_windows_reparse_point_in_item_parent_chain_is_refused(env, monkeypatch):
     monkeypatch.setattr(elevated, "_is_posix", lambda: False)
     monkeypatch.setattr(elevated, "_win_known_dirs",
-                        lambda: (r"C:\Windows", r"C:\Windows\System32", r"C:\ProgramData"))
+                        lambda: (r"C:\Windows", r"C:\Windows\System32", r"C:\ProgramData",
+                                 r"C:\Program Files", r"C:\Program Files (x86)"))
     f = _file(env.junk / "sub", "f")
-    real_is_reparse = safety.is_reparse_point
-    monkeypatch.setattr(safety, "is_reparse_point",
-                        lambda p: Path(p) == env.junk or real_is_reparse(p))
+    real_lstat = os.lstat
+
+    def lstat(p):
+        st = real_lstat(p)
+        if Path(p) == env.junk:  # this parent is a junction
+            return SimpleNamespace(st_mode=st.st_mode, st_file_attributes=0x400)
+        return st
+
+    monkeypatch.setattr(elevated, "_lstat", lstat)
     it = _item(f)
     env.cleaners.append(FakeCleaner("logs", [it]))
     rc, _ = _run(env, _selection([item_key(it)]))
@@ -1348,3 +1358,182 @@ def test_run_accepts_deadline_as_string(env):
     env.cleaners.append(FakeCleaner("logs", [ia]))
     rc, _ = _run(env, _selection([item_key(ia)]), deadline="5")
     assert rc == 0 and not a.exists()
+
+
+# --------------------------------------------------------------------------
+# round 3: ProgramData, fail-closed checks, UID floor, more cleaner bases
+# --------------------------------------------------------------------------
+def _force_windows(env, monkeypatch):
+    win = env.tmp / "Win"
+    pd = env.tmp / "PD"
+    monkeypatch.setattr(elevated, "_is_posix", lambda: False)
+    monkeypatch.setattr(elevated, "_win_known_dirs", lambda: (
+        str(win), str(win / "System32"), str(pd), str(env.tmp / "PF"),
+        str(env.tmp / "PF86")))
+    return win, pd
+
+
+windows_paths = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="needs drive-letter tmp paths (the Windows environment requires a system drive)")
+
+
+@windows_paths
+def test_windows_item_under_programdata_is_refused(env, monkeypatch):
+    win, pd = _force_windows(env, monkeypatch)
+    queued = _file(pd / "Microsoft" / "Windows" / "WER" / "ReportQueue" / "r1", "Report.wer")
+    temp_file = _file(win / "Temp", "old.tmp")
+    items = [_item(queued.parent), _item(temp_file)]
+    env.cleaners.append(FakeCleaner("logs", items))
+    rc, _ = _run(env, _selection([item_key(i) for i in items]))
+    assert rc == 0
+    assert queued.exists()                 # under ProgramData: refused
+    assert not temp_file.exists()          # under Windows\Temp: still eligible
+    res = elevate.read_result(env.result)
+    assert res.removed == 1 and res.refused == 1
+    assert "ProgramData" in res.errors[0]
+
+
+def test_is_under_is_case_insensitive_and_component_wise():
+    assert elevated._is_under(r"C:\programdata\Microsoft\x", r"C:\ProgramData")
+    assert elevated._is_under(r"C:\ProgramData", "C:\\ProgramData\\")
+    assert not elevated._is_under(r"C:\ProgramDataX\x", r"C:\ProgramData")
+    assert not elevated._is_under(r"C:\Windows\Temp\x", r"C:\ProgramData")
+
+
+@windows_paths
+def test_windows_unreadable_parent_is_refused(env, monkeypatch):
+    _force_windows(env, monkeypatch)
+    f = _file(env.junk / "sub", "f")
+    real_lstat = os.lstat
+
+    def lstat(p):
+        if Path(p) == env.junk:
+            raise PermissionError("access denied")
+        return real_lstat(p)
+
+    monkeypatch.setattr(elevated, "_lstat", lstat)
+    it = _item(f)
+    env.cleaners.append(FakeCleaner("logs", [it]))
+    rc, _ = _run(env, _selection([item_key(it)]))
+    assert rc == 0 and f.exists()
+    res = elevate.read_result(env.result)
+    assert res.refused == 1 and "cannot be inspected" in res.errors[0]
+
+
+@posix_only
+def test_posix_unreadable_parent_is_refused(env, monkeypatch):
+    f = _file(env.junk / "sub", "f")
+    real_lstat = os.lstat
+
+    def lstat(p):
+        if Path(p) == env.junk:
+            raise PermissionError("denied")
+        return real_lstat(p)
+
+    monkeypatch.setattr(elevated, "_lstat", lstat)
+    it = _item(f)
+    env.cleaners.append(FakeCleaner("logs", [it]))
+    rc, _ = _run(env, _selection([item_key(it)]))
+    assert rc == 0 and f.exists()
+    assert elevate.read_result(env.result).refused == 1
+
+
+def test_windows_environment_program_files_and_onedrive(monkeypatch):
+    monkeypatch.setattr(elevated, "_is_posix", lambda: False)
+    monkeypatch.setattr(elevated, "_win_known_dirs", lambda: (
+        r"C:\Windows", r"C:\Windows\System32", r"C:\ProgramData",
+        r"C:\Program Files", r"C:\Program Files (x86)"))
+    for k, v in {"ProgramFiles": r"E:\evil", "ProgramFiles(x86)": r"E:\evil86",
+                 "OneDrive": r"C:\Users\u\OneDrive",
+                 "OneDriveCommercial": r"C:\Users\u\OneDrive - Org",
+                 "OneDriveConsumer": r"C:\Users\u\OneDrive"}.items():
+        monkeypatch.setenv(k, v)
+    elevated._sanitize_environment()
+    env_ = {k.lower(): v for k, v in os.environ.items()}
+    assert env_["programfiles"] == r"C:\Program Files"
+    assert env_["programfiles(x86)"] == r"C:\Program Files (x86)"
+    assert env_["onedrive"] == r"C:\Users\u\OneDrive"
+    assert env_["onedrivecommercial"] == r"C:\Users\u\OneDrive - Org"
+    assert env_["onedriveconsumer"] == r"C:\Users\u\OneDrive"
+
+
+def test_user_groups_fail_closed(monkeypatch):
+    def boom(*a):
+        raise OSError("nss down")
+
+    monkeypatch.setattr(os, "getgrouplist", boom, raising=False)
+    user = context.TargetUser("alice", Path("/home/alice"), 1000, 1000, True)
+    assert elevated._user_groups(user) is None
+    # real policy (no stubs): a system-group-writable parent is refused when
+    # the user's groups are unknown, accepted when known and not a member
+    st = _st(0o040775, gid=4)
+    assert "non-system group" in elevated._component_problem(st, 1000, None)
+    assert elevated._component_problem(st, 1000, frozenset({1000})) is None
+
+
+@pytest.mark.parametrize("content, expected", [
+    ("UID_MIN 1000\n", 1000),
+    ("# comment\nUID_MIN\t\t 600\n", 600),
+    ("UID_MIN 1500\n", 1000),      # clamped
+    ("UID_MIN 100\n", 500),        # clamped
+    ("UID_MIN lots\n", 1000),      # garbage -> default
+    ("#UID_MIN 600\n", 1000),      # commented out
+    ("", 1000),
+])
+def test_read_uid_min(tmp_path, content, expected):
+    p = tmp_path / "login.defs"
+    p.write_text(content, encoding="utf-8")
+    assert elevated._read_uid_min(str(p), 1000) == expected
+    assert elevated._read_uid_min(str(tmp_path / "missing"), 1000) == 1000
+
+
+def test_human_uid_min_reads_login_defs_and_macos(tmp_path, monkeypatch):
+    from cleanix.core import platform as plat
+
+    p = tmp_path / "login.defs"
+    p.write_text("UID_MIN 700\n", encoding="utf-8")
+    monkeypatch.setattr(elevated, "_LOGIN_DEFS", str(p))
+    try:
+        monkeypatch.setattr(plat, "current_os", lambda: plat.LINUX)
+        elevated._human_uid_min.cache_clear()
+        assert elevated._human_uid_min() == 700
+        # the floor drives the real owner policy (no stubs)
+        assert elevated._trusted_owner(_st(0o040755, uid=650), 1000)
+        assert not elevated._trusted_owner(_st(0o040755, uid=700), 1000)
+        monkeypatch.setattr(plat, "current_os", lambda: plat.MACOS)
+        elevated._human_uid_min.cache_clear()
+        assert elevated._human_uid_min() == 501
+    finally:
+        elevated._human_uid_min.cache_clear()
+
+
+@posix_only
+def test_chain_policy_end_to_end_without_stubs(monkeypatch):
+    """_path_chain_problem with the REAL owner/group policy on fake stats."""
+    stats = {"/": _st(0o040755), "/a": _st(0o040755), "/a/b": _st(0o040755),
+             "/a/b/c": _st(0o040755)}
+    monkeypatch.setattr(elevated, "_lstat", lambda p: stats[str(p)])
+    assert elevated._path_chain_problem("/a/b/c/item", 1000, frozenset()) is None
+    stats["/a/b"] = _st(0o040755, uid=1000)              # owned by a human
+    assert "non-system user" in elevated._path_chain_problem("/a/b/c/item", 1000,
+                                                             frozenset())
+    stats["/a/b"] = _st(0o040775, gid=4)                 # system group, groups unknown
+    assert "non-system group" in elevated._path_chain_problem("/a/b/c/item", 1000, None)
+    stats["/a/b"] = _st(0o041777)                        # root sticky: ok
+    assert elevated._path_chain_problem("/a/b/c/item", 1000, frozenset()) is None
+
+
+@posix_only
+def test_crash_report_cleaner_ignores_symlinked_base(env, monkeypatch):
+    from cleanix.cleaners import linux_extras
+    from cleanix.config import Config
+
+    etc, _shadow, _ = _stand_in_etc(env)
+    var = env.tmp / "var"
+    var.mkdir()
+    (var / "crash").symlink_to(etc)
+    monkeypatch.setattr(linux_extras, "older_than", lambda p, d: True)
+    cleaner = linux_extras.CrashReportCleaner(Config())
+    monkeypatch.setattr(cleaner, "BASES", (str(var / "crash"),))
+    assert list(cleaner.find_items()) == []

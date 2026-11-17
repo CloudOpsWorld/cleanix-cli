@@ -201,6 +201,8 @@ def test_run_elevated_off_windows_raises(monkeypatch):
         winenv.run_elevated(["x"], 1)
 
 
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="SHELLEXECUTEINFOW layout is a Windows ABI")
 def test_shellexecuteinfo_layout():
     cls = winenv._shellexecuteinfo_class()
     expected = 112 if ctypes.sizeof(ctypes.c_void_p) == 8 else 60
