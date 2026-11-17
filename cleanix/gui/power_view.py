@@ -424,6 +424,13 @@ class PowerView(QWidget):
             done = {item_key(o.item) for o in summary.result.outcomes if o.removed}
             self.item_model.remove_keys(done)
             self._removed_keys |= done
+            if getattr(summary, "admin_selected", 0):
+                # Admin rows stay (unknown per-item outcome) but are unchecked
+                # so a second click never re-prompts for the same items.
+                m = self.item_model
+                for r in range(m.rowCount()):
+                    if m.item_at(r).requires_root:
+                        m.set_checked(r, False)
             self._on_current_changed(self.table.currentIndex())
         self.show_results(summary, "\n".join([text] + admin_lines))
         self.clean_finished.emit(summary)

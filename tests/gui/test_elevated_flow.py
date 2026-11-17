@@ -293,6 +293,21 @@ def test_partial_result_after_deadline_exit_is_reported(monkeypatch, isolation):
     assert "may already have been removed" in text and "time limit" in text
 
 
+def test_refused_exit_with_zero_removed_says_nothing_was_removed(monkeypatch):
+    def action(argv, sel):
+        write_result(argv, sel.nonce, errors=["request refused: x"])
+        raise elevate_launch.ElevationFailed("exit 1", exit_code=1)
+
+    FakeLauncher(monkeypatch, action)
+    out = elevation.run_elevated_part([it("r", root=True)], Config())
+    assert out.status == "failed" and out.result.removed == 0
+    assert "no administrator items were removed" in out.message
+    # exit code 1 without a valid result: never claim nothing was removed
+    FakeLauncher(monkeypatch, raises(elevate_launch.ElevationFailed("x", exit_code=1)))
+    out = elevation.run_elevated_part([it("r", root=True)], Config())
+    assert out.result is None and "may already have been removed" in out.message
+
+
 @pytest.mark.parametrize("cause", [TimeoutError("t"), subprocess.TimeoutExpired("x", 1)])
 def test_timeout_never_reads_a_result(monkeypatch, isolation, cause):
     fake_clean(monkeypatch, summary=user_summary(freed=100, removed=1))
@@ -773,6 +788,34 @@ def test_power_admin_outcome_shown_and_admin_rows_kept(qtbot, monkeypatch):
     assert keys == [item_key(admin_item)]  # the admin row stays (counts only)
     assert "Administrator permission was declined; 1 items were not cleaned" in shown[0]
     assert "declined" in v.status_label.text()
+    # the kept admin row is unchecked: a second click never re-prompts
+    assert m.checked_items() == []
+
+
+def test_power_second_click_after_admin_clean_does_not_reprompt(qtbot, monkeypatch):
+    monkeypatch.setattr(workers, "start_worker", lambda w: w.run())
+    monkeypatch.setattr(pv.PowerView, "show_results", lambda *a, **k: None)
+    monkeypatch.setattr(pv.PowerView, "confirm_clean", lambda self, text: True)
+    calls = []
+
+    def factory(items, *, dry_run, use_quarantine):
+        calls.append(list(items))
+        return FakeCleanWorker(combined("done", admin_selected=1,
+                                        result=elevate.HelperResult(
+                                            freed=50, removed=1, errors=[], unmatched=0)))
+
+    v = pv.PowerView(Config(), allow_admin_items=True, clean_worker_factory=factory)
+    qtbot.addWidget(v)
+    v._on_scan_finished(_admin_scan())
+    m = v.item_model
+    v.select_none_visible()
+    row = next(r for r in range(m.rowCount()) if m.item_at(r).requires_root)
+    assert m.set_checked(row, True)
+    v.dry_run_check.setChecked(False)
+    v.clean_button.click()
+    v.clean_button.click()
+    assert v.status_label.text() == "No visible items selected."
+    assert len(calls) == 1
 
 
 # --------------------------------------------------------------------------
@@ -852,7 +895,13 @@ def test_end_to_end_with_real_helper(monkeypatch, isolation, helper_env):
     i_foreign = CleanableItem("user_cache", "foreign", size=10, path=str(foreign_file),
                               requires_root=True)
     i_gone = CleanableItem("logs", "gone", size=10, path=str(gone_file), requires_root=True)
-    helper_env.cleaners.append(E2EFakeCleaner("logs", [i_admin]))
+    # The GUI thinks this needs admin rights, but the helper's fresh scan says
+    # it does not: refused after matching (in-scan eligibility check).
+    flip_file = _file(junk, "flip.bin")
+    i_flip = CleanableItem("logs", "flip", size=10, path=str(flip_file), requires_root=True)
+    fresh_flip = CleanableItem("logs", "flip", size=10, path=str(flip_file),
+                               requires_root=False)
+    helper_env.cleaners.append(E2EFakeCleaner("logs", [i_admin, fresh_flip]))
 
     runs = []
 
@@ -878,20 +927,21 @@ def test_end_to_end_with_real_helper(monkeypatch, isolation, helper_env):
         return 0
 
     monkeypatch.setattr(elevate_launch, "launch_elevated", launcher)
-    rec = run_sync([i_user, i_admin, i_foreign, i_gone], use_quarantine=False)
+    rec = run_sync([i_user, i_admin, i_foreign, i_gone, i_flip], use_quarantine=False)
     s = rec.summary
     assert runs == [0]
     assert not user_file.exists()          # user part, in-process
     assert not admin_file.exists()         # admin part, by the helper
-    assert foreign_file.exists()           # refused by the helper
+    assert foreign_file.exists()           # refused up front (not allowlisted)
+    assert flip_file.exists()              # refused after the fresh scan
     assert s.admin.status == "done"
     r = s.admin.result
-    assert (r.removed, r.freed, r.refused, r.unmatched) == (1, 10, 1, 1)
+    assert (r.removed, r.freed, r.refused, r.unmatched) == (1, 10, 2, 1)
     assert s.user_removed == 1 and s.removed == 2 and s.freed == 20
-    assert s.admin_selected == 3
+    assert s.admin_selected == 4
     lines = elevation.admin_outcome_lines(s)
     assert lines[0] == f"Administrator items: removed 1, freed {utils.human_size(10)}"
-    assert ("2 administrator items were not cleaned because the helper did not "
+    assert ("3 administrator items were not cleaned because the helper did not "
             "consider them eligible; scan again") in lines
     # history: the user part (service.clean) and one in-process admin entry
     assert (10, 1, "delete") in isolation.history

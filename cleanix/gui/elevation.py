@@ -221,11 +221,13 @@ def run_elevated_part(admin_items: Sequence[CleanableItem], config=None, *,
                 # The helper's own error codes: it may have written a (partial)
                 # result for this run; some items may already be gone.
                 result, _problem = _read_matching_result(result_path, selection.nonce)
-            return ElevatedOutcome(
-                FAILED,
-                "Administrator cleaning failed; some administrator items may "
-                "already have been removed. Scan again to see what is left.",
-                result=result, detail=detail)
+            if result is not None and result.removed == 0:
+                message = ("Administrator cleaning failed; no administrator items "
+                           "were removed.")
+            else:
+                message = ("Administrator cleaning failed; some administrator items "
+                           "may already have been removed. Scan again to see what is left.")
+            return ElevatedOutcome(FAILED, message, result=result, detail=detail)
         if rc != 0:
             return ElevatedOutcome(
                 FAILED, "Administrator cleaning failed. Scan again to see what is left.",
