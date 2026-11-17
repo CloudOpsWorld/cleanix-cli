@@ -18,6 +18,9 @@ BadgeRole = Qt.ItemDataRole.UserRole + 3
 
 COLUMNS = ["", "Cleaner", "Description", "Size", "Admin", "Type"]
 
+# Tooltip for the short "Admin" badge and column text.
+ADMIN_TOOLTIP = "Needs administrator permission"
+
 
 def badge_for(info: catalog.CleanerInfo) -> str:
     badges = []
@@ -58,7 +61,11 @@ class CleanerListModel(QAbstractListModel):
             return info.name
         if role == IdRole:
             return info.id
-        if role in (DescriptionRole, Qt.ItemDataRole.ToolTipRole):
+        if role == DescriptionRole:
+            return info.description
+        if role == Qt.ItemDataRole.ToolTipRole:
+            if info.requires_root:
+                return f"{info.description}\n{ADMIN_TOOLTIP}"
             return info.description
         if role == BadgeRole:
             return badge_for(info)
@@ -212,6 +219,8 @@ class ItemTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.ToolTipRole:
             if col == 0:
                 return None
+            if col == 4:
+                return ADMIN_TOOLTIP if item.requires_root else None
             if col == 2:
                 return f"{item.description}\n{_target_text(item)}"
             return self._text(item, col) if col != 3 else human_size(item.size)

@@ -444,7 +444,10 @@ class PowerView(QWidget):
                     if it.requires_root and item_key(it) in sent:
                         m.set_checked(r, False)
             self._on_current_changed(self.table.currentIndex())
-        self.show_results(summary, "\n".join([text] + admin_lines))
+        if not self._shutting_down:
+            # No modal dialog from a window that is closing (it may be hidden
+            # while an administrator step finishes).
+            self.show_results(summary, "\n".join([text] + admin_lines))
         self.clean_finished.emit(summary)
 
     def show_results(self, summary, text: str) -> None:

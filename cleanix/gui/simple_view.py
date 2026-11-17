@@ -265,6 +265,10 @@ class SimpleView(QWidget):
     # items about to be cleaned. The view starts the clean itself.
     request_clean = Signal(list)
     scanned = Signal(object)
+    # Emitted after a clean produced a summary (also a partial, cancelled one).
+    clean_finished = Signal(object)
+    # Emitted after Undo restored (part of) a quarantine run.
+    undone = Signal()
 
     def __init__(self, config: Config, *, scan_worker_factory: Optional[Callable] = None,
                  clean_worker_factory: Optional[Callable] = None,
@@ -284,6 +288,7 @@ class SimpleView(QWidget):
         self._state = SimpleState.IDLE
         self._worker = None
         self._cancel_requested = False
+        self._shutting_down = False
         self._cards: List[CategoryCard] = []
         self._last_summary = None
 
@@ -428,7 +433,7 @@ class SimpleView(QWidget):
     # ---- scan ----------------------------------------------------------
     @Slot()
     def start_scan(self) -> None:
-        if self._worker is not None:
+        if self._worker is not None or self._shutting_down:
             return
         self.error_label.setText("")
         self._clear_cards()
@@ -487,6 +492,13 @@ class SimpleView(QWidget):
             self._worker.cancel()
         except RuntimeError:
             pass
+
+    def shutdown(self) -> None:
+        """Cancel any running worker and refuse new work; safe to call repeatedly."""
+        already = self._shutting_down
+        self._shutting_down = True
+        if not already:
+            self.cancel()
 
     # ---- results -------------------------------------------------------
     def set_scan_result(self, result: ScanResult) -> None:
@@ -585,6 +597,8 @@ class SimpleView(QWidget):
         self._start_clean(items, keep_copy)
 
     def _start_clean(self, items: List[CleanableItem], keep_copy: bool) -> None:
+        if self._worker is not None or self._shutting_down:
+            return
         self._cancel_requested = False
         self._kept_copy = keep_copy
         self._all_irreversible = all(i.kind is not ItemKind.PATH or i.requires_root
@@ -645,6 +659,7 @@ class SimpleView(QWidget):
             self.undo_label.setText("Undo is unavailable: nothing was kept.")
         self.undo_button.setEnabled(bool(summary.quarantine_run))
         self._set_state(SimpleState.DONE)
+        self.clean_finished.emit(summary)
 
     @Slot()
     def _on_clean_cancelled(self) -> None:
@@ -693,3 +708,4 @@ class SimpleView(QWidget):
             text += f" {failed} could not be restored."
         self.undo_label.setText(text)
         self.undo_button.setEnabled(False)
+        self.undone.emit()

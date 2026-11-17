@@ -559,3 +559,39 @@ def test_readonly_card_shows_each_items_own_hint(qtbot):
     v.set_scan_result(result(item("big_files", 1, report_only=True, requires_root=True,
                                   hint="Delete manually")))
     assert v.cards()[0].hint_label.fullText() == "Delete manually"
+
+
+def test_clean_finished_and_undone_signals(qtbot, monkeypatch):
+    monkeypatch.setattr(quarantine, "restore", lambda run: {"restored": ["a"], "failed": []})
+    s = summary(run="run7")
+    v = make_view(qtbot, clean=FakeCleanWorker(outcome=s))
+    finished, undone = [], []
+    v.clean_finished.connect(finished.append)
+    v.undone.connect(lambda: undone.append(True))
+    v.set_scan_result(result(item("temp", 10)))
+    v.clean_button.click()
+    qtbot.waitUntil(lambda: v.state() is SimpleState.DONE, timeout=3000)
+    assert finished == [s]
+    v.undo_button.click()
+    assert undone == [True]
+
+
+def test_shutdown_cancels_running_worker_and_blocks_new_work(qtbot):
+    sw = FakeWorker(outcome=result(item("temp", 10)), block=True)
+    created = []
+
+    def scan_factory(cfg):
+        created.append(cfg)
+        return sw
+
+    v = SimpleView(Config(), scan_worker_factory=scan_factory,
+                   confirm=lambda info: (True, True))
+    qtbot.addWidget(v)
+    v.start_scan()
+    qtbot.waitUntil(sw.started.is_set, timeout=3000)
+    v.shutdown()
+    v.shutdown()  # idempotent
+    assert sw.cancel_flag.is_set()
+    qtbot.waitUntil(lambda: v.state() is SimpleState.IDLE, timeout=3000)
+    v.start_scan()
+    assert len(created) == 1 and v.state() is SimpleState.IDLE

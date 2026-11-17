@@ -181,14 +181,24 @@ class QuarantinePanel(QWidget):
             return
         if not self._confirm(f"Permanently delete run {run_id}? This cannot be undone."):
             return
-        freed, errors = self._do_purge(run_id)
+        try:
+            freed, errors = self._do_purge(run_id)
+        except OSError as exc:
+            self.status_label.setText(f"Delete failed: {exc}")
+            self.refresh()
+            return
         self._report_purge(freed, errors)
         self.refresh()
 
     def _on_empty_all(self) -> None:
         if not self._confirm("Permanently delete ALL quarantined runs? This cannot be undone."):
             return
-        freed, errors = self._do_purge_all()
+        try:
+            freed, errors = self._do_purge_all()
+        except OSError as exc:
+            self.status_label.setText(f"Delete failed: {exc}")
+            self.refresh()
+            return
         self._report_purge(freed, errors)
         self.refresh()
 

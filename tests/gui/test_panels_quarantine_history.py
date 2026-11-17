@@ -88,6 +88,23 @@ def test_delete_run_success_reports_bytes(qtbot, fake_q):
     assert "2.0 KiB reclaimed" in p.status_label.text()
 
 
+def test_delete_and_empty_os_errors_are_shown_not_raised(qtbot, fake_q, monkeypatch):
+    def boom(*a):
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(quarantine, "purge_detailed", boom)
+    monkeypatch.setattr(quarantine, "purge_all_detailed", boom)
+    p = _panel(qtbot)
+    p.table.selectRow(0)
+    p.delete_btn.click()  # must not raise into the event loop
+    assert p.status_label.text().startswith("Delete failed:")
+    assert "access denied" in p.status_label.text()
+    p.status_label.setText("")
+    p.empty_btn.click()
+    assert p.status_label.text().startswith("Delete failed:")
+    assert p.table.rowCount() == 2  # refreshed
+
+
 def test_empty_all_requires_confirmation(qtbot, fake_q):
     calls, _ = fake_q
     p = _panel(qtbot, confirm=lambda m: False)

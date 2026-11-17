@@ -11,7 +11,7 @@ from cleanix.core.registry import known_ids
 
 SUBCOMMANDS = [
     "list", "scan", "clean", "info", "stats", "restore", "quarantine",
-    "config", "schedule", "factory-reset", "completion",
+    "config", "schedule", "factory-reset", "completion", "gui",
 ]
 SCAN_CLEAN_OPTS = [
     "--only", "--exclude", "--json", "--output", "--quiet", "--summary",

@@ -17,7 +17,6 @@ from __future__ import annotations
 import threading
 from typing import Optional, Sequence
 
-import shiboken6
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from cleanix.config import Config
@@ -231,6 +230,14 @@ def start_worker(worker: QObject) -> QThread:
     thread.finished.connect(_release)
     thread.start()
     return thread
+
+
+def active_count() -> int:
+    """Number of started workers whose thread has not finished yet.
+
+    Call on the GUI thread (entries are released by ``thread.finished``).
+    """
+    return len(_active)
 
 
 def cancel_all_and_wait(timeout_ms: int = 5000) -> bool:

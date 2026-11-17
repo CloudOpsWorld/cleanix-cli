@@ -127,6 +127,36 @@ def test_cleaner_model_lists_supported_cleaners_with_badges(monkeypatch):
     assert "opt" in m.enabled_ids()
 
 
+def test_admin_badge_tooltips_say_administrator(view):
+    m = view.cleaner_model
+    assert "Needs administrator permission" in m.data(m.index(1), Qt.ItemDataRole.ToolTipRole)
+    assert m.data(m.index(0), Qt.ItemDataRole.ToolTipRole) == "Temp desc"
+    assert m.data(m.index(1), gm.DescriptionRole) == "APT desc"
+    _load(view)
+    t = view.item_model
+    rows = {t.item_at(r).description: r for r in range(t.rowCount())}
+    admin_row, user_row = rows["apt clean"], rows["small cache"]
+    assert t.data(t.index(admin_row, 4)) == "Admin"
+    assert t.data(t.index(admin_row, 4), Qt.ItemDataRole.ToolTipRole) == (
+        "Needs administrator permission")
+    assert t.data(t.index(user_row, 4), Qt.ItemDataRole.ToolTipRole) is None
+
+
+def test_no_results_dialog_once_shutting_down(view, monkeypatch):
+    from cleanix.core.models import CleanResult
+    from cleanix.core.service import CleanSummary
+
+    shown, finished = [], []
+    monkeypatch.setattr(pv.PowerView, "show_results", lambda *a, **k: shown.append(a))
+    view.clean_finished.connect(finished.append)
+    s = CleanSummary(result=CleanResult(dry_run=True), freed=0, removed=0)
+    view._on_clean_finished(s)
+    assert len(shown) == 1
+    view.shutdown()
+    view._on_clean_finished(s)
+    assert len(shown) == 1 and finished == [s, s]
+
+
 def test_real_catalog_populates_model():
     m = gm.CleanerListModel(Config())
     assert m.rowCount() > 0
