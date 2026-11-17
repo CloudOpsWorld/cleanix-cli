@@ -316,8 +316,9 @@ AppImage) are coming in a later release (Plan 2B); for now install with pip.
 **Simple mode** (the default) is Scan, review, Clean, Undo. Results are
 grouped into category cards. Only files from reviewed-safe cleaners that your
 normal user can delete are pre-selected. Everything else sits unticked in the
-collapsed "Also found" section: Trash / Recycle Bin and system files can be
-ticked there; report-only findings, unreviewed cleaners and the other
+collapsed "Also found" section: Trash / Recycle Bin and (when administrator
+permission is available, see below) system files can be ticked there;
+report-only findings, unreviewed cleaners and the other
 categories are shown for review only. Nothing that
 needs administrator permission, nothing irreversible and no personal data is
 ever pre-selected. Before cleaning, a confirmation shows the count and size and
@@ -383,6 +384,10 @@ Known residuals, accepted for now (details in `cleanix/elevated.py`):
 - **Windows: the result file is written by path**, as administrator, into the
   requesting user's directory; a junction swap after validation could redirect
   that write. Handle-based writing is future work.
+- **Windows: `Windows\Temp` is cleaned only partly.** In elevated runs,
+  `win_system_temp` removes plain files there; directories (user-creatable,
+  swappable for junctions mid-delete) are refused. Items under `ProgramData`
+  are always refused in elevated runs.
 - **macOS:** the administrator path has been reasoned about from the code and
   unit-tested with mocks, but not yet run on a real Mac.
 
