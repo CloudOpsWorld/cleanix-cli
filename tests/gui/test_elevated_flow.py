@@ -345,7 +345,8 @@ def test_unavailable_elevation_message(monkeypatch):
     s = run_sync([it("u"), it("r", root=True)]).summary
     assert s.admin.status == "unavailable"
     assert elevation.admin_outcome_lines(s)[0] == (
-        "Administrator cleaning is not available on this system")
+        "Administrator cleaning is not available on this system; "
+        "1 administrator items were not cleaned")
 
 
 def test_nonce_mismatch_rejected(monkeypatch, isolation):
@@ -720,7 +721,8 @@ def test_simple_confirm_counts_admin_items(qtbot, monkeypatch):
 @pytest.mark.parametrize("status, first", [
     ("done", "Administrator items: removed 1, freed "),
     ("declined", "Administrator permission was declined; 2 items were not cleaned"),
-    ("unavailable", "Administrator cleaning is not available on this system"),
+    ("unavailable", "Administrator cleaning is not available on this system; "
+                    "2 administrator items were not cleaned"),
     ("failed", "Administrator cleaning failed (see details)"),
     (None, "Stopped before the administrator step; 2 administrator items were not cleaned."),
 ])
@@ -907,14 +909,14 @@ def test_end_to_end_with_real_helper(monkeypatch, isolation, helper_env):
 
     def launcher(argv):
         argv = list(argv)
-        req, res = Path(_arg(argv, "--request")), Path(_arg(argv, "--result"))
-        uid = int(_arg(argv, "--uid")) if "--uid" in argv else None
-        config = _arg(argv, "--config") if "--config" in argv else None
+        # Through the helper's own argument parsing: strip interpreter/-I/-m.
+        helper_args = argv[argv.index("cleanix.elevated") + 1:]
+        assert argv[1:3] == ["-I", "-m"]
         saved_env = dict(os.environ)
         real_is_root = engine.is_root
         engine.is_root = lambda: True  # only while the "elevated" helper runs
         try:
-            rc = elevated.run(req, res, config, expected_uid=uid)
+            rc = elevated.main(helper_args)
         finally:
             engine.is_root = real_is_root
             os.environ.clear()
@@ -951,3 +953,224 @@ def test_end_to_end_with_real_helper(monkeypatch, isolation, helper_env):
     # the helper wrote nothing under the user's home except the GUI's own
     # (user part) manifest
     assert not quarantine.quarantine_root().exists()
+
+
+# --------------------------------------------------------------------------
+# fix round 1: cancel around the elevated step, exit codes, Power unchecking
+# --------------------------------------------------------------------------
+def test_cancel_between_write_request_and_launch_skips_launcher(monkeypatch, isolation):
+    fake_clean(monkeypatch)
+    launcher = FakeLauncher(monkeypatch, succeed(removed=1, freed=1))
+    holder = {}
+    real_write = elevate.write_request
+
+    def write_then_cancel(directory, selection):
+        path = real_write(directory, selection)
+        holder["w"].cancel()  # Cancel lands after the request was written
+        return path
+
+    monkeypatch.setattr(elevate, "write_request", write_then_cancel)
+    w = workers.ElevatedCleanWorker([it("u"), it("r1", root=True), it("r2", root=True)],
+                                    Config(), dry_run=False, use_quarantine=True)
+    holder["w"] = w
+    rec = Recorder(w)
+    w.run()
+    s = rec.summary
+    assert launcher.calls == []
+    assert s.admin is None and s.cancelled and s.admin_selected == 2
+    assert not s.late_cancel
+    assert len(isolation.made) == 1 and not isolation.made[0].exists()
+    assert elevation.admin_outcome_lines(s)[0].startswith(
+        "Stopped before the administrator step; 2 administrator items")
+    assert isolation.history == []
+
+
+def test_run_elevated_part_cancel_checked_right_before_launch(monkeypatch, isolation):
+    launcher = FakeLauncher(monkeypatch, succeed())
+    assert elevation.run_elevated_part([it("r", root=True)], Config(),
+                                       cancel=lambda: True) is None
+    assert launcher.calls == [] and not isolation.made[0].exists()
+    out = elevation.run_elevated_part([it("r", root=True)], Config(), cancel=lambda: False)
+    assert out.status == "done" and out.launched and len(launcher.calls) == 1
+
+
+def test_late_cancel_is_reported_not_hidden(monkeypatch, isolation):
+    fake_clean(monkeypatch, summary=user_summary(freed=100, removed=1))
+    holder = {}
+
+    def action(argv, sel):
+        holder["w"].cancel()  # user clicks Cancel while the helper runs
+        write_result(argv, sel.nonce, removed=3, freed=30)
+        return 0
+
+    launcher = FakeLauncher(monkeypatch, action)
+    w = workers.ElevatedCleanWorker([it("u")] + [it(f"r{i}", root=True) for i in range(3)],
+                                    Config(), dry_run=False, use_quarantine=True)
+    holder["w"] = w
+    progress = []
+    w.progress.connect(lambda n, d, t: progress.append(n))
+    rec = Recorder(w)
+    w.run()
+    s = rec.summary
+    assert len(launcher.calls) == 1
+    assert progress[-1] == elevation.ADMIN_WAIT_MESSAGE
+    assert "it cannot be stopped from here" in elevation.ADMIN_WAIT_MESSAGE
+    assert s.admin.status == "done" and s.admin.result.removed == 3
+    assert s.late_cancel is True
+    assert s.cancelled is False  # nothing was stopped early
+    assert s.freed == 130 and s.removed == 4
+    lines = elevation.admin_outcome_lines(s)
+    assert lines[0].startswith("Administrator items: removed 3")
+    assert ("Cancel arrived after administrator permission was given; that step "
+            "could not be stopped.") in lines
+    assert isolation.history == [(30, 3, "delete")]
+
+
+def test_cancel_during_declined_prompt_is_not_a_late_cancel(monkeypatch):
+    fake_clean(monkeypatch)
+    holder = {}
+
+    def action(argv, sel):
+        holder["w"].cancel()
+        raise elevate_launch.ElevationDeclined()
+
+    FakeLauncher(monkeypatch, action)
+    w = workers.ElevatedCleanWorker([it("r", root=True)], Config(), dry_run=False,
+                                    use_quarantine=True)
+    holder["w"] = w
+    rec = Recorder(w)
+    w.run()
+    assert rec.summary.admin.status == "declined" and not rec.summary.late_cancel
+
+
+@pytest.mark.parametrize("code, reads", [(1, True), (2, True), (3, True),
+                                         (5, False), (127, False), (126, False)])
+def test_result_read_only_for_helper_exit_codes(monkeypatch, code, reads):
+    calls = []
+    real_read = elevate.read_result
+    monkeypatch.setattr(elevate, "read_result", lambda p: calls.append(p) or real_read(p))
+
+    def action(argv, sel):
+        write_result(argv, sel.nonce, removed=2, freed=20)
+        raise elevate_launch.ElevationFailed("x", exit_code=code)
+
+    FakeLauncher(monkeypatch, action)
+    out = elevation.run_elevated_part([it("r", root=True)], Config())
+    assert out.status == "failed"
+    assert bool(calls) is reads
+    assert (out.result is not None) is reads
+
+
+class ProgressThenFinish(QObject):
+    """Emits the admin wait message, records the view's Cancel state, finishes."""
+
+    progress = Signal(str, int, int)
+    finished = Signal(object)
+    cancelled = Signal()
+    failed = Signal(str)
+
+    def __init__(self, outcome, probe):
+        super().__init__()
+        self.outcome = outcome
+        self.probe = probe
+        self.states = []
+
+    def cancel(self):
+        pass
+
+    @Slot()
+    def run(self):
+        self.states.append(("before", self.probe()))
+        self.progress.emit(elevation.ADMIN_WAIT_MESSAGE, 0, 0)
+        self.states.append(("waiting", self.probe()))
+        self.finished.emit(self.outcome)
+
+
+def _late_summary():
+    s = combined("done", admin_selected=1, result=elevate.HelperResult(
+        freed=50, removed=1, errors=[], unmatched=0))
+    s.late_cancel = True
+    return s
+
+
+def test_simple_cancel_disabled_while_waiting_for_admin_and_late_cancel_shown(
+        qtbot, monkeypatch):
+    monkeypatch.setattr(workers, "start_worker", lambda w: w.run())
+    holder = {}
+
+    def factory(items, cfg, **k):
+        w = ProgressThenFinish(_late_summary(),
+                               lambda: holder["v"].cancel_clean_button.isEnabled())
+        holder["w"] = w
+        return w
+
+    v = SimpleView(Config(), clean_worker_factory=factory,
+                   confirm=lambda info: (True, True), allow_admin_items=True)
+    holder["v"] = v
+    qtbot.addWidget(v)
+    v.set_scan_result(_admin_scan())
+    next(c for c in v.cards() if c.category == "system").checkbox.setChecked(True)
+    v._on_clean_clicked()
+    assert holder["w"].states == [("before", True), ("waiting", False)]
+    assert v.state() is SimpleState.DONE
+    assert elevation.LATE_CANCEL_LINE in v.admin_label.text()
+    # the next clean starts with an enabled Cancel button again
+    v.set_scan_result(_admin_scan())
+    v._on_clean_clicked()
+    assert holder["w"].states[0] == ("before", True)
+
+
+def test_power_cancel_disabled_while_waiting_for_admin_and_late_cancel_shown(
+        qtbot, monkeypatch):
+    monkeypatch.setattr(workers, "start_worker", lambda w: w.run())
+    shown = []
+    monkeypatch.setattr(pv.PowerView, "show_results",
+                        lambda self, summary, text: shown.append(text))
+    monkeypatch.setattr(pv.PowerView, "confirm_clean", lambda self, text: True)
+    holder = {}
+
+    def factory(items, *, dry_run, use_quarantine):
+        w = ProgressThenFinish(_late_summary(), lambda: holder["v"].cancel_button.isEnabled())
+        holder["w"] = w
+        return w
+
+    v = pv.PowerView(Config(), allow_admin_items=True, clean_worker_factory=factory)
+    holder["v"] = v
+    qtbot.addWidget(v)
+    v._on_scan_finished(_admin_scan())
+    m = v.item_model
+    row = next(r for r in range(m.rowCount()) if m.item_at(r).requires_root)
+    m.set_checked(row, True)
+    v.dry_run_check.setChecked(False)
+    v.clean_button.click()
+    assert holder["w"].states == [("before", True), ("waiting", False)]
+    assert elevation.LATE_CANCEL_LINE in v.status_label.text()
+    assert elevation.LATE_CANCEL_LINE in shown[0]
+    assert not v.cancel_button.isEnabled()  # idle again
+
+
+def test_power_unchecks_only_admin_rows_sent_in_this_clean(qtbot, monkeypatch):
+    monkeypatch.setattr(workers, "start_worker", lambda w: w.run())
+    monkeypatch.setattr(pv.PowerView, "show_results", lambda *a, **k: None)
+    monkeypatch.setattr(pv.PowerView, "confirm_clean", lambda self, text: True)
+    sent = []
+
+    def factory(items, *, dry_run, use_quarantine):
+        sent.append(list(items))
+        return FakeCleanWorker(combined("declined", admin_selected=len(items)))
+
+    scan = ScanResult(reports=[CleanerReport("logs", "Logs", "", items=[
+        CleanableItem("logs", "alpha log", size=5, path="/var/log/a", requires_root=True),
+        CleanableItem("logs", "beta log", size=6, path="/var/log/b", requires_root=True),
+    ])])
+    v = pv.PowerView(Config(), allow_admin_items=True, clean_worker_factory=factory)
+    qtbot.addWidget(v)
+    v._on_scan_finished(scan)
+    m = v.item_model
+    for r in range(m.rowCount()):
+        assert m.set_checked(r, True)
+    v.filter_edit.setText("alpha")  # beta is checked but hidden: not sent
+    v.dry_run_check.setChecked(False)
+    v.clean_button.click()
+    assert [i.description for i in sent[0]] == ["alpha log"]
+    assert [i.description for i in m.checked_items()] == ["beta log"]

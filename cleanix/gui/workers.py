@@ -177,12 +177,19 @@ class ElevatedCleanWorker(_BaseWorker):
             return
 
         admin = None
+        late_cancel = False
         stopped = bool(getattr(user, "cancelled", False)) or self._cancel.is_set()
         if admin_items and not stopped:
-            self.progress.emit("Waiting for administrator permission...", 0, 0)
+            # Views disable Cancel on this exact text: once launched, the
+            # prompt/helper cannot be stopped from here.
+            self.progress.emit(elevation.ADMIN_WAIT_MESSAGE, 0, 0)
             admin = elevation.run_elevated_part(
-                admin_items, self._config, use_quarantine=False, launcher=self._launcher)
+                admin_items, self._config, use_quarantine=False, launcher=self._launcher,
+                cancel=self._cancel.is_set)
             elevation.record_admin_history(admin)
+            late_cancel = bool(
+                admin is not None and admin.launched and self._cancel.is_set()
+                and admin.status not in (elevation.DECLINED, elevation.UNAVAILABLE))
         res = admin.result if admin is not None else None
         combined = elevation.CombinedSummary(
             result=user.result,
@@ -197,6 +204,7 @@ class ElevatedCleanWorker(_BaseWorker):
             admin_selected=len(admin_items),
             user_freed=user.freed,
             user_removed=user.removed,
+            late_cancel=late_cancel,
         )
         self._emit(self.finished, combined)
 

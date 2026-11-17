@@ -101,6 +101,7 @@ class PowerView(QWidget):
         self._worker = None
         self._shutting_down = False
         self._removed_keys: set = set()
+        self._sent_admin_keys: set = set()
 
         self.tabs = QTabWidget()
         self.scan_tab = QWidget()
@@ -320,6 +321,9 @@ class PowerView(QWidget):
         self._run(worker)
 
     def _on_progress(self, name: str, done: int, total: int) -> None:
+        if name == elevation.ADMIN_WAIT_MESSAGE:
+            # The elevated step cannot be stopped from here.
+            self.cancel_button.setEnabled(False)
         self.status_label.setText(f"{name} ({done}/{total})" if total else name)
 
     def _on_scan_finished(self, result) -> None:
@@ -398,6 +402,8 @@ class PowerView(QWidget):
             if not self.confirm_clean(text):
                 return
         self.status_label.setText("Dry run..." if dry_run else "Cleaning...")
+        # Administrator items actually sent in this clean (see _on_clean_finished).
+        self._sent_admin_keys = {item_key(i) for i in items if i.requires_root}
         worker = self._clean_factory(items, dry_run=dry_run, use_quarantine=keep)
         worker.finished.connect(self._on_clean_finished)
         worker.cancelled.connect(self._on_cancelled)
@@ -418,18 +424,24 @@ class PowerView(QWidget):
         # Administrator rows stay in the table: the helper only returns
         # counts, so they cannot be matched to outcomes; the text says to
         # scan again.
-        self.status_label.setText(f"{text}. {admin_lines[0]}" if admin_lines else text)
+        status = f"{text}. {admin_lines[0]}" if admin_lines else text
+        if getattr(summary, "late_cancel", False):
+            status += " " + elevation.LATE_CANCEL_LINE
+        self.status_label.setText(status)
         if not dry:
             # Done rows leave the table; a rescan is needed for fresh state.
             done = {item_key(o.item) for o in summary.result.outcomes if o.removed}
             self.item_model.remove_keys(done)
             self._removed_keys |= done
-            if getattr(summary, "admin_selected", 0):
-                # Admin rows stay (unknown per-item outcome) but are unchecked
-                # so a second click never re-prompts for the same items.
+            sent = self._sent_admin_keys
+            if getattr(summary, "admin_selected", 0) and sent:
+                # Admin rows stay (unknown per-item outcome) but the ones sent
+                # in this clean are unchecked so a second click never
+                # re-prompts for them; other (e.g. hidden) rows are untouched.
                 m = self.item_model
                 for r in range(m.rowCount()):
-                    if m.item_at(r).requires_root:
+                    it = m.item_at(r)
+                    if it.requires_root and item_key(it) in sent:
                         m.set_checked(r, False)
             self._on_current_changed(self.table.currentIndex())
         self.show_results(summary, "\n".join([text] + admin_lines))

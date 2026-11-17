@@ -46,8 +46,6 @@ DECLINED = "declined"
 UNAVAILABLE = "unavailable"
 FAILED = "failed"
 
-_OSASCRIPT = "/usr/bin/osascript"
-
 
 @dataclass
 class ElevatedOutcome:
@@ -67,6 +65,8 @@ class ElevatedOutcome:
     result: Optional[elevate.HelperResult] = None
     detail: str = ""
     outcome_unknown: bool = False
+    # True once the launcher (prompt + helper) was actually called.
+    launched: bool = False
 
 
 @dataclass
@@ -80,12 +80,25 @@ class CombinedSummary(service.CleanSummary):
     when there were no administrator items or the run was cancelled before
     the administrator step (then ``cancelled`` is True and
     ``admin_selected`` > 0).
+
+    ``late_cancel`` is True when Cancel was requested after the administrator
+    prompt/helper had been launched: that step cannot be stopped, so it ran
+    to completion (``cancelled`` stays False because nothing stopped early).
     """
 
     admin: Optional[ElevatedOutcome] = None
     admin_selected: int = 0
     user_freed: int = 0
     user_removed: int = 0
+    late_cancel: bool = False
+
+
+# Progress text the worker emits right before the (unstoppable) elevated
+# step. Views compare ``progress`` names against it and disable Cancel.
+ADMIN_WAIT_MESSAGE = ("Waiting for administrator permission... (it cannot be stopped "
+                      "from here: decline the prompt to skip administrator items)")
+LATE_CANCEL_LINE = ("Cancel arrived after administrator permission was given; "
+                    "that step could not be stopped.")
 
 
 # --------------------------------------------------------------------------
@@ -100,7 +113,7 @@ def elevation_available() -> bool:
         if osname == LINUX:
             return bool(utils.safe_which("pkexec"))
         if osname == MACOS:
-            return os.path.exists(_OSASCRIPT)
+            return os.path.exists(elevate_launch._OSASCRIPT)
     except Exception:  # noqa: BLE001 - availability probe only
         return False
     return False
@@ -171,7 +184,9 @@ def _read_matching_result(result_path, nonce: str) -> Tuple[Optional[elevate.Hel
 def run_elevated_part(admin_items: Sequence[CleanableItem], config=None, *,
                       use_quarantine: bool = False,
                       launcher: Optional[Callable[[List[str]], int]] = None,
-                      config_path: Optional[str] = None) -> ElevatedOutcome:
+                      config_path: Optional[str] = None,
+                      cancel: Optional[Callable[[], bool]] = None,
+                      ) -> Optional[ElevatedOutcome]:
     """Clean ``admin_items`` through the elevated helper (one prompt).
 
     ``use_quarantine`` is accepted for interface symmetry and ignored: the
@@ -179,6 +194,11 @@ def run_elevated_part(admin_items: Sequence[CleanableItem], config=None, *,
     Blocks while the prompt is open and the helper runs: call it off the GUI
     thread. Never raises (except BaseException such as KeyboardInterrupt);
     the request directory is always removed.
+
+    ``cancel`` is checked immediately before the launcher is called (after
+    the request was written): if it is set, the launcher is never called and
+    None is returned ("stopped before the administrator step"). Once the
+    launcher runs, nothing here can stop it.
     """
     del use_quarantine, config  # the helper loads its own default config
     admin_items = list(admin_items)
@@ -197,47 +217,11 @@ def run_elevated_part(admin_items: Sequence[CleanableItem], config=None, *,
         elevate.write_request(request_dir, selection)
         argv = elevate_launch.elevated_command(
             request_path, result_path, config_path or _config_path())
-        try:
-            rc = run(argv)
-        except elevate_launch.ElevationDeclined:
-            return ElevatedOutcome(
-                DECLINED, f"Administrator permission was declined; {n} items were not cleaned")
-        except elevate_launch.ElevationUnavailable as exc:
-            return ElevatedOutcome(
-                UNAVAILABLE, "Administrator cleaning is not available on this system",
-                detail=str(exc))
-        except elevate_launch.ElevationFailed as exc:
-            code = getattr(exc, "exit_code", None)
-            if code is None and _is_timeout(exc):
-                # Never trust or read a result file after a timeout.
-                return ElevatedOutcome(
-                    FAILED,
-                    "The administrator helper timed out: the outcome is unknown and "
-                    "the helper may still be running. Scan again later to see what is left.",
-                    detail=str(exc), outcome_unknown=True)
-            detail = str(exc) + (f" (exit code {code})" if code is not None else "")
-            result = None
-            if code in (1, 2, 3):
-                # The helper's own error codes: it may have written a (partial)
-                # result for this run; some items may already be gone.
-                result, _problem = _read_matching_result(result_path, selection.nonce)
-            if result is not None and result.removed == 0:
-                message = ("Administrator cleaning failed; no administrator items "
-                           "were removed.")
-            else:
-                message = ("Administrator cleaning failed; some administrator items "
-                           "may already have been removed. Scan again to see what is left.")
-            return ElevatedOutcome(FAILED, message, result=result, detail=detail)
-        if rc != 0:
-            return ElevatedOutcome(
-                FAILED, "Administrator cleaning failed. Scan again to see what is left.",
-                detail=f"launcher returned {rc!r}")
-        result, problem = _read_matching_result(result_path, selection.nonce)
-        if result is None:
-            return ElevatedOutcome(
-                FAILED, f"Administrator cleaning failed: {problem}. "
-                "Scan again to see what is left.", detail=problem)
-        return ElevatedOutcome(DONE, "Administrator items cleaned", result=result)
+        if cancel is not None and cancel():
+            return None
+        outcome = _launch(run, argv, n, result_path, selection.nonce)
+        outcome.launched = True
+        return outcome
     except Exception as exc:  # noqa: BLE001 - surfaced as a plain failure
         return ElevatedOutcome(
             FAILED, "Administrator cleaning failed. Scan again to see what is left.",
@@ -245,6 +229,56 @@ def run_elevated_part(admin_items: Sequence[CleanableItem], config=None, *,
     finally:
         if request_dir is not None:
             shutil.rmtree(request_dir, ignore_errors=True)
+
+
+# Exit codes of the helper itself that may come with a (partial) result.
+_HELPER_RESULT_CODES = (1, 2, 3)
+
+
+def _launch(run, argv, n: int, result_path, nonce: str) -> ElevatedOutcome:
+    """Call the launcher once and map its outcome (see run_elevated_part)."""
+    try:
+        rc = run(argv)
+    except elevate_launch.ElevationDeclined:
+        return ElevatedOutcome(
+            DECLINED, f"Administrator permission was declined; {n} items were not cleaned")
+    except elevate_launch.ElevationUnavailable as exc:
+        return ElevatedOutcome(
+            UNAVAILABLE, "Administrator cleaning is not available on this system; "
+            f"{n} administrator items were not cleaned",
+            detail=str(exc))
+    except elevate_launch.ElevationFailed as exc:
+        code = getattr(exc, "exit_code", None)
+        if code is None and _is_timeout(exc):
+            # Never trust or read a result file after a timeout.
+            return ElevatedOutcome(
+                FAILED,
+                "The administrator helper timed out: the outcome is unknown and "
+                "the helper may still be running. Scan again later to see what is left.",
+                detail=str(exc), outcome_unknown=True)
+        detail = str(exc) + (f" (exit code {code})" if code is not None else "")
+        result = None
+        if code in _HELPER_RESULT_CODES:
+            # The helper's own error codes: it may have written a (partial)
+            # result for this run; some items may already be gone.
+            result, _problem = _read_matching_result(result_path, nonce)
+        if result is not None and result.removed == 0:
+            message = ("Administrator cleaning failed; no administrator items "
+                       "were removed.")
+        else:
+            message = ("Administrator cleaning failed; some administrator items "
+                       "may already have been removed. Scan again to see what is left.")
+        return ElevatedOutcome(FAILED, message, result=result, detail=detail)
+    if rc != 0:
+        return ElevatedOutcome(
+            FAILED, "Administrator cleaning failed. Scan again to see what is left.",
+            detail=f"launcher returned {rc!r}")
+    result, problem = _read_matching_result(result_path, nonce)
+    if result is None:
+        return ElevatedOutcome(
+            FAILED, f"Administrator cleaning failed: {problem}. "
+            "Scan again to see what is left.", detail=problem)
+    return ElevatedOutcome(DONE, "Administrator items cleaned", result=result)
 
 
 def record_admin_history(outcome: Optional[ElevatedOutcome]) -> None:
@@ -285,9 +319,14 @@ def admin_outcome_lines(summary) -> List[str]:
         lines.append(f"Administrator permission was declined; {selected} items "
                      "were not cleaned")
     elif outcome.status == UNAVAILABLE:
-        lines.append("Administrator cleaning is not available on this system")
-    else:
+        lines.append("Administrator cleaning is not available on this system; "
+                     f"{selected} administrator items were not cleaned")
+    failed = not lines
+    if failed:
         lines.append("Administrator cleaning failed (see details)")
+    if getattr(summary, "late_cancel", False):
+        lines.append(LATE_CANCEL_LINE)
+    if failed:
         lines.append(outcome.message)
         if res is not None:
             lines.append(f"Before it stopped, the helper removed {res.removed} "

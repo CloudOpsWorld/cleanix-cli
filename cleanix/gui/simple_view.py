@@ -591,6 +591,7 @@ class SimpleView(QWidget):
                                      for i in items)
         self.clean_progress.setRange(0, 0)
         self.clean_status.setText("Cleaning...")
+        self.cancel_clean_button.setEnabled(True)
         worker = self._clean_factory(
             items, self._config, dry_run=False, use_quarantine=keep_copy)
         self._worker = worker
@@ -604,6 +605,12 @@ class SimpleView(QWidget):
     @Slot(str, int, int)
     def _on_clean_progress(self, name: str, done: int, total: int) -> None:
         if self._state is not SimpleState.CLEANING:
+            return
+        if name == elevation.ADMIN_WAIT_MESSAGE:
+            # The elevated step cannot be stopped from here: Cancel would lie.
+            self.cancel_clean_button.setEnabled(False)
+            self.clean_progress.setRange(0, 0)
+            self.clean_status.setText(name)
             return
         self.clean_progress.setRange(0, max(total, 1))
         self.clean_progress.setValue(done)
