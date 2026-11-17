@@ -68,6 +68,12 @@ Known residuals, accepted for now:
     per-user Python) is still user-writable code run as root. A root-owned
     install location plus a launcher check is future work (Plan 2B packaging).
 (c) POSIX ACLs are not inspected; only owner, group and mode bits are.
+(d) Windows: the result file is written by path, as administrator, into the
+    requesting user's directory; a junction swap after validation could
+    redirect that fixed-name file write. Handle-based writing is future work.
+(e) Windows: ``win_system_temp`` cleans only plain files under
+    ``Windows\\Temp`` in elevated runs; directories there (user-creatable,
+    swappable for junctions mid-delete) are refused.
 
 Exit codes (126/127 are never used: pkexec reserves them):
 0 completed (details in the result file), 1 request unreadable/refused
@@ -444,6 +450,23 @@ def _path_chain_problem(path: str, expected_uid: Optional[int],
         if programdata and _is_under(path, programdata):
             return ("it lies under ProgramData, where standard users can turn "
                     "folders into junctions")
+        system_root = os.environ.get("SystemRoot", "")  # API value (sanitised)
+        if system_root and _is_under(path, ntpath.join(system_root, "Temp")):
+            # Users can create (and later swap for junctions) directories in
+            # Windows\Temp; the recursive delete unlinks entries by path, so
+            # only plain files are cleaned there. Judged NOW, right before
+            # the delete, not at scan time.
+            try:
+                st = _lstat(path)
+            except OSError:
+                return f"{path} cannot be inspected"
+            import stat as _stat
+
+            if (_stat.S_ISDIR(st.st_mode) or not _stat.S_ISREG(st.st_mode)
+                    or getattr(st, "st_file_attributes", 0)
+                    & _FILE_ATTRIBUTE_REPARSE_POINT):
+                return ("directories under Windows\\Temp are not cleaned with "
+                        "administrator rights")
         for parent in Path(path).parents:
             try:
                 st = _lstat(parent)

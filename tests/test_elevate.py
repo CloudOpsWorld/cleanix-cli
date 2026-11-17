@@ -982,11 +982,35 @@ def test_windows_reparse_point_in_request_path_refused(env, monkeypatch):
     ia = _item(a)
     env.cleaners.append(FakeCleaner("logs", [ia]))
     req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
-    monkeypatch.setattr(safety, "is_reparse_point",
-                        lambda p: Path(p) == env.tmp)  # a parent is a junction
+    real_lstat = os.lstat
+
+    def lstat(p):
+        st = real_lstat(p)
+        if Path(p) == env.tmp:  # a parent is a junction
+            return SimpleNamespace(st_mode=st.st_mode, st_file_attributes=0x400)
+        return st
+
+    monkeypatch.setattr(elevate, "_lstat", lstat)
     rc = elevated.run(req, env.result, None, expected_uid=UID)
     assert rc == 1
     assert a.exists() and env.scans == []
+
+
+def test_request_dir_windows_check_fails_closed(env, monkeypatch):
+    """An unreadable component of the request path is a refusal (any host)."""
+    monkeypatch.setattr(elevate, "_POSIX", False)
+    real_lstat = os.lstat
+
+    def lstat(p):
+        if Path(p) == env.tmp:
+            raise PermissionError("access denied")
+        return real_lstat(p)
+
+    monkeypatch.setattr(elevate, "_lstat", lstat)
+    with pytest.raises(ValueError, match="cannot be inspected"):
+        elevate.RequestDir(env.reqdir, None)
+    monkeypatch.setattr(elevate, "_lstat", real_lstat)
+    elevate.RequestDir(env.reqdir, None)  # readable chain: accepted
 
 
 # --------------------------------------------------------------------------
@@ -1537,3 +1561,70 @@ def test_crash_report_cleaner_ignores_symlinked_base(env, monkeypatch):
     cleaner = linux_extras.CrashReportCleaner(Config())
     monkeypatch.setattr(cleaner, "BASES", (str(var / "crash"),))
     assert list(cleaner.find_items()) == []
+
+
+# --------------------------------------------------------------------------
+# round 4: Windows\Temp directories, fail-closed request directory
+# --------------------------------------------------------------------------
+_WIN_TEMP_MSG = "directories under Windows\\Temp are not cleaned with administrator rights"
+
+
+@windows_paths
+def test_windows_temp_directory_item_is_refused_file_item_cleaned(env, monkeypatch):
+    win, _pd = _force_windows(env, monkeypatch)
+    d = win / "Temp" / "olddir"
+    inner = _file(d, "inner.txt")
+    f = _file(win / "Temp", "old.tmp")
+    items = [_item(d), _item(f)]
+    env.cleaners.append(FakeCleaner("logs", items))
+    rc, _ = _run(env, _selection([item_key(i) for i in items]))
+    assert rc == 0
+    assert d.is_dir() and inner.exists()   # directory left intact
+    assert not f.exists()                  # plain file still cleaned
+    res = elevate.read_result(env.result)
+    assert res.removed == 1 and res.refused == 1
+    assert _WIN_TEMP_MSG in res.errors[0]
+
+
+@windows_paths
+def test_windows_temp_item_type_is_judged_at_clean_time(env, monkeypatch):
+    """A file at scan time, swapped for a directory before its turn: refused."""
+    win, _pd = _force_windows(env, monkeypatch)
+    first = _file(win / "Temp", "a_first.tmp")
+    swapped = _file(win / "Temp", "b_swapped.tmp")
+    items = [_item(first), _item(swapped)]
+    env.cleaners.append(FakeCleaner("logs", items))
+    real_rmtree = safety.safe_rmtree
+
+    def rmtree_then_swap(p):
+        real_rmtree(p)
+        if Path(p).name == "a_first.tmp":
+            swapped.unlink()
+            swapped.mkdir()
+            (swapped / "victim.txt").write_text("x")
+
+    monkeypatch.setattr(safety, "safe_rmtree", rmtree_then_swap)
+    rc, _ = _run(env, _selection([item_key(i) for i in items]))
+    assert rc == 0
+    assert not first.exists()
+    assert (swapped / "victim.txt").exists()
+    res = elevate.read_result(env.result)
+    assert res.removed == 1 and res.refused == 1 and _WIN_TEMP_MSG in res.errors[0]
+
+
+@windows_paths
+def test_windows_unreadable_request_dir_component_exits_1(env, monkeypatch):
+    a = _file(env.junk, "a.bin")
+    ia = _item(a)
+    env.cleaners.append(FakeCleaner("logs", [ia]))
+    req = elevate.write_request(env.reqdir, _selection([item_key(ia)]))
+    real_lstat = os.lstat
+
+    def lstat(p):
+        if Path(p) == env.tmp:
+            raise PermissionError("access denied")
+        return real_lstat(p)
+
+    monkeypatch.setattr(elevate, "_lstat", lstat)
+    rc = elevated.run(req, env.result, None, expected_uid=UID)
+    assert rc == 1 and a.exists() and env.scans == []

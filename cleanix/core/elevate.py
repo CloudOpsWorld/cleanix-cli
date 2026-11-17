@@ -44,6 +44,8 @@ _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _REQUEST_FIELDS = {"version", "invoking_user", "only", "keys", "use_quarantine", "nonce"}
 
 _POSIX = os.name != "nt"
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_lstat = os.lstat
 
 
 def new_nonce() -> str:
@@ -341,10 +343,13 @@ class RequestDir:
                 raise
             self.fd = fd
             return
-        from cleanix.core import safety
-
+        # Fail closed: a component that cannot be inspected is a refusal.
         for p in (self.path, *self.path.parents):
-            if safety.is_reparse_point(p):
+            try:
+                st = _lstat(str(p))
+            except OSError:
+                raise ValueError("request directory path cannot be inspected") from None
+            if getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
                 raise ValueError("request directory path contains a link or junction")
         if not self.path.is_dir():
             raise ValueError("request directory is not a directory")
