@@ -1,11 +1,13 @@
-.TH CLEANIX 1 "2026-07-16" "cleanix 1.2.0" "User Commands"
+.TH CLEANIX 1 "2026-11-17" "cleanix 1.4.0" "User Commands"
 .SH NAME
-cleanix \- safe, thorough cross-platform *nix system cleaner
+cleanix \- safe, thorough cross-platform system cleaner
 .SH SYNOPSIS
 .B cleanix
 [\fICOMMAND\fR] [\fIOPTIONS\fR]
 .SH DESCRIPTION
-cleanix analyzes and reclaims disk space across Linux, macOS and the BSDs. It scans read\-only, previews every removal, funnels all deletions through a protected\-path safety guard, and only deletes after confirmation. Report\-only findings are surfaced but never auto\-deleted.
+cleanix analyzes and reclaims disk space across Linux, macOS, the BSDs and Windows. It scans read\-only, previews every removal, funnels all deletions through a protected\-path safety guard, and only deletes after confirmation. Report\-only findings are surfaced but never auto\-deleted.
+.PP
+An optional desktop interface is started with \fBcleanix gui\fR (or \fBcleanix\-gui\fR). It needs the \fIgui\fR extra (\fBpip install "cleanix\-cli[gui]"\fR); without it, \fBcleanix gui\fR prints that hint and exits with status 1. Items that need administrator rights are removed by a separate helper after one operating\-system prompt (UAC, pkexec or the macOS password dialog), permanently.
 .SH COMMANDS
 .SS list
 list available cleaners
@@ -189,6 +191,11 @@ how much to reset (default: full)
 .TP
 .B \-\-execute
 run the reversible rollback (only on NixOS/rpm\-ostree/MicroOS/Guix; requires a typed confirmation)
+.SS gui
+launch the desktop GUI (requires the gui extra)
+.TP
+.B \-h, \-\-help
+show this help message and exit
 .SH FILES
 .TP
 .I ~/.config/cleanix/config.yaml

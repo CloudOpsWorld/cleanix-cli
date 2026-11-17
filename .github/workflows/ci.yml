@@ -63,7 +63,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libegl1 libxkbcommon0 libdbus-1-3 libxcb-cursor0 libgl1 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0
+          sudo apt-get install -y libegl1 libxkbcommon0 libdbus-1-3 libxcb-cursor0 libgl1 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libfontconfig1 libfreetype6
 
       - name: Install dependencies (with the GUI extra)
         run: |
@@ -71,7 +71,7 @@ jobs:
           pip install -e ".[gui-test]" pytest
 
       - name: Run GUI and elevation tests
-        run: pytest tests/gui tests/test_gui_isolation.py tests/test_elevate.py tests/test_elevate_launch.py tests/test_service.py tests/test_catalog.py -v
+        run: pytest tests/gui tests/test_gui_isolation.py tests/test_elevate.py tests/test_elevate_launch.py tests/test_service.py tests/test_catalog.py tests/test_admin_eligibility.py -v
 
   lint:
     name: Lint (advisory)

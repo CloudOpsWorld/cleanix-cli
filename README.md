@@ -316,9 +316,13 @@ AppImage) are coming in a later release (Plan 2B); for now install with pip.
 **Simple mode** (the default) is Scan, review, Clean, Undo. Results are
 grouped into category cards. Only files from reviewed-safe cleaners that your
 normal user can delete are pre-selected. Everything else sits unticked in the
-collapsed "Also found" section: Trash / Recycle Bin and (when administrator
-permission is available, see below) system files can be ticked there;
-report-only findings, unreviewed cleaners and the other
+collapsed "Also found" section. Trash / Recycle Bin and the "System" card can
+be ticked there: system items that do not need administrator rights
+(Docker/Podman/nerdctl prune, Flatpak, `nix` garbage collection, Homebrew)
+are always tickable; system items that do need them are tickable only when
+administrator cleaning is available (see below) and the administrator helper
+would actually clean them, otherwise they are shown read-only with the
+reason. Report-only findings, unreviewed cleaners and the other
 categories are shown for review only. Nothing that
 needs administrator permission, nothing irreversible and no personal data is
 ever pre-selected. Before cleaning, a confirmation shows the count and size and
@@ -329,9 +333,12 @@ quarantine instead of deleted (they use disk space until you empty it).
 and every item in a sortable, filterable table with a detail pane, JSON export,
 and tabs for Quarantine (restore, delete a run, empty all), History, Schedule,
 Settings (every config key, including `protected_globs`) and Findings
-(report-only items, with Reveal in the file manager; never deleted). **Dry run
-is ticked by default**; untick it to clean for real. "Keep a copy (undo)" is
-also ticked by default.
+(report-only items, with Reveal in the file manager; never deleted). Settings
+saved there apply to the running GUI from the next scan or clean (no restart
+needed). **Dry run is ticked by default**; untick it to clean for real. A dry
+run never asks for administrator permission: items that need it are listed as
+a preview ("would be removed after one administrator prompt"). "Keep a copy
+(undo)" is also ticked by default.
 
 **What Undo covers.** Undo (Simple mode, or Restore in the Quarantine tab) only
 brings back *files* that were cleaned as your normal user with a copy kept.
@@ -342,7 +349,9 @@ These are always permanent and cannot be undone:
   containers;
 - anything cleaned with "keep a copy" unticked.
 
-**Administrator permission.** The GUI never runs as root. When you clean items
+**Administrator permission.** The GUI never runs as root: on Linux, macOS and
+the BSDs it refuses to start when run as root (`sudo cleanix gui`) and asks
+for administrator permission itself when needed. When you clean items
 that need administrator rights, you are asked once per clean, through the
 operating system's own prompt, and a separate helper (`python -m
 cleanix.elevated`) removes them:
@@ -356,10 +365,23 @@ cleanix.elevated`) removes them:
 The prompt itself does not list what will be removed; the GUI's confirmation is
 the place to check. The helper trusts only cleaner ids and item keys from the
 request, re-scans by itself and cleans only items it finds eligible. It runs
-only a narrow allowlist of system cleaners (plus `temp`), uses built-in default
-settings and ignores most of your config: only `protected_globs` is honoured,
-since it can only add protection. It never writes history or quarantine; the
-GUI records one history entry for its work.
+only a fixed list of system cleaners (see `admin_cleaner_ids` in
+`cleanix/elevated.py`): on Linux, macOS and the BSDs the default-enabled
+system cleaners that need root and support the machine (package-manager
+caches, old kernels, Snap, system logs and crash dumps, ...) plus `temp` for
+other users' entries; the opt-in memory/swap actions are never included. On
+Windows it is `win_system_temp`, `win_system_dumps`, `win_update_cache` and
+`win_component_store` (not `temp`). The GUI offers only administrator items
+the helper would clean; the rest are shown read-only with the reason. It uses
+built-in default settings and ignores most of your config: only
+`protected_globs` is honoured, since it can only add protection. It never
+writes history or quarantine; the GUI records one history entry for its work.
+
+Before offering administrator items the GUI checks once that the helper can
+start (`python -I -c "import cleanix.elevated"`). A `pip install --user` or a
+source-tree run fails that check: administrator items are then shown
+read-only with "Administrator cleaning is not available: the helper cannot be
+started from this installation"; install cleanix into the system or a venv.
 
 **Headless / SSH.** The GUI needs a desktop session; over SSH or on a server
 use the CLI. (The test suite runs the GUI headless with
