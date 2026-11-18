@@ -1,8 +1,10 @@
-"""Simple mode: Scan, review category cards, confirm, Clean, Undo.
+"""Simple mode: Scan, review curated groups, confirm, Clean, Undo.
 
-Only items that ``catalog.preselect`` accepts are pre-selected; everything
-else is shown read-only in a collapsed "Also found" section, except the
-``trash`` and ``system`` groups, which can be opted into by ticking them.
+Results are curated groups (``curation.build_groups``) shown in
+``GroupedResults`` trees. Only items that ``catalog.preselect`` accepts are
+pre-selected. Groups with Review safety go to a collapsed "Needs your
+review" section with nothing ticked; every other group that preselects
+nothing sits unticked in a collapsed "Also found (not selected)" section.
 
 Worker signals are connected to bound methods of this (GUI-thread) widget so
 the handlers run on the GUI thread. The ``QThread`` returned by
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QRect, QSize, Qt, Signal, Slot
@@ -20,12 +23,10 @@ from PySide6.QtGui import QFontMetrics, QPainter
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QProgressBar,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QStackedWidget,
     QToolButton,
@@ -34,13 +35,22 @@ from PySide6.QtWidgets import (
 )
 
 from cleanix.config import Config
-from cleanix.core import catalog, quarantine
+from cleanix.core import catalog, curation, quarantine
 from cleanix.core.models import CleanableItem, ItemKind, ScanResult
 from cleanix.core.utils import human_size
 from cleanix.gui import elevation, workers
+from cleanix.gui.grouped_results import GroupedResults
 
-# Category cards that are opt-in (shown under "Also found", unchecked).
-_OPT_IN = ("trash", "system")
+IDLE_HEADLINE = "Free up disk space"
+IDLE_REASSURANCE = ("Nothing is deleted until you review it. "
+                    "Most cleanups can be undone.")
+DEEP_SCAN_TEXT = "Deep scan (slower: duplicates, big files)"
+SLOW = getattr(catalog, "SLOW_SCAN_IDS", ("duplicates", "big_files", "downloads"))
+
+
+def _default_scan_factory(config: Config, deep: bool = False):
+    """Quick scans skip the slow cleaners; ``deep`` runs everything."""
+    return workers.ScanWorker(config, exclude=None if deep else list(SLOW))
 
 
 class SimpleState(Enum):
@@ -116,75 +126,6 @@ class ElidedLabel(QLabel):
     def elidedText(self) -> str:
         return QFontMetrics(self.font()).elidedText(
             self._full, Qt.TextElideMode.ElideRight, max(self.contentsRect().width(), 1))
-
-
-class CategoryCard(QFrame):
-    """One category: label, item count, size and a checkbox.
-
-    ``mode``: ``"select"`` (pre-selected), ``"optin"`` (trash/system, unchecked,
-    enabled) or ``"readonly"`` (shown only, checkbox disabled and unchecked).
-    """
-
-    toggled = Signal()
-
-    def __init__(self, category: str, label: str, items: List[CleanableItem], *,
-                 mode: str = "select", checked: bool = False,
-                 admin_blocked: bool = False,
-                 problems: Optional[Dict[int, str]] = None,
-                 admin_blocked_reason: str = "",
-                 parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.category = category
-        self.mode = mode
-        self.items = list(items)
-        self.size = sum(i.size for i in self.items)
-        self.setFrameShape(QFrame.Shape.StyledPanel)
-
-        self.checkbox = QCheckBox()
-        self.checkbox.setChecked(checked and mode != "readonly")
-        self.checkbox.setEnabled(mode != "readonly")
-        self.label_widget = ElidedLabel(label)
-        self.count_label = QLabel(f"{len(self.items)} item{'s' if len(self.items) != 1 else ''}")
-        self.size_label = QLabel(human_size(self.size))
-        self.checkbox.setAccessibleName(f"{label}, {human_size(self.size)}")
-        self.checkbox.toggled.connect(self._on_toggled)
-
-        row = QHBoxLayout()
-        row.addWidget(self.checkbox)
-        row.addWidget(self.label_widget, 1)
-        row.addWidget(self.count_label)
-        row.addWidget(self.size_label)
-        outer = QVBoxLayout(self)
-        outer.addLayout(row)
-
-        self.hint_label: Optional[ElidedLabel] = None
-        if mode == "readonly":
-            # Each item contributes its own reason (distinct, in order).
-            reasons: List[str] = []
-            problems = problems or {}
-            for i in self.items:
-                if id(i) in problems:
-                    r = problems[id(i)]
-                elif i.requires_root and admin_blocked and not i.report_only:
-                    r = admin_blocked_reason or "Needs administrator permission"
-                else:
-                    r = i.hint or "Shown for review; not cleaned from Simple mode."
-                if r not in reasons:
-                    reasons.append(r)
-            text = "; ".join(reasons)
-            self.hint_label = ElidedLabel(text)
-            outer.addWidget(self.hint_label)
-
-    def _on_toggled(self, _checked: bool) -> None:
-        self.toggled.emit()
-
-    def is_checked(self) -> bool:
-        return self.checkbox.isChecked()
-
-    def selected_items(self) -> List[CleanableItem]:
-        if self.mode == "readonly" or not self.is_checked():
-            return []
-        return [i for i in self.items if not i.report_only]
 
 
 class ConfirmCleanDialog(QDialog):
@@ -299,16 +240,15 @@ class SimpleView(QWidget):
         self._admin_reason = admin_unavailable_reason
         self._kept_copy = True
         self._all_irreversible = False
-        # Factories mirror the worker constructors: scan(config) and
+        # Factories mirror the worker constructors: scan(config, deep=...) and
         # clean(items, config, dry_run=..., use_quarantine=...).
-        self._scan_factory = scan_worker_factory or workers.ScanWorker
+        self._scan_factory = scan_worker_factory or _default_scan_factory
         self._clean_factory = clean_worker_factory or workers.CleanWorker
         self._confirm = confirm or _default_confirm
         self._state = SimpleState.IDLE
         self._worker = None
         self._cancel_requested = False
         self._shutting_down = False
-        self._cards: List[CategoryCard] = []
         self._last_summary = None
 
         self._stack = QStackedWidget()
@@ -330,13 +270,28 @@ class SimpleView(QWidget):
 
     def _build_idle(self) -> None:
         self._idle_page, lay = self._page()
-        self.intro_label = QLabel("Find files Cleanix can safely remove.")
-        self.intro_label.setWordWrap(True)
+        self.headline_label = QLabel(IDLE_HEADLINE)
+        font = self.headline_label.font()
+        font.setPointSizeF(font.pointSizeF() * 1.8)
+        font.setBold(True)
+        self.headline_label.setFont(font)
+        self.headline_label.setWordWrap(True)
+        self.reassurance_label = QLabel(IDLE_REASSURANCE)
+        self.reassurance_label.setWordWrap(True)
         self.error_label = QLabel("")
         self.error_label.setWordWrap(True)
         self.scan_button = _button("Scan", "Scan for files to clean")
+        sfont = self.scan_button.font()
+        sfont.setPointSizeF(sfont.pointSizeF() * 1.3)
+        sfont.setBold(True)
+        self.scan_button.setFont(sfont)
+        self.scan_button.setMinimumHeight(48)
+        self.scan_button.setDefault(True)
         self.scan_button.clicked.connect(self.start_scan)
-        for w in (self.intro_label, self.error_label, self.scan_button):
+        self.deep_scan_check = QCheckBox(DEEP_SCAN_TEXT)
+        self.deep_scan_check.setChecked(False)
+        for w in (self.headline_label, self.reassurance_label, self.error_label,
+                  self.scan_button, self.deep_scan_check):
             lay.addWidget(w)
         lay.addStretch(1)
 
@@ -351,36 +306,59 @@ class SimpleView(QWidget):
             lay.addWidget(w)
         lay.addStretch(1)
 
+    def _section(self, title: str, tree: GroupedResults, min_height: int = 160):
+        toggle = QToolButton()
+        toggle.setText(title)
+        toggle.setCheckable(True)
+        toggle.setChecked(False)
+        toggle.setArrowType(Qt.ArrowType.RightArrow)
+        toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toggle.setAccessibleName(title)
+        container = QWidget()
+        box = QVBoxLayout(container)
+        box.setContentsMargins(0, 0, 0, 0)
+        tree.setMinimumHeight(min_height)
+        box.addWidget(tree)
+        container.setVisible(False)
+
+        def on_toggled(expanded: bool) -> None:
+            container.setVisible(expanded)
+            toggle.setArrowType(
+                Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+
+        toggle.toggled.connect(on_toggled)
+        return toggle, container
+
+    def _new_tree(self) -> GroupedResults:
+        tree = GroupedResults(
+            allow_admin_items=self._allow_admin, admin_reason=self._admin_reason,
+            home=str(Path.home()))
+        tree.selection_changed.connect(self._refresh_clean_button)
+        return tree
+
     def _build_results(self) -> None:
         self._results_page, lay = self._page()
         self.results_summary = QLabel("")
         self.results_summary.setWordWrap(True)
+        self.results_total_label = QLabel("")
+        tfont = self.results_total_label.font()
+        tfont.setPointSizeF(tfont.pointSizeF() * 1.4)
+        tfont.setBold(True)
+        self.results_total_label.setFont(tfont)
+        lay.addWidget(self.results_total_label)
         lay.addWidget(self.results_summary)
-        self._cards_host = QWidget()
-        self._cards_layout = QVBoxLayout(self._cards_host)
-        self._cards_layout.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self._cards_host)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        lay.addWidget(scroll, 1)
-        self._main_cards_layout = QVBoxLayout()
-        self._cards_layout.addLayout(self._main_cards_layout)
-        self.also_found_toggle = QToolButton()
-        self.also_found_toggle.setText("Also found (not selected)")
-        self.also_found_toggle.setCheckable(True)
-        self.also_found_toggle.setChecked(False)
-        self.also_found_toggle.setArrowType(Qt.ArrowType.RightArrow)
-        self.also_found_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.also_found_toggle.setAccessibleName("Also found (not selected)")
-        self.also_found_toggle.toggled.connect(self._on_also_found_toggled)
-        self.also_found_container = QWidget()
-        self._also_layout = QVBoxLayout(self.also_found_container)
-        self._also_layout.setContentsMargins(0, 0, 0, 0)
-        self.also_found_container.setVisible(False)
-        self._cards_layout.addWidget(self.also_found_toggle)
-        self._cards_layout.addWidget(self.also_found_container)
-        self._cards_layout.addStretch(1)
+        self.results_tree = self._new_tree()
+        self.also_tree = self._new_tree()
+        self.review_tree = self._new_tree()
+        self._trees = (self.results_tree, self.also_tree, self.review_tree)
+        lay.addWidget(self.results_tree, 1)
+        self.also_found_toggle, self.also_found_container = self._section(
+            "Also found (not selected)", self.also_tree)
+        self.review_toggle, self.review_container = self._section(
+            "Needs your review", self.review_tree)
+        for w in (self.review_toggle, self.review_container,
+                  self.also_found_toggle, self.also_found_container):
+            lay.addWidget(w)
         self.clean_button = _button("Nothing selected", "Clean selected items")
         self.clean_button.clicked.connect(self._on_clean_clicked)
         self.rescan_button = _button("Scan again")
@@ -449,13 +427,19 @@ class SimpleView(QWidget):
         }[state]
         self._stack.setCurrentWidget(page)
 
-    def _on_also_found_toggled(self, expanded: bool) -> None:
-        self.also_found_container.setVisible(expanded)
-        self.also_found_toggle.setArrowType(
-            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
-
     def also_found_expanded(self) -> bool:
         return self.also_found_toggle.isChecked()
+
+    def review_expanded(self) -> bool:
+        return self.review_toggle.isChecked()
+
+    def set_allow_admin_items(self, allow: bool, reason: str = "") -> None:
+        """Admin availability changed: trees and selection follow."""
+        self._allow_admin = bool(allow)
+        self._admin_reason = reason
+        for tree in self._trees:
+            tree.set_allow_admin_items(allow, reason)
+        self._refresh_clean_button()
 
     # ---- scan ----------------------------------------------------------
     @Slot()
@@ -463,11 +447,12 @@ class SimpleView(QWidget):
         if self._worker is not None or self._shutting_down:
             return
         self.error_label.setText("")
-        self._clear_cards()
+        self._clear_results()
         self.scan_progress.setRange(0, 0)
         self.scan_status.setText("Scanning...")
         self._cancel_requested = False
-        worker = self._scan_factory(self._config)
+        worker = self._scan_factory(
+            self._config, deep=self.deep_scan_check.isChecked())
         self._worker = worker
         worker.progress.connect(self._on_scan_progress)
         worker.finished.connect(self._on_scan_finished)
@@ -531,69 +516,47 @@ class SimpleView(QWidget):
     def set_scan_result(self, result: ScanResult) -> None:
         infos: Dict[str, catalog.CleanerInfo] = {
             i.id: i for i in catalog.list_cleaners(self._config, include_unsupported=True)}
-        groups: Dict[Tuple[str, str], List[CleanableItem]] = {}
-        # Administrator items the elevated helper would always refuse.
-        problems = elevation.admin_problems(result.all_items()) if self._allow_admin else {}
-        for item in result.all_items():
-            category = catalog.category_of(item.cleaner_id)
+
+        def preselect(item: CleanableItem) -> bool:
             info = infos.get(item.cleaner_id)
-            if item.report_only or info is None:
-                mode = "readonly"
-            elif item.requires_root and (not self._allow_admin or id(item) in problems):
-                mode = "readonly"
-            elif category in _OPT_IN:
-                mode = "optin"
-            elif catalog.preselect(item, info):
-                mode = "select"
+            return info is not None and catalog.preselect(item, info)
+
+        groups = curation.build_groups(result, infos)
+        review, main, also = [], [], []
+        for g in groups:
+            if g.safety is curation.Safety.REVIEW:
+                review.append(g)
+            elif any(preselect(i) for i in g.items):
+                main.append(g)
             else:
-                mode = "readonly"
-            groups.setdefault((category, mode), []).append(item)
+                also.append(g)
 
-        self._clear_cards()
-
-        order = list(catalog.CATEGORIES)
-        for mode in ("select", "optin", "readonly"):
-            for category in order:
-                items = groups.get((category, mode))
-                if not items:
-                    continue
-                label = catalog.CATEGORIES[category]
-                if mode == "readonly":
-                    label += " (review only)"
-                card = CategoryCard(category, label, items, mode=mode,
-                                    checked=(mode == "select"),
-                                    admin_blocked=not self._allow_admin,
-                                    problems=problems,
-                                    admin_blocked_reason=self._admin_reason)
-                card.toggled.connect(self._refresh_clean_button)
-                self._cards.append(card)
-                (self._main_cards_layout if mode == "select" else self._also_layout
-                 ).addWidget(card)
-
-        self.also_found_toggle.setVisible(any(c.mode != "select" for c in self._cards))
-        self.also_found_toggle.setChecked(False)
+        self._clear_results()
+        self.results_tree.set_groups(main, preselect)
+        self.also_tree.set_groups(also, lambda _i: False)
+        self.review_tree.set_groups(review, lambda _i: False)
+        self.results_tree.setVisible(bool(main))
+        self.also_found_toggle.setVisible(bool(also))
+        self.review_toggle.setVisible(bool(review))
         self.results_summary.setText(
-            "Nothing found to clean." if not result.all_items()
+            "Nothing found to clean." if not groups
             else f"Found {human_size(result.total_size)} in {result.total_items} items.")
         self._refresh_clean_button()
         self._set_state(SimpleState.RESULTS)
         self.scanned.emit(result)
 
-    def _clear_cards(self) -> None:
-        for card in self._cards:
-            card.setParent(None)
-            card.deleteLater()
-        self._cards = []
+    def _clear_results(self) -> None:
+        for tree in self._trees:
+            tree.set_groups([], lambda _i: False)
         self.also_found_toggle.setChecked(False)
-
-    def cards(self) -> List[CategoryCard]:
-        return list(self._cards)
+        self.review_toggle.setChecked(False)
+        self.results_total_label.setText("")
 
     def selected_items(self) -> List[CleanableItem]:
         out: List[CleanableItem] = []
-        for card in self._cards:
-            out.extend(i for i in card.selected_items()
-                       if self._allow_admin or not i.requires_root)
+        for tree in self._trees:
+            out.extend(i for i in tree.checked_items()
+                       if not i.report_only and (self._allow_admin or not i.requires_root))
         return out
 
     def selected_size(self) -> int:
@@ -602,12 +565,16 @@ class SimpleView(QWidget):
     def clean_button_text(self) -> str:
         if not self.selected_items():
             return "Nothing selected"
-        return f"Free {human_size(self.selected_size())}"
+        return f"Clean {human_size(self.selected_size())}"
 
     @Slot()
     def _refresh_clean_button(self) -> None:
+        items = self.selected_items()
         self.clean_button.setText(self.clean_button_text())
-        self.clean_button.setEnabled(bool(self.selected_items()))
+        self.clean_button.setEnabled(bool(items))
+        self.results_total_label.setText(
+            f"{human_size(self.selected_size())} can be freed" if items
+            else "Nothing selected")
 
     # ---- clean ---------------------------------------------------------
     @Slot()
@@ -714,7 +681,7 @@ class SimpleView(QWidget):
     def _stopped_before_finishing(self, detail: str = "") -> None:
         # Some items may already be gone: force a rescan instead of showing
         # stale cards.
-        self._clear_cards()
+        self._clear_results()
         self.error_label.setText(
             "Clean stopped before finishing; scan again to see what is left."
             + (f" ({detail})" if detail else ""))
