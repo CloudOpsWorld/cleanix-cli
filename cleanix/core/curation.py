@@ -236,6 +236,12 @@ class Group:
         return len(self.items)
 
 
+def is_empty(item: CleanableItem) -> bool:
+    """True for items with nothing to show. A COMMAND item's size is unknown
+    (best effort, often 0), so it is never treated as empty."""
+    return item.size <= 0 and item.kind is not ItemKind.COMMAND
+
+
 def build_groups(
     result: ScanResult,
     infos: Mapping[str, CleanerInfo],
@@ -249,8 +255,8 @@ def build_groups(
         if not rep.items:
             continue
         items = sorted(rep.items, key=lambda i: -i.size)
-        nonzero = [i for i in items if i.size > 0]
-        zero = [i for i in items if i.size <= 0]
+        nonzero = [i for i in items if not is_empty(i)]
+        zero = [i for i in items if is_empty(i)]
         if not nonzero and not show_empty:
             continue
         info = infos.get(rep.cleaner_id)

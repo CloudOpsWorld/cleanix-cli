@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 
 from cleanix.config import Config
 from cleanix.core import catalog, curation, report
-from cleanix.core.curation import Safety
+from cleanix.core.curation import Safety, is_empty
 from cleanix.core.models import CleanableItem, ItemKind, ScanResult, item_key
 from cleanix.core.utils import human_size
 from cleanix.gui import elevation, workers
@@ -367,7 +367,7 @@ class PowerView(QWidget):
                     continue
             if not self.show_empty_check.isChecked() and g.zero:
                 # Empty items are not displayed, so they must not be selectable.
-                g = dataclasses.replace(g, items=[i for i in g.items if i.size > 0],
+                g = dataclasses.replace(g, items=[i for i in g.items if not is_empty(i)],
                                         zero=[])
             shown.append(g)
         self._syncing = True
@@ -592,7 +592,7 @@ class PowerView(QWidget):
 
         def _pre(item: CleanableItem) -> bool:
             info = infos.get(item.cleaner_id)
-            if item.size <= 0 and not self.show_empty_check.isChecked():
+            if is_empty(item) and not self.show_empty_check.isChecked():
                 return False  # not displayed, so never pre-checked
             return info is not None and catalog.preselect(item, info)
 

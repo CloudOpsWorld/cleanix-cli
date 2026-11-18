@@ -839,3 +839,21 @@ def test_quick_select_leaves_hidden_rows_alone(qtbot, sync_workers):
     view.filter_edit.setText("")
     assert any(i.cleaner_id == "apt" for i in view.item_model.checked_items())
     assert not any(i.cleaner_id == "temp" for i in view.item_model.checked_items())
+
+
+def _cmd_zero_result():
+    return ScanResult(reports=[CleanerReport("temp", "Temp", "t", items=[
+        CleanableItem("temp", "Empty the Recycle Bin", size=0, kind=ItemKind.COMMAND,
+                      command=["empty-bin"])])])
+
+
+def test_zero_size_command_item_visible_and_selectable_without_show_empty(
+        qtbot, monkeypatch, sync_workers):
+    v = pv.PowerView(Config())
+    qtbot.addWidget(v)
+    v._on_scan_finished(_cmd_zero_result())
+    assert v.tree.group_count() == 1
+    assert [i.kind for g in v.tree._groups for i in g.items] == [ItemKind.COMMAND]
+    assert v.item_model.checked_items() == []  # never preselected
+    v.select_all_visible()
+    assert [i.kind for i in v.item_model.checked_items()] == [ItemKind.COMMAND]

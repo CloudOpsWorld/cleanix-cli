@@ -14,6 +14,7 @@ from cleanix.core.curation import (
     build_groups,
     copy_for,
     display_label,
+    is_empty,
     safety_of,
     shorten_path,
 )
@@ -99,6 +100,31 @@ def test_zero_only_group_hidden():
     assert build_groups(_result(items), infos) == []
     g = build_groups(_result(items), infos, show_empty=True)
     assert len(g) == 1 and g[0].shown == [] and len(g[0].zero) == 2
+
+
+def _cmd_item(size=0, cid="x"):
+    return CleanableItem(cleaner_id=cid, description="Empty the Recycle Bin",
+                         size=size, kind=ItemKind.COMMAND, command=["empty-bin"])
+
+
+def test_command_item_size_zero_is_never_empty():
+    assert not is_empty(_cmd_item(0))
+    assert is_empty(_path_item(size=0))
+    assert not is_empty(_path_item(size=1))
+
+
+def test_command_only_zero_group_visible_without_show_empty():
+    g = build_groups(_result([_cmd_item(0)]), {"x": _info()})
+    assert len(g) == 1
+    assert len(g[0].shown) == 1 and g[0].zero == []
+
+
+def test_command_zero_sorts_after_sized_items_but_stays_visible():
+    items = [_path_item(desc="a", size=0), _cmd_item(0), _path_item(desc="b", size=5)]
+    g = build_groups(_result(items), {"x": _info()})[0]
+    assert [i.size for i in g.shown] == [5, 0]
+    assert g.shown[1].kind is ItemKind.COMMAND
+    assert [i.kind for i in g.zero] == [ItemKind.PATH]
 
 
 def test_empty_report_omitted():
