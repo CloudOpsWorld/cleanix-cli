@@ -60,8 +60,12 @@ class GroupedResults(QTreeWidget):
     selection_changed = Signal()
 
     def __init__(self, parent=None, *, allow_admin_items: bool = False,
-                 admin_reason: str = "", home: Optional[str] = None) -> None:
+                 admin_reason: str = "", home: Optional[str] = None,
+                 selectable: Optional[Callable[[CleanableItem], Optional[str]]] = None
+                 ) -> None:
         super().__init__(parent)
+        # Per-view extra rule: returns a refusal reason, or None when allowed.
+        self._extra_rule = selectable
         self._allow_admin = bool(allow_admin_items)
         self._admin_reason = admin_reason
         self._home = home
@@ -106,7 +110,11 @@ class GroupedResults(QTreeWidget):
         if item.requires_root:
             if not self._allow_admin:
                 return self._admin_reason or ADMIN_REASON
-            return self._problems.get(id(item))
+            problem = self._problems.get(id(item))
+            if problem:
+                return problem
+        if self._extra_rule is not None:
+            return self._extra_rule(item)
         return None
 
     def set_groups(self, groups: List[Group],

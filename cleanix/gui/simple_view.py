@@ -53,6 +53,9 @@ def _default_scan_factory(config: Config, deep: bool = False):
     return workers.ScanWorker(config, exclude=None if deep else list(SLOW))
 
 
+_OPT_IN = ("trash", "system")
+
+
 class SimpleState(Enum):
     IDLE = "idle"
     SCANNING = "scanning"
@@ -332,7 +335,7 @@ class SimpleView(QWidget):
     def _new_tree(self) -> GroupedResults:
         tree = GroupedResults(
             allow_admin_items=self._allow_admin, admin_reason=self._admin_reason,
-            home=str(Path.home()))
+            home=str(Path.home()), selectable=self._simple_rule)
         tree.selection_changed.connect(self._refresh_clean_button)
         return tree
 
@@ -347,6 +350,7 @@ class SimpleView(QWidget):
         self.results_total_label.setFont(tfont)
         lay.addWidget(self.results_total_label)
         lay.addWidget(self.results_summary)
+        self._infos: Dict[str, catalog.CleanerInfo] = {}
         self.results_tree = self._new_tree()
         self.also_tree = self._new_tree()
         self.review_tree = self._new_tree()
@@ -517,13 +521,30 @@ class SimpleView(QWidget):
             self.cancel()
 
     # ---- results -------------------------------------------------------
+    NOT_FROM_SIMPLE = ("Not cleaned from Simple mode: use Power mode to review "
+                       "and clean it.")
+
+    def _simple_rule(self, item: CleanableItem) -> Optional[str]:
+        """Simple mode cleans only pre-selectable cleaners and the opt-in
+        Trash/System categories; everything else is shown read-only."""
+        if curation.is_empty(item):
+            return "Nothing to clean."
+        info = self._infos.get(item.cleaner_id)
+        if info is None:
+            return self.NOT_FROM_SIMPLE
+        if catalog.category_of(item.cleaner_id) in _OPT_IN:
+            return None
+        return None if catalog.preselect(item, info) else self.NOT_FROM_SIMPLE
+
     def set_scan_result(self, result: ScanResult) -> None:
         infos: Dict[str, catalog.CleanerInfo] = {
             i.id: i for i in catalog.list_cleaners(self._config, include_unsupported=True)}
+        self._infos = infos
 
         def preselect(item: CleanableItem) -> bool:
             info = infos.get(item.cleaner_id)
-            return info is not None and catalog.preselect(item, info)
+            return (info is not None and not curation.is_empty(item)
+                    and catalog.preselect(item, info))
 
         groups = curation.build_groups(result, infos)
         review, main, also = [], [], []

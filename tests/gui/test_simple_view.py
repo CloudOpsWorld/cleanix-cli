@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QWidget  # noqa: E402
 
 from cleanix.config import Config  # noqa: E402
 from cleanix.core import quarantine  # noqa: E402
+from cleanix.core.models import item_key  # noqa: E402
 from cleanix.core.models import (  # noqa: E402
     CleanableItem, CleanerReport, ItemKind, ScanResult,
 )
@@ -243,6 +244,50 @@ def test_unreviewed_cleaner_never_preselected(qtbot):
     assert not v.clean_button.isEnabled()
     assert v.review_tree.group_count() == 1
     assert v.review_tree.checked_items() == []
+    # base rule: an unreviewed cleaner is read-only in Simple mode
+    it = v.review_tree._groups[0].items[0]
+    assert v.review_tree.refusal_reason(it) == SimpleView.NOT_FROM_SIMPLE
+    assert it not in v.selected_items()
+
+
+def test_unknown_cleaner_cannot_be_ticked(qtbot):
+    v = make_view(qtbot)
+    it = item("brand_new_cleaner", 600)
+    v.set_scan_result(result(it))
+    tree = all_trees(v)[2]
+    row = tree.topLevelItem(0)
+    assert not row.flags() & Qt.ItemFlag.ItemIsUserCheckable
+    assert tree.refusal_reason(it)
+    tree.set_checked_keys({item_key(it)})
+    assert v.selected_items() == []
+
+
+def test_review_category_cleaner_is_readonly_in_simple(qtbot):
+    v = make_view(qtbot)
+    it = item("toolchains", 600)
+    v.set_scan_result(result(it))
+    for tree in all_trees(v):
+        tree.set_checked_keys({item_key(it)})
+    assert v.selected_items() == []
+
+
+def test_trash_optin_item_can_still_be_ticked(qtbot):
+    v = make_view(qtbot)
+    it = item("trash", 500)
+    v.set_scan_result(result(it))
+    assert v.selected_items() == []
+    tree = [t for t in all_trees(v) if t.group_count()][0]
+    tick(tree, tree.topLevelItem(0).text(0))
+    assert v.selected_items() == [it]
+
+
+def test_empty_items_are_never_selected_in_simple(qtbot):
+    v = make_view(qtbot)
+    full, empty = item("temp", 100), item("temp", 0, path="/tmp/temp/empty")
+    v.set_scan_result(result(full, empty))
+    assert v.selected_items() == [full]
+    tick(v.results_tree, "Temporary files", True)
+    assert v.selected_items() == [full]
 
 
 def test_clean_button_text_tracks_selection(qtbot):
