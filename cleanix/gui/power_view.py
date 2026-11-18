@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QTableView,
     QTabWidget,
     QToolButton,
@@ -29,10 +31,12 @@ from PySide6.QtWidgets import (
 )
 
 from cleanix.config import Config
-from cleanix.core import catalog, report
+from cleanix.core import catalog, curation, report
+from cleanix.core.curation import Safety
 from cleanix.core.models import CleanableItem, ItemKind, ScanResult, item_key
 from cleanix.core.utils import human_size
 from cleanix.gui import elevation, workers
+from cleanix.gui.grouped_results import GroupedResults
 from cleanix.gui.models import (
     BadgeRole,
     CleanerListModel,
@@ -46,6 +50,8 @@ class _ItemFilterProxy(QSortFilterProxyModel):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._text = ""
+        self._safety: Optional[Safety] = None
+        self._group_safety: dict = {}
         self.setSortRole(Qt.ItemDataRole.UserRole)
 
     def set_filter_text(self, text: str) -> None:
@@ -57,10 +63,25 @@ class _ItemFilterProxy(QSortFilterProxyModel):
         else:
             self.invalidateFilter()
 
+    def set_safety(self, safety: Optional[Safety], group_safety: dict) -> None:
+        """Only rows of cleaners whose group has ``safety`` (None = all)."""
+        begin = getattr(self, "beginFilterChange", None)
+        self._safety = safety
+        self._group_safety = dict(group_safety)
+        if begin is not None:
+            begin()
+            self.endFilterChange()
+        else:
+            self.invalidateFilter()
+
     def filterAcceptsRow(self, row: int, parent: QModelIndex) -> bool:  # noqa: N802
+        src = self.sourceModel()
+        if self._safety is not None:
+            item = src.item_at(row)
+            if self._group_safety.get(item.cleaner_id) is not self._safety:
+                return False
         if not self._text:
             return True
-        src = self.sourceModel()
         for col in (1, 2):
             value = src.data(src.index(row, col, parent), Qt.ItemDataRole.DisplayRole)
             if value and self._text in str(value).lower():
@@ -104,6 +125,9 @@ class PowerView(QWidget):
         self._shutting_down = False
         self._removed_keys: set = set()
         self._sent_admin_keys: set = set()
+        self._syncing = False   # re-entrancy guard for tree <-> model bridge
+        self._bulk = False      # defer model->tree sync during bulk changes
+        self._scanned_once = False
 
         self.tabs = QTabWidget()
         self.scan_tab = QWidget()
@@ -164,6 +188,21 @@ class PowerView(QWidget):
             tb.setAccessibleName("Clear filter")
 
         # Two rows keep the window narrow enough for small screens.
+        self.safe_only_button = QPushButton("Safe only")
+        self.safe_only_button.setAccessibleName("Safe only")
+        self.developer_button = QPushButton("Developer")
+        self.developer_button.setAccessibleName("Developer")
+        self.raw_toggle = QPushButton("Raw list")
+        self.raw_toggle.setCheckable(True)
+        self.raw_toggle.setAccessibleName("Raw list")
+        self.safety_combo = QComboBox()
+        self.safety_combo.setAccessibleName("Safety level filter")
+        self.safety_combo.addItem("All", None)
+        for sv in (Safety.SAFE, Safety.REVIEW, Safety.ADMIN, Safety.PERMANENT):
+            self.safety_combo.addItem(sv.value, sv)
+        self.show_empty_check = QCheckBox("Show empty")
+        self.show_empty_check.setAccessibleName("Show empty")
+
         self.filter_edit.setMinimumWidth(160)
         row1 = QHBoxLayout()
         for w in (self.scan_button, self.clean_button, self.cancel_button):
@@ -176,12 +215,40 @@ class PowerView(QWidget):
             row2.addWidget(w)
         row2.addStretch(1)
         row2.addWidget(self.export_button)
-        self.toolbar_rows = (row1, row2)
+        row3 = QHBoxLayout()
+        row3.addWidget(self.safe_only_button)
+        row3.addWidget(self.developer_button)
+        row3.addWidget(self.safety_combo)
+        row3.addWidget(self.show_empty_check)
+        row3.addStretch(1)
+        row3.addWidget(self.raw_toggle)
+        self.toolbar_rows = (row1, row2)  # row3: curated-view controls
 
         self.cleaner_list = QListView()
         self.cleaner_list.setModel(self.cleaner_model)
         self.cleaner_list.setAccessibleName("Cleaners")
         self.cleaner_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        # Collapsible "Choose what to scan" section.
+        self.cleaner_toggle = QToolButton()
+        self.cleaner_toggle.setText("Choose what to scan")
+        self.cleaner_toggle.setAccessibleName("Choose what to scan")
+        self.cleaner_toggle.setCheckable(True)
+        self.cleaner_toggle.setChecked(True)
+        self.cleaner_toggle.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.cleaner_toggle.setArrowType(Qt.ArrowType.DownArrow)
+        self.cleaner_toggle.toggled.connect(self._on_cleaner_toggled)
+        cleaner_box = QWidget()
+        cb_lay = QVBoxLayout(cleaner_box)
+        cb_lay.setContentsMargins(0, 0, 0, 0)
+        cb_lay.addWidget(self.cleaner_toggle)
+        cb_lay.addWidget(self.cleaner_list, 1)
+
+        self.tree = GroupedResults(allow_admin_items=self._allow_admin,
+                                   admin_reason=self._admin_reason,
+                                   home=str(Path.home()))
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.tree)   # page 0: curated tree (default)
 
         self.table = QTableView()
         self.table.setModel(self.proxy)
@@ -214,13 +281,14 @@ class PowerView(QWidget):
         self.status_label = QLabel("")
         self.status_label.setAccessibleName("Status")
 
+        self.stack.addWidget(self.table)  # page 1: Raw list
         right = QSplitter(Qt.Orientation.Vertical)
-        right.addWidget(self.table)
+        right.addWidget(self.stack)
         right.addWidget(self.detail_label)
         right.setStretchFactor(0, 4)
         right.setStretchFactor(1, 1)
         split = QSplitter(Qt.Orientation.Horizontal)
-        split.addWidget(self.cleaner_list)
+        split.addWidget(cleaner_box)
         split.addWidget(right)
         split.setStretchFactor(0, 1)
         split.setStretchFactor(1, 3)
@@ -228,10 +296,11 @@ class PowerView(QWidget):
         lay = QVBoxLayout(self.scan_tab)
         lay.addLayout(row1)
         lay.addLayout(row2)
+        lay.addLayout(row3)
         lay.addWidget(split, 1)
         lay.addWidget(self.status_label)
 
-        QWidget.setTabOrder(self.table, self.detail_label)
+        QWidget.setTabOrder(self.stack, self.detail_label)
         self.scan_button.clicked.connect(self.start_scan)
         self.clean_button.clicked.connect(self.start_clean)
         self.cancel_button.clicked.connect(self.cancel_current)
@@ -239,6 +308,160 @@ class PowerView(QWidget):
         self.filter_edit.textChanged.connect(self.proxy.set_filter_text)
         self.select_visible_button.clicked.connect(self.select_all_visible)
         self.select_none_button.clicked.connect(self.select_none_visible)
+        self.safe_only_button.clicked.connect(self.select_safe_only)
+        self.developer_button.clicked.connect(self.select_developer)
+        self.raw_toggle.toggled.connect(self._on_raw_toggled)
+        self.safety_combo.currentIndexChanged.connect(self._on_filters_changed)
+        self.show_empty_check.toggled.connect(self._on_show_empty)
+        self.filter_edit.textChanged.connect(self._on_filters_changed)
+        self.tree.selection_changed.connect(self._tree_to_model)
+        self.tree.currentItemChanged.connect(self._on_tree_current)
+        self.item_model.dataChanged.connect(self._model_changed)
+        self.item_model.modelReset.connect(self._rebuild_tree)
+
+    # ----- curated tree <-> item model bridge -----
+    def _on_cleaner_toggled(self, on: bool) -> None:
+        self.cleaner_list.setVisible(on)
+        self.cleaner_toggle.setArrowType(
+            Qt.ArrowType.DownArrow if on else Qt.ArrowType.RightArrow)
+
+    def _on_raw_toggled(self, on: bool) -> None:
+        self.stack.setCurrentIndex(1 if on else 0)
+
+    def _on_show_empty(self, on: bool) -> None:
+        self.tree.set_raw_items_visible(on)
+        self._rebuild_tree()
+
+    def _infos(self) -> dict:
+        return {self.cleaner_model.info_at(r).id: self.cleaner_model.info_at(r)
+                for r in range(self.cleaner_model.rowCount())}
+
+    def _current_groups(self) -> List[curation.Group]:
+        """Groups for the items now in the model (all safety levels)."""
+        if self._result is None:
+            return []
+        m = self.item_model
+        present = {item_key(m.item_at(r)) for r in range(m.rowCount())}
+        res = ScanResult(reports=[
+            dataclasses.replace(r, items=[i for i in r.items if item_key(i) in present])
+            for r in self._result.reports])
+        return curation.build_groups(
+            res, self._infos(), show_empty=self.show_empty_check.isChecked())
+
+    def _rebuild_tree(self) -> None:
+        if self._syncing:
+            return
+        groups = self._current_groups()
+        gsafety = {g.cleaner_id: g.safety for g in groups}
+        data = self.safety_combo.currentData()
+        want = Safety(data) if data else None
+        self.proxy.set_safety(want, gsafety)
+        text = self.filter_edit.text().strip().lower()
+        shown = []
+        for g in groups:
+            if want is not None and g.safety is not want:
+                continue
+            if text:
+                g = self._filter_group(g, text)
+                if g is None:
+                    continue
+            if not self.show_empty_check.isChecked() and g.zero:
+                # Empty items are not displayed, so they must not be selectable.
+                g = dataclasses.replace(g, items=[i for i in g.items if i.size > 0],
+                                        zero=[])
+            shown.append(g)
+        self._syncing = True
+        try:
+            self.tree.set_groups(shown, None)
+            self.tree.set_checked_keys(self._model_checked_keys())
+        finally:
+            self._syncing = False
+
+    def _filter_group(self, g, text):
+        """Same rule as the raw list filter: cleaner name or description."""
+        name = self.item_model._names.get(g.cleaner_id, g.cleaner_id).lower()
+
+        def keep(items):
+            return [i for i in items if text in name or text in i.description.lower()]
+
+        items = keep(g.items)
+        if not items:
+            return None
+        return dataclasses.replace(
+            g, items=items, shown=keep(g.shown), rest=keep(g.rest),
+            zero=keep(g.zero), total_size=sum(i.size for i in items))
+
+    def _on_filters_changed(self, *_a) -> None:
+        self._rebuild_tree()
+
+    def _model_checked_keys(self) -> set:
+        return {item_key(i) for i in self.item_model.checked_items()}
+
+    def _model_changed(self, *_a) -> None:
+        if self._syncing or self._bulk:
+            return
+        self._model_to_tree()
+
+    def _model_to_tree(self) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.tree.set_checked_keys(self._model_checked_keys())
+        finally:
+            self._syncing = False
+
+    def _tree_to_model(self) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            keys = self.tree.checked_keys()
+            universe = {item_key(i) for g in self.tree._groups for i in g.items}
+            m = self.item_model
+            for r in range(m.rowCount()):
+                k = item_key(m.item_at(r))
+                if k in universe and m.is_checked(r) != (k in keys):
+                    m.set_checked(r, k in keys)
+        finally:
+            self._syncing = False
+
+    def _set_selection(self, predicate) -> None:
+        """Replace the selection with the checkable items matching predicate."""
+        m = self.item_model
+        self._bulk = True
+        try:
+            for r in self._actionable_rows():
+                m.set_checked(r, bool(predicate(m.item_at(r))))
+        finally:
+            self._bulk = False
+        self._model_to_tree()
+
+    def select_safe_only(self) -> None:
+        infos = self._infos()
+        self._set_selection(
+            lambda i: curation.safety_of(i, infos.get(i.cleaner_id)) is Safety.SAFE
+            and i.kind is ItemKind.PATH
+            and not i.requires_root and not i.report_only)
+
+    def select_developer(self) -> None:
+        infos = self._infos()
+
+        def _dev(i: CleanableItem) -> bool:
+            info = infos.get(i.cleaner_id)
+            cat = info.category if info else catalog.category_of(i.cleaner_id)
+            return cat == "dev"
+        self._set_selection(_dev)
+
+    def _on_tree_current(self, current, _previous=None) -> None:
+        p = GroupedResults._payload(current)
+        item = getattr(p, "item", None)
+        if item is None:
+            self._set_detail("Select an item to see details.")
+            return
+        self._set_detail(self.detail_text(item, allow_admin=self._allow_admin,
+                                          problem=self.item_model.admin_problem(item),
+                                          unavailable_reason=self._admin_reason))
 
     # ----- detail -----
     def _on_current_changed(self, current: QModelIndex, _previous=None) -> None:
@@ -295,17 +518,35 @@ class PowerView(QWidget):
         return [self.proxy.mapToSource(self.proxy.index(r, 0)).row()
                 for r in range(self.proxy.rowCount())]
 
+    def _actionable_rows(self) -> List[int]:
+        """Visible rows of the page being shown; on the tree page only items
+        the tree displays (empty items only with Show empty)."""
+        rows = self._visible_rows()
+        if self.stack.currentWidget() is not self.tree:
+            return rows
+        shown = {item_key(i) for g in self.tree._groups for i in g.items}
+        m = self.item_model
+        return [r for r in rows if item_key(m.item_at(r)) in shown]
+
     def visible_checked_items(self) -> List[CleanableItem]:
         m = self.item_model
-        return [m.item_at(r) for r in self._visible_rows() if m.is_checked(r)]
+        return [m.item_at(r) for r in self._actionable_rows() if m.is_checked(r)]
+
+    def _set_visible(self, on: bool) -> None:
+        self._bulk = True
+        try:
+            rows = self._actionable_rows() if on else self._visible_rows()
+            for r in rows:
+                self.item_model.set_checked(r, on)  # refuses report-only rows
+        finally:
+            self._bulk = False
+        self._model_to_tree()
 
     def select_all_visible(self) -> None:
-        for r in self._visible_rows():
-            self.item_model.set_checked(r, True)  # refuses report-only rows
+        self._set_visible(True)
 
     def select_none_visible(self) -> None:
-        for r in self._visible_rows():
-            self.item_model.set_checked(r, False)
+        self._set_visible(False)
 
     def shutdown(self) -> None:
         """Cancel any running worker; safe to call repeatedly."""
@@ -347,15 +588,19 @@ class PowerView(QWidget):
         self._worker = None
         self._result = result
         self._removed_keys = set()
-        infos = {self.cleaner_model.info_at(r).id: self.cleaner_model.info_at(r)
-                 for r in range(self.cleaner_model.rowCount())}
+        infos = self._infos()
 
         def _pre(item: CleanableItem) -> bool:
             info = infos.get(item.cleaner_id)
+            if item.size <= 0 and not self.show_empty_check.isChecked():
+                return False  # not displayed, so never pre-checked
             return info is not None and catalog.preselect(item, info)
 
         self.item_model.set_result(result, _pre)
         self.table.sortByColumn(3, Qt.SortOrder.DescendingOrder)
+        if not self._scanned_once:
+            self._scanned_once = True
+            self.cleaner_toggle.setChecked(False)  # collapse after first scan
         self.status_label.setText(
             f"Found {result.total_items} items, {human_size(result.total_size)}")
         self._set_busy(False)
