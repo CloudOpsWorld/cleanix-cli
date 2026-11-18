@@ -384,3 +384,14 @@ def test_settings_apply_failure_is_shown_not_raised(qtbot, app_env, monkeypatch)
     w.settings_panel.save_button.click()
     assert "could not be applied" in w.settings_panel.message_label.text()
     assert w.config.temp_min_age_days == before
+
+
+def test_mode_switch_persists_via_isolated_settings(qtbot):
+    from cleanix.gui import main_window
+    w = MainWindow(config=Config(), elevation_available=False)
+    qtbot.addWidget(w)
+    w.power_button.click()
+    assert main_window._load_mode() == "power"
+    w.simple_button.click()
+    assert main_window._load_mode() == "simple"
+    assert w.stack.currentWidget() is w.simple_page

@@ -663,3 +663,179 @@ def test_shutdown_keeps_start_guard_up(qtbot, monkeypatch):
     v._on_cancelled()  # old worker finishes; still no new work
     v.start_scan()
     assert n == [1]
+
+
+# ----- curated tree + raw list (Task 5) -----
+from cleanix.core.curation import Safety  # noqa: E402
+from cleanix.core.models import item_key  # noqa: E402
+
+
+def _group_row(view, cleaner_id):
+    g = next(i for i, grp in enumerate(view.tree._groups) if grp.cleaner_id == cleaner_id)
+    return view.tree._group_rows[g]
+
+
+def test_default_page_is_tree_and_raw_toggle_switches(view):
+    _load(view)
+    assert view.stack.currentIndex() == 0 and view.stack.currentWidget() is view.tree
+    assert view.raw_toggle.isCheckable()
+    view.raw_toggle.setChecked(True)
+    assert view.stack.currentWidget() is view.table
+    assert view.table.model().rowCount() == view.item_model.rowCount() == 5
+    view.raw_toggle.setChecked(False)
+    assert view.stack.currentWidget() is view.tree
+
+
+def test_tree_group_tick_selects_group_items_and_back(view):
+    _load(view)
+    view.select_none_visible()
+    assert view.item_model.checked_items() == []
+    row = _group_row(view, "temp")
+    row.setCheckState(0, Qt.CheckState.Checked)
+    got = {item_key(i) for i in view.item_model.checked_items()}
+    assert got == {item_key(i) for i in _result().reports[0].items}
+    # model -> tree
+    view.item_model.set_checked(0, False)
+    assert row.checkState(0) == Qt.CheckState.PartiallyChecked
+    assert len(view.tree.checked_keys()) == 2
+
+
+def test_scan_preselect_reaches_tree(view):
+    _load(view)
+    assert view.tree.checked_keys() == {item_key(i) for i in view.item_model.checked_items()}
+    assert len(view.tree.checked_keys()) == 3
+
+
+def test_safe_only_selects_safe_user_path_items(view):
+    _load(view)
+    view.select_all_visible()
+    view.safe_only_button.click()
+    chosen = view.item_model.checked_items()
+    assert {i.cleaner_id for i in chosen} == {"temp"}
+    assert all(not i.requires_root and not i.report_only and i.kind is ItemKind.PATH
+               for i in chosen)
+    assert view.tree.checked_keys() == {item_key(i) for i in chosen}
+
+
+def test_developer_quick_select_by_catalog_category(qtbot, monkeypatch, sync_workers):
+    monkeypatch.setattr(catalog, "list_cleaners", lambda cfg, **k: [
+        _info("temp", "Temp"), _info("npm_cache", "npm", category="dev")])
+    res = ScanResult(reports=[
+        CleanerReport("temp", "Temp", "t", items=[CleanableItem("temp", "a", size=5, path="/t/a")]),
+        CleanerReport("npm_cache", "npm", "n", items=[CleanableItem("npm_cache", "b", size=5, path="/t/b")]),
+    ])
+    v = pv.PowerView(Config())
+    qtbot.addWidget(v)
+    v._on_scan_finished(res)
+    v.developer_button.click()
+    assert [i.cleaner_id for i in v.item_model.checked_items()] == ["npm_cache"]
+
+
+def test_safety_filter_hides_non_matching_groups(view):
+    _load(view)
+    assert view.tree.group_count() == 3
+    view.safety_combo.setCurrentIndex(view.safety_combo.findData(Safety.ADMIN))
+    assert [g.cleaner_id for g in view.tree._groups] == ["apt"]
+    assert view.proxy.rowCount() == 1
+    view.safety_combo.setCurrentIndex(0)
+    assert view.tree.group_count() == 3 and view.proxy.rowCount() == 5
+
+
+def test_show_empty_passes_to_build_groups(view):
+    res = ScanResult(reports=[CleanerReport("temp", "Temp", "t", items=[
+        CleanableItem("temp", "z", size=0, path="/t/z")])])
+    view._on_scan_finished(res)
+    assert view.tree.group_count() == 0
+    view.show_empty_check.setChecked(True)
+    assert view.tree.group_count() == 1
+
+
+def test_clean_after_tree_selection_uses_those_items(qtbot, monkeypatch, sync_workers):
+    texts, seen = [], []
+    v = pv.PowerView(Config(), clean_worker_factory=_stub_real_clean(monkeypatch, texts, seen))
+    qtbot.addWidget(v)
+    _load(v)
+    v.select_none_visible()
+    _group_row(v, "temp").setCheckState(0, Qt.CheckState.Checked)
+    with qtbot.waitSignal(v.clean_finished):
+        v.clean_button.click()  # dry run by default
+    assert {item_key(i) for i in seen[0]} == {item_key(i) for i in _result().reports[0].items}
+
+
+def test_cleaner_section_collapses_after_first_scan(view):
+    assert view.cleaner_toggle.isChecked()
+    assert not view.cleaner_list.isHidden()
+    _load(view)
+    assert not view.cleaner_toggle.isChecked()
+    assert view.cleaner_list.isHidden()
+    view.cleaner_toggle.setChecked(True)
+    assert not view.cleaner_list.isHidden()
+    _load(view)
+    assert view.cleaner_toggle.isChecked()  # only the first scan collapses
+
+
+def test_real_clean_removes_rows_from_tree(qtbot, monkeypatch, sync_workers):
+    texts, seen = [], []
+    v = pv.PowerView(Config(), clean_worker_factory=_stub_real_clean(monkeypatch, texts, seen))
+    qtbot.addWidget(v)
+    _load(v)
+    v.dry_run_check.setChecked(False)
+    v.clean_button.click()
+    assert v.tree.group_count() == 2  # temp group fully cleaned
+    assert v.tree.checked_keys() == {item_key(i) for i in v.item_model.checked_items()}
+
+
+def _zero_result():
+    return ScanResult(reports=[CleanerReport("temp", "Temp", "t", items=[
+        CleanableItem("temp", "real", size=10, path="/t/real"),
+        CleanableItem("temp", "empty", size=0, path="/t/empty")])])
+
+
+def test_bulk_actions_skip_zero_size_items_without_show_empty(qtbot, monkeypatch, sync_workers):
+    texts, seen = [], []
+    v = pv.PowerView(Config(), clean_worker_factory=_stub_real_clean(monkeypatch, texts, seen))
+    qtbot.addWidget(v)
+    v._on_scan_finished(_zero_result())
+    empty = "/t/empty"
+    for action in (v.select_all_visible, v.safe_only_button.click):
+        v.select_none_visible()
+        action()
+        assert empty not in [i.path for i in v.item_model.checked_items()]
+    v.select_none_visible()
+    v.developer_button.click()
+    assert empty not in [i.path for i in v.item_model.checked_items()]
+    v.select_all_visible()
+    v.clean_button.click()
+    assert [i.path for i in seen[-1]] == ["/t/real"]
+    # a tree group tick does not reach the hidden empty item either
+    v.select_none_visible()
+    _group_row(v, "temp").setCheckState(0, Qt.CheckState.Checked)
+    assert empty not in [i.path for i in v.item_model.checked_items()]
+
+
+def test_zero_size_items_selectable_with_show_empty(qtbot, monkeypatch, sync_workers):
+    v = pv.PowerView(Config())
+    qtbot.addWidget(v)
+    v._on_scan_finished(_zero_result())
+    v.show_empty_check.setChecked(True)
+    v.select_none_visible()
+    v.select_all_visible()
+    assert "/t/empty" in [i.path for i in v.item_model.checked_items()]
+
+
+def test_quick_select_leaves_hidden_rows_alone(qtbot, sync_workers):
+    view = pv.PowerView(Config(), allow_admin_items=True)
+    qtbot.addWidget(view)
+    _load(view)
+    view.select_all_visible()
+    assert any(i.cleaner_id == "apt" for i in view.item_model.checked_items())
+    view.filter_edit.setText("temp")
+    view.select_none_visible()
+    view.safe_only_button.click()
+    view.filter_edit.setText("")
+    assert any(i.cleaner_id == "apt" for i in view.item_model.checked_items())
+    view.filter_edit.setText("temp")
+    view.developer_button.click()  # temp is not "dev": clears visible only
+    view.filter_edit.setText("")
+    assert any(i.cleaner_id == "apt" for i in view.item_model.checked_items())
+    assert not any(i.cleaner_id == "temp" for i in view.item_model.checked_items())

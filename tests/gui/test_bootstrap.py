@@ -22,13 +22,13 @@ def test_main_window_starts_in_simple_mode(qtbot):
 def test_toggle_switches_page_and_persists(qtbot):
     w = MainWindow()
     qtbot.addWidget(w)
-    w.power_action.trigger()
+    w.power_button.click()
     assert w.current_mode() == "power"
     assert w.stack.currentWidget() is w.power_page
     w2 = MainWindow()
     qtbot.addWidget(w2)
     assert w2.current_mode() == "power"
-    assert w2.power_action.isChecked()
+    assert w2.power_button.isChecked()
 
 
 def test_set_page_helpers_swap_widgets(qtbot):
@@ -94,11 +94,17 @@ def test_app_main_bootstraps_themed_window(qtbot, qapp, monkeypatch):
     assert len(created) == 1
 
 
-def test_power_mode_action_has_accessible_name(qtbot):
+def test_mode_buttons_are_checkable_exclusive_and_accessible(qtbot):
     w = MainWindow()
     qtbot.addWidget(w)
-    assert w.power_action.isCheckable()
-    assert w.power_action.text() == "Power mode"
-    tb = w.findChild(type(w.toolbar))
-    btn = tb.widgetForAction(w.power_action)
-    assert btn.accessibleName() == "Power mode"
+    assert w.simple_button.text() == "Simple" and w.power_button.text() == "Power"
+    assert w.simple_button.accessibleName() == "Simple mode"
+    assert w.power_button.accessibleName() == "Power mode"
+    assert w.simple_button.isChecked() and not w.power_button.isChecked()
+    w.power_button.click()
+    assert w.power_button.isChecked() and not w.simple_button.isChecked()
+    w.simple_button.click()
+    assert w.current_mode() == "simple" and w.simple_button.isChecked()
+    w.set_mode("power")
+    assert w.power_button.isChecked() and not w.simple_button.isChecked()
+    assert w.power_button.focusPolicy() != w.power_button.focusPolicy().NoFocus

@@ -148,3 +148,8 @@ def test_list_cleaners_filters_unsupported_platforms():
         assert by_id["win_temp"].supported is False
         assert by_id["temp"].supported is True
         assert by_id["temp"].category == "temp" and by_id["temp"].safe_default
+
+
+def test_slow_scan_ids_are_registered_cleaners():
+    assert catalog.SLOW_SCAN_IDS == ("duplicates", "big_files", "downloads")
+    assert set(catalog.SLOW_SCAN_IDS) <= set(known_ids())
