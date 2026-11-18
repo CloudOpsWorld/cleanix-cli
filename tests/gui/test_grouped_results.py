@@ -290,3 +290,23 @@ def test_busy_restored_after_expand(qtbot):
     w = make(qtbot, [g])
     top(w, 0).setExpanded(True)
     assert w._busy is False
+
+
+def test_refused_item_shows_hint_in_tooltips_and_description(qtbot):
+    it = CleanableItem(cleaner_id="big_files", description="big_files: huge.iso",
+                       size=5 * MB, path=f"{HOME}/huge.iso", report_only=True,
+                       hint="Delete it manually")
+    g = Group(cleaner_id="big_files", title="Largest files", blurb="b",
+              category="review", safety=Safety.REVIEW, items=[it], shown=[it],
+              rest=[], zero=[], total_size=5 * MB)
+    w = make(qtbot, [g])
+    w.expandItem(top(w, 0))
+    row = top(w, 0).child(0)
+    for col in (0, 1):
+        tip = row.toolTip(col)
+        assert "Delete it manually" in tip
+        assert f"{HOME}/huge.iso" in tip
+        assert "Review only: Cleanix never deletes this." in tip
+    assert row.text(1).startswith("Review only: Cleanix never deletes this.")
+    assert "Delete it manually" in row.text(1)
+    assert not row.flags() & Qt.ItemFlag.ItemIsUserCheckable

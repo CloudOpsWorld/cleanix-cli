@@ -283,14 +283,15 @@ class GroupedResults(QTreeWidget):
         else:
             full = item.path or ""
             row.setText(1, shorten_path(full, self._home))
-        row.setToolTip(0, full)
-        row.setToolTip(1, full)
+        reason = self.refusal_reason(item)
+        tip = chr(10).join(t for t in (full, reason, item.hint) if t)
+        row.setToolTip(0, tip)
+        row.setToolTip(1, tip)
         safety = self._item_safety(g, item)
         self._badge(row, safety)
         row.setText(3, "")
         row.setText(4, human_size(item.size))
         row.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        reason = self.refusal_reason(item)
         flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
         if reason is None:
             flags |= Qt.ItemFlag.ItemIsUserCheckable
@@ -299,8 +300,7 @@ class GroupedResults(QTreeWidget):
                               else Qt.CheckState.Unchecked)
         else:
             row.setFlags(flags)
-            row.setToolTip(0, f"{full}\n{reason}")
-            row.setText(1, reason)
+            row.setText(1, f"{reason} {item.hint}" if item.hint else reason)
         row.setData(0, _ACCESSIBLE,
                     f"{label}, {safety.value}, {human_size(item.size)}")
         return row
