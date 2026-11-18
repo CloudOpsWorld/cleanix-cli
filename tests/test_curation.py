@@ -187,3 +187,29 @@ def test_curation_imports_without_qt():
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+def test_will_not_delete_copy_only_on_report_only_cleaners():
+    import inspect
+
+    cleaners = registry.describe_all(Config())
+    flagged = [cid for cid, c in COPY.items() if "will not delete" in c.blurb]
+    assert flagged
+    for cid in flagged:
+        assert cid in cleaners, cid
+        src = inspect.getsource(type(cleaners[cid]))
+        assert "report_item(" in src or "report_only=True" in src, cid
+
+
+def test_preselectable_cleaner_ids_are_pinned():
+    pinned = {
+        "temp", "win_temp", "browsers", "win_browser_cache", "dev_caches",
+        "pip_cache", "npm_cache", "lang_caches", "win_pkg_caches",
+        "win_visualstudio", "jetbrains", "user_cache", "thumbnails",
+        "win_thumbnails", "win_error_reports", "electron_cache",
+        "gpu_shader_cache", "win_shader_cache",
+    }
+    infos = catalog.list_cleaners(Config(), include_unsupported=True)
+    eligible = {i.id for i in infos
+                if i.safe_default and i.category not in catalog._NEVER_PRESELECT}
+    assert eligible == pinned
