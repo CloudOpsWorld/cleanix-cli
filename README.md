@@ -313,32 +313,59 @@ Without the extra, `cleanix gui` prints the install hint and the CLI keeps
 working. Standalone GUI installers (Windows installer, macOS `.dmg`, Linux
 AppImage) are coming in a later release (Plan 2B); for now install with pip.
 
-**Simple mode** (the default) is Scan, review, Clean, Undo. Results are
-grouped into category cards. Only files from reviewed-safe cleaners that your
-normal user can delete are pre-selected. Everything else sits unticked in the
-collapsed "Also found" section. Trash / Recycle Bin and the "System" card can
-be ticked there: system items that do not need administrator rights
-(Docker/Podman/nerdctl prune, Flatpak, `nix` garbage collection, Homebrew)
-are always tickable; system items that do need them are tickable only when
-administrator cleaning is available (see below) and the administrator helper
-would actually clean them, otherwise they are shown read-only with the
-reason. Report-only findings, unreviewed cleaners and the other
-categories are shown for review only. Nothing that
-needs administrator permission, nothing irreversible and no personal data is
-ever pre-selected. Before cleaning, a confirmation shows the count and size and
-offers **"Keep a copy so I can undo"**, ticked by default: files are moved into
-quarantine instead of deleted (they use disk space until you empty it).
+**Simple and Power.** A toolbar switch at the top picks the mode; the choice
+is remembered. Both modes show scan results as a short list of plain-language
+groups instead of raw paths. Each group has a title, a one-line explanation,
+the item count, the total size and a **safety badge**. The badge always spells
+the level out in words (colour is only a hint):
 
-**Power mode** (toolbar toggle; the choice is remembered) shows every cleaner
-and every item in a sortable, filterable table with a detail pane, JSON export,
-and tabs for Quarantine (restore, delete a run, empty all), History, Schedule,
-Settings (every config key, including `protected_globs`) and Findings
-(report-only items, with Reveal in the file manager; never deleted). Settings
-saved there apply to the running GUI from the next scan or clean (no restart
-needed). **Dry run is ticked by default**; untick it to clean for real. A dry
-run never asks for administrator permission: items that need it are listed as
-a preview ("would be removed after one administrator prompt"). "Keep a copy
-(undo)" is also ticked by default.
+- **Safe**: rebuilt automatically; removed without fuss.
+- **Review**: Cleanix never deletes it; you decide (report-only findings and
+  cleaners that are not reviewed-safe). Its row says why it cannot be ticked
+  and, where there is one, how to remove it by hand.
+- **Needs admin**: needs administrator permission; tickable only when
+  administrator cleaning is available and the helper would clean it, otherwise
+  shown read-only with the reason.
+- **Permanent**: cannot be undone (command items such as emptying the
+  Recycle Bin / Trash or pruning containers).
+
+A group shows its biggest items (top 15) and folds the rest into one
+"N smaller items" row; double-click it (or Enter, or right-click and Show all)
+to list them. Items with nothing to reclaim are hidden. Command items, whose
+size is only an estimate, are never hidden for being 0 B. Hover a row for the
+full path and any manual-removal hint; right-click an item for Copy path and
+Open location.
+
+**Simple mode** (the default) is Scan, review, Clean, Undo. A **Deep scan**
+checkbox (off by default) adds the slow cleaners (duplicates, big files and
+similar); a normal scan skips them. Results are split into three lists: the
+main list holds groups with something pre-selected, "Also found (not
+selected)" holds safe or admin groups you did not ask for, and "Needs your
+review" holds review-only groups. Only files from reviewed-safe cleaners that
+your normal user can delete are pre-selected; nothing that needs
+administrator permission, nothing irreversible and no personal data is ever
+pre-selected. Before cleaning, a confirmation shows the count and size and
+offers **"Keep a copy so I can undo"**, ticked by default: files are moved
+into quarantine instead of deleted (they use disk space until you empty it).
+
+**Power mode** shows the same curated groups for every cleaner you choose to
+scan ("Choose what to scan"), with a detail pane, JSON export and tabs for
+Quarantine (restore, delete a run, empty all), History, Schedule, Settings
+(every config key, including `protected_globs`) and Findings (report-only
+items, with Reveal in the file manager; never deleted). Extra controls:
+
+- **Raw list** toggles between the curated groups and the full sortable,
+  filterable table of every item.
+- Quick selects: **Select all visible**, **Select none**, **Safe only** and
+  **Developer** act on the rows currently visible (filter and safety level).
+- A safety-level filter, a text filter and **Show empty** (lists zero-size
+  items and lets you tick them).
+
+Settings saved in the Settings tab apply to the running GUI from the next scan
+or clean (no restart needed). **Dry run is ticked by default**; untick it to
+clean for real. A dry run never asks for administrator permission: items that
+need it are listed as a preview ("would be removed after one administrator
+prompt"). "Keep a copy (undo)" is also ticked by default.
 
 **What Undo covers.** Undo (Simple mode, or Restore in the Quarantine tab) only
 brings back *files* that were cleaned as your normal user with a copy kept.

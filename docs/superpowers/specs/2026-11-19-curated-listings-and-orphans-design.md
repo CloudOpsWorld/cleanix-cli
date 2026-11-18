@@ -1,6 +1,6 @@
 # Curated listings, registry cleanup and system-wide orphan reports — design
 
-Status: draft for approval. Builds on `2026-11-16-windows-and-gui-design.md` (branch `feat/gui`).
+Status: sub-project A (curated listings) is implemented on `feat/curated-listings`; B and C remain draft. Builds on `2026-11-16-windows-and-gui-design.md` (branch `feat/gui`).
 Delivered as three sub-projects, in this order: **A** curated listings, **B** Windows registry cleanup, **C** Linux/macOS system-wide orphan reports. Each gets its own plan; this document fixes the shape of all three and the detail of A.
 
 ## Intent and why
