@@ -420,3 +420,15 @@ def test_simple_scan_worker_forwards_deep(qtbot, monkeypatch):
     w3 = _window(qtbot, scan_worker_factory=lambda cfg: got.append("plain"))
     w3._make_simple_scan_worker(w3.config, deep=True)
     assert got == [True, {"deep": True}, "plain"]
+
+
+def test_power_toolbar_third_row_fits_1024(qtbot):
+    w = _window(qtbot)
+    pv = w.power_view
+    row3 = pv.toolbar_row3
+    widgets = [row3.itemAt(i).widget() for i in range(row3.count())]
+    widgets = [x for x in widgets if x]
+    assert widgets == [pv.safe_only_button, pv.developer_button, pv.safety_combo,
+                       pv.show_empty_check, pv.raw_toggle]
+    need = sum(x.sizeHint().width() for x in widgets) + row3.spacing() * (len(widgets) - 1)
+    assert need < 1024 - 2 * 12

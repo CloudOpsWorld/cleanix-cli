@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListView,
@@ -223,6 +224,7 @@ class PowerView(QWidget):
         row3.addStretch(1)
         row3.addWidget(self.raw_toggle)
         self.toolbar_rows = (row1, row2)  # row3: curated-view controls
+        self.toolbar_row3 = row3
 
         self.cleaner_list = QListView()
         self.cleaner_list.setModel(self.cleaner_model)
@@ -262,7 +264,11 @@ class PowerView(QWidget):
         for cb in self.table.findChildren(QAbstractButton):
             cb.setAccessibleName("Select all rows")  # the table's corner button
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        for col in (0, 1, 3, 4, 5):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.selectionModel().currentRowChanged.connect(self._on_current_changed)
 
         # Read-only text box: wraps long unbroken paths, keyboard focusable

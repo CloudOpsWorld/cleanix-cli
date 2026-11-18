@@ -26,12 +26,19 @@ _RANK = {Safety.SAFE: 0, Safety.REVIEW: 1, Safety.ADMIN: 2, Safety.PERMANENT: 3}
 _CHECK = Qt.ItemDataRole.CheckStateRole
 _ACCESSIBLE = Qt.ItemDataRole.AccessibleTextRole
 
-# Colour is only a hint; the badge text always carries the meaning.
-_BADGE_COLOR = {
-    Safety.SAFE: "#2e7d32",
-    Safety.REVIEW: "#b26a00",
-    Safety.ADMIN: "#1565c0",
-    Safety.PERMANENT: "#c62828",
+# Colour is only a hint; the badge text always carries the meaning. Two
+# palettes keep the text readable (>= 4.5:1) on light and on dark backgrounds.
+_BADGE_LIGHT = {
+    Safety.SAFE: "#1b5e20",
+    Safety.REVIEW: "#8a4b00",
+    Safety.ADMIN: "#0d47a1",
+    Safety.PERMANENT: "#b71c1c",
+}
+_BADGE_DARK = {
+    Safety.SAFE: "#81c784",
+    Safety.REVIEW: "#ffb74d",
+    Safety.ADMIN: "#90caf9",
+    Safety.PERMANENT: "#ef9a9a",
 }
 
 REVIEW_ONLY_REASON = "Review only: Cleanix never deletes this."
@@ -232,7 +239,9 @@ class GroupedResults(QTreeWidget):
 
     def _badge(self, row: QTreeWidgetItem, safety: Safety) -> None:
         row.setText(2, safety.value)
-        row.setForeground(2, QBrush(QColor(_BADGE_COLOR[safety])))
+        dark = self.palette().base().color().lightness() < 128
+        row.setForeground(2, QBrush(QColor(
+            (_BADGE_DARK if dark else _BADGE_LIGHT)[safety])))
         row.setToolTip(2, f"Safety: {safety.value}")
 
     def _make_group_row(self, gi: int, g: Group) -> QTreeWidgetItem:
