@@ -319,15 +319,16 @@ groups instead of raw paths. Each group has a title, a one-line explanation,
 the item count, the total size and a **safety badge**. The badge always spells
 the level out in words (colour is only a hint):
 
-- **Safe**: rebuilt automatically; removed without fuss.
-- **Review**: Cleanix never deletes it; you decide (report-only findings and
-  cleaners that are not reviewed-safe). Its row says why it cannot be ticked
-  and, where there is one, how to remove it by hand.
-- **Needs admin**: needs administrator permission; tickable only when
-  administrator cleaning is available and the helper would clean it, otherwise
-  shown read-only with the reason.
-- **Permanent**: cannot be undone (command items such as emptying the
-  Recycle Bin / Trash or pruning containers).
+- **Safe**: rebuilt automatically; can be cleaned from Simple mode.
+- **Review**: needs your judgment. Report-only findings are never deleted by
+  Cleanix (their row says why and, where there is one, how to remove them by
+  hand). Other Review items can be cleaned only from Power mode; in Simple
+  mode they are listed read-only.
+- **Needs admin**: needs administrator permission and cannot be undone;
+  tickable only when administrator cleaning is available and the helper would
+  clean it, otherwise shown read-only with the reason.
+- **Permanent**: cannot be undone (command items, for example emptying the
+  Windows Recycle Bin or pruning containers).
 
 A group shows its biggest items (top 15) and folds the rest into one
 "N smaller items" row; double-click it (or Enter, or right-click and Show all)
@@ -340,8 +341,10 @@ Open location.
 checkbox (off by default) adds the slow cleaners (duplicates, big files and
 similar); a normal scan skips them. Results are split into three lists: the
 main list holds groups with something pre-selected, "Also found (not
-selected)" holds safe or admin groups you did not ask for, and "Needs your
-review" holds review-only groups. Only files from reviewed-safe cleaners that
+selected)" holds the Permanent and Needs admin groups, and "Needs your
+review" holds the Review groups. Simple mode only lets you tick reviewed-safe
+cleaners and the Trash and System groups; everything else (including cleaners
+Cleanix does not know) is read-only there. Only files from reviewed-safe cleaners that
 your normal user can delete are pre-selected; nothing that needs
 administrator permission, nothing irreversible and no personal data is ever
 pre-selected. Before cleaning, a confirmation shows the count and size and
