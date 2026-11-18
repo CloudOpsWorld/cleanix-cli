@@ -365,6 +365,10 @@ class PowerView(QWidget):
                 g = self._filter_group(g, text)
                 if g is None:
                     continue
+            if not self.show_empty_check.isChecked() and g.zero:
+                # Empty items are not displayed, so they must not be selectable.
+                g = dataclasses.replace(g, items=[i for i in g.items if i.size > 0],
+                                        zero=[])
             shown.append(g)
         self._syncing = True
         try:
@@ -427,7 +431,7 @@ class PowerView(QWidget):
         m = self.item_model
         self._bulk = True
         try:
-            for r in range(m.rowCount()):
+            for r in self._actionable_rows():
                 m.set_checked(r, bool(predicate(m.item_at(r))))
         finally:
             self._bulk = False
@@ -514,14 +518,25 @@ class PowerView(QWidget):
         return [self.proxy.mapToSource(self.proxy.index(r, 0)).row()
                 for r in range(self.proxy.rowCount())]
 
+    def _actionable_rows(self) -> List[int]:
+        """Visible rows of the page being shown; on the tree page only items
+        the tree displays (empty items only with Show empty)."""
+        rows = self._visible_rows()
+        if self.stack.currentWidget() is not self.tree:
+            return rows
+        shown = {item_key(i) for g in self.tree._groups for i in g.items}
+        m = self.item_model
+        return [r for r in rows if item_key(m.item_at(r)) in shown]
+
     def visible_checked_items(self) -> List[CleanableItem]:
         m = self.item_model
-        return [m.item_at(r) for r in self._visible_rows() if m.is_checked(r)]
+        return [m.item_at(r) for r in self._actionable_rows() if m.is_checked(r)]
 
     def _set_visible(self, on: bool) -> None:
         self._bulk = True
         try:
-            for r in self._visible_rows():
+            rows = self._actionable_rows() if on else self._visible_rows()
+            for r in rows:
                 self.item_model.set_checked(r, on)  # refuses report-only rows
         finally:
             self._bulk = False
@@ -577,6 +592,8 @@ class PowerView(QWidget):
 
         def _pre(item: CleanableItem) -> bool:
             info = infos.get(item.cleaner_id)
+            if item.size <= 0 and not self.show_empty_check.isChecked():
+                return False  # not displayed, so never pre-checked
             return info is not None and catalog.preselect(item, info)
 
         self.item_model.set_result(result, _pre)

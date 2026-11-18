@@ -783,3 +783,59 @@ def test_real_clean_removes_rows_from_tree(qtbot, monkeypatch, sync_workers):
     v.clean_button.click()
     assert v.tree.group_count() == 2  # temp group fully cleaned
     assert v.tree.checked_keys() == {item_key(i) for i in v.item_model.checked_items()}
+
+
+def _zero_result():
+    return ScanResult(reports=[CleanerReport("temp", "Temp", "t", items=[
+        CleanableItem("temp", "real", size=10, path="/t/real"),
+        CleanableItem("temp", "empty", size=0, path="/t/empty")])])
+
+
+def test_bulk_actions_skip_zero_size_items_without_show_empty(qtbot, monkeypatch, sync_workers):
+    texts, seen = [], []
+    v = pv.PowerView(Config(), clean_worker_factory=_stub_real_clean(monkeypatch, texts, seen))
+    qtbot.addWidget(v)
+    v._on_scan_finished(_zero_result())
+    empty = "/t/empty"
+    for action in (v.select_all_visible, v.safe_only_button.click):
+        v.select_none_visible()
+        action()
+        assert empty not in [i.path for i in v.item_model.checked_items()]
+    v.select_none_visible()
+    v.developer_button.click()
+    assert empty not in [i.path for i in v.item_model.checked_items()]
+    v.select_all_visible()
+    v.clean_button.click()
+    assert [i.path for i in seen[-1]] == ["/t/real"]
+    # a tree group tick does not reach the hidden empty item either
+    v.select_none_visible()
+    _group_row(v, "temp").setCheckState(0, Qt.CheckState.Checked)
+    assert empty not in [i.path for i in v.item_model.checked_items()]
+
+
+def test_zero_size_items_selectable_with_show_empty(qtbot, monkeypatch, sync_workers):
+    v = pv.PowerView(Config())
+    qtbot.addWidget(v)
+    v._on_scan_finished(_zero_result())
+    v.show_empty_check.setChecked(True)
+    v.select_none_visible()
+    v.select_all_visible()
+    assert "/t/empty" in [i.path for i in v.item_model.checked_items()]
+
+
+def test_quick_select_leaves_hidden_rows_alone(qtbot, sync_workers):
+    view = pv.PowerView(Config(), allow_admin_items=True)
+    qtbot.addWidget(view)
+    _load(view)
+    view.select_all_visible()
+    assert any(i.cleaner_id == "apt" for i in view.item_model.checked_items())
+    view.filter_edit.setText("temp")
+    view.select_none_visible()
+    view.safe_only_button.click()
+    view.filter_edit.setText("")
+    assert any(i.cleaner_id == "apt" for i in view.item_model.checked_items())
+    view.filter_edit.setText("temp")
+    view.developer_button.click()  # temp is not "dev": clears visible only
+    view.filter_edit.setText("")
+    assert any(i.cleaner_id == "apt" for i in view.item_model.checked_items())
+    assert not any(i.cleaner_id == "temp" for i in view.item_model.checked_items())
