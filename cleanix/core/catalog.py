@@ -22,11 +22,12 @@ CATEGORIES: Dict[str, str] = {
     "trash": "Trash / Recycle Bin",
     "system": "System files (administrator)",
     "review": "Needs your review",
+    "backups": "Backups & leftovers",
     "other": "Other",
 }
 
 # Categories whose items are never pre-selected, whatever the cleaner says.
-_NEVER_PRESELECT = frozenset({"trash", "system", "review", "other"})
+_NEVER_PRESELECT = frozenset({"trash", "system", "review", "backups", "other"})
 
 _CATEGORY_BY_ID: Dict[str, str] = {}
 
@@ -47,6 +48,26 @@ _assign(
     "apps",
     "user_cache thumbnails win_thumbnails win_error_reports electron_cache "
     "gpu_shader_cache win_shader_cache",
+)
+_assign(
+    "temp",
+    "broken_symlinks apple_litter home_coredumps build_litter macos_diagnostics",
+)
+_assign(
+    "dev",
+    "toolchains guix conda opam sdkman gem cpanm ollama huggingface "
+    "ai_compile_cache vm_tooling ide_caches xcode",
+)
+_assign(
+    "apps",
+    "font_cache flatpak_cache steam search_index snap_app_cache appimage "
+    "macos_extra macos_containers macos_font_cache macos_caches",
+)
+# Tool leftovers, session/history data and backup-style litter.
+_assign(
+    "backups",
+    "claude_code codex gemini_cli opencode ai_clients aider app_leftovers "
+    "backup_files backup_caches editor_state",
 )
 _assign("trash", "trash macos_trash win_recycle_bin")
 # Report-only cleaners (never deletes; user reviews manually). These win over
