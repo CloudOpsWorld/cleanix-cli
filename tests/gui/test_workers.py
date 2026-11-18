@@ -57,6 +57,21 @@ def test_scan_worker_emits_progress_then_finished(qtbot, monkeypatch):
     assert rec.terminal() == ["finished"]
 
 
+def test_scan_worker_forwards_only_and_exclude(qtbot, monkeypatch):
+    seen = {}
+
+    def fake_scan(config, only=None, exclude=None, progress=None, cancel=None):
+        seen.update(only=only, exclude=exclude)
+        return "R"
+
+    monkeypatch.setattr(workers.service, "scan", fake_scan)
+    _run(qtbot, workers.ScanWorker(object(), only=["a"], exclude=["x", "y"]))
+    assert seen == {"only": ["a"], "exclude": ["x", "y"]}
+    seen.clear()
+    _run(qtbot, workers.ScanWorker(object()))
+    assert seen == {"only": None, "exclude": None}
+
+
 def test_scan_worker_cancel_emits_cancelled_once(qtbot, monkeypatch):
     started = threading.Event()
 

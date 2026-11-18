@@ -5,10 +5,9 @@ from __future__ import annotations
 import dataclasses
 from typing import Callable, Optional
 
-from PySide6.QtCore import QSettings, QTimer, Slot
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QSettings, Qt, QTimer, Slot
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QSizePolicy, QStackedWidget, QToolBar, QWidget,
+    QApplication, QButtonGroup, QMainWindow, QPushButton, QSizePolicy, QStackedWidget, QToolBar, QWidget,
 )
 
 from cleanix.config import Config
@@ -75,13 +74,16 @@ class MainWindow(QMainWindow):
         self.toolbar = QToolBar("Mode")
         self.toolbar.setMovable(False)
         self.addToolBar(self.toolbar)
-        self.power_action = QAction("Power mode", self)
-        self.power_action.setCheckable(True)
-        self.power_action.toggled.connect(self._on_toggled)
-        self.toolbar.addAction(self.power_action)
-        btn = self.toolbar.widgetForAction(self.power_action)
-        if btn is not None:
-            btn.setAccessibleName("Power mode")
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        self.simple_button = self._mode_button("Simple", "Simple mode", "left")
+        self.power_button = self._mode_button("Power", "Power mode", "right")
+        self.mode_group.addButton(self.simple_button)
+        self.mode_group.addButton(self.power_button)
+        self.simple_button.clicked.connect(self._on_simple_clicked)
+        self.power_button.clicked.connect(self._on_power_clicked)
+        self.toolbar.addWidget(self.simple_button)
+        self.toolbar.addWidget(self.power_button)
 
         self._mode = SIMPLE
         self.set_mode(_load_mode(), persist=False)
@@ -232,9 +234,8 @@ class MainWindow(QMainWindow):
         if mode not in (SIMPLE, POWER):
             mode = SIMPLE
         self._mode = mode
-        self.power_action.blockSignals(True)
-        self.power_action.setChecked(mode == POWER)
-        self.power_action.blockSignals(False)
+        self.simple_button.setChecked(mode == SIMPLE)
+        self.power_button.setChecked(mode == POWER)
         current = self.power_page if mode == POWER else self.simple_page
         hidden = self.simple_page if mode == POWER else self.power_page
         # The hidden page must not constrain the window's minimum size.
@@ -247,8 +248,31 @@ class MainWindow(QMainWindow):
         if persist:
             _save_mode(mode)
 
-    def _on_toggled(self, checked: bool) -> None:
-        self.set_mode(POWER if checked else SIMPLE)
+    def _mode_button(self, text: str, name: str, side: str) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setCheckable(True)
+        btn.setAccessibleName(name)
+        btn.setToolTip(name)
+        btn.setMinimumSize(96, 34)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        radius = ("border-top-left-radius:6px;border-bottom-left-radius:6px;"
+                  if side == "left" else
+                  "border-top-right-radius:6px;border-bottom-right-radius:6px;")
+        btn.setStyleSheet(
+            "QPushButton{font-size:14px;font-weight:600;padding:4px 18px;"
+            "border:1px solid palette(mid);" + radius + "}"
+            "QPushButton:checked{background:palette(highlight);"
+            "color:palette(highlighted-text);}"
+            "QPushButton:focus{border:2px solid palette(highlight);}")
+        return btn
+
+    @Slot()
+    def _on_simple_clicked(self) -> None:
+        self.set_mode(SIMPLE)
+
+    @Slot()
+    def _on_power_clicked(self) -> None:
+        self.set_mode(POWER)
 
     def _swap(self, old: QWidget, new: QWidget) -> None:
         idx = self.stack.indexOf(old)

@@ -26,6 +26,9 @@ CATEGORIES: Dict[str, str] = {
     "other": "Other",
 }
 
+# Cleaners excluded from the default (fast) scan; Simple's "Deep scan" opts in.
+SLOW_SCAN_IDS = ("duplicates", "big_files", "downloads")
+
 # Categories whose items are never pre-selected, whatever the cleaner says.
 _NEVER_PRESELECT = frozenset({"trash", "system", "review", "backups", "other"})
 
