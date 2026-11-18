@@ -530,8 +530,8 @@ def test_set_allow_admin_items_updates_trees_and_selection(qtbot):
     tick(v.also_tree, "APT cache and unused packages")
     assert v.selected_size() == 30
     v.set_allow_admin_items(False, "Helper unavailable")
-    assert v.selected_items() == [i for i in v.selected_items() if not i.requires_root]
-    assert v.selected_size() == 10
+    assert any(i.requires_root for i in v.selected_items()) is False
+    assert len(v.selected_items()) == 1 and v.selected_size() == 10
     apt = row(v.also_tree, "APT cache and unused packages")
     assert "Helper unavailable" in apt.text(1)
     assert v.clean_button.text() == "Clean 10 B"
@@ -712,12 +712,42 @@ def test_admin_wait_message_wraps_and_is_never_elided(qtbot):
 
 
 def test_non_selectable_rows_show_their_reason(qtbot):
+    from cleanix.gui.grouped_results import ADMIN_REASON, REVIEW_ONLY_REASON
+
     v = make_view(qtbot)
-    v.set_scan_result(result(
-        item("big_files", 1, report_only=True, requires_root=True, hint="Delete manually")))
+    rep = item("temp", 1, report_only=True, hint="Review by hand")
+    adm = item("temp", 2, requires_root=True)
+    v.set_scan_result(result(rep, adm))
+    assert v.results_tree.refusal_reason(rep) == REVIEW_ONLY_REASON
+    assert v.results_tree.refusal_reason(adm) == ADMIN_REASON
+    assert "administrator" in ADMIN_REASON.lower()
+    # a report-only item that also needs root keeps the report-only reason
+    both = item("big_files", 1, report_only=True, requires_root=True,
+                hint="Delete manually")
+    v.set_scan_result(result(both))
     g = row(v.review_tree, "Largest files")
     assert not (g.flags() & Qt.ItemFlag.ItemIsUserCheckable)
+    assert g.text(1) == REVIEW_ONLY_REASON
+    assert v.review_tree.refusal_reason(both) == REVIEW_ONLY_REASON
     assert v.review_tree.checked_items() == []
+    # custom admin reason is used when admin items are unavailable
+    v2 = SimpleView(Config(), admin_unavailable_reason="Helper unavailable")
+    qtbot.addWidget(v2)
+    v2.set_scan_result(result(item("apt", 5, requires_root=True)))
+    g2 = row(v2.also_tree, "APT cache and unused packages")
+    assert g2.text(1) == "Helper unavailable"
+
+
+def test_mixed_group_keeps_safe_item_preselected(qtbot):
+    safe = item("temp", 100)
+    rep = item("temp", 50, report_only=True)
+    v = make_view(qtbot)
+    v.set_scan_result(result(safe, rep))
+    assert "Temporary files" in rows(v.results_tree)
+    assert "Temporary files" not in rows(v.review_tree)
+    assert v.selected_items() == [safe]
+    assert v.selected_size() == 100
+    assert rep not in v.results_tree.checked_items()
 
 
 def test_clean_finished_and_undone_signals(qtbot, monkeypatch):

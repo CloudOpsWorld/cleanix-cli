@@ -101,6 +101,8 @@ def test_simple_cards_offer_only_what_the_helper_cleans(qtbot):
     qtbot.addWidget(v)
     v.set_scan_result(as_result(items))
     tree = v.also_tree
+    present = {id(i) for t in v.trees() for g in t._groups for i in g.items}
+    assert {id(i) for i in items} <= present
     for i in items:
         reason = tree.refusal_reason(i)
         if reason is None:

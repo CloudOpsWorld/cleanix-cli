@@ -157,10 +157,13 @@ class MainWindow(QMainWindow):
         if factory is workers.ScanWorker:
             return simple_view._default_scan_factory(cfg, deep=deep)
         try:
-            takes_deep = "deep" in inspect.signature(factory).parameters
+            params = inspect.signature(factory).parameters.values()
         except (TypeError, ValueError):
-            takes_deep = False
-        return factory(cfg, deep=deep) if takes_deep else factory(cfg)
+            params = ()
+        if any(p.name == "deep" or p.kind is inspect.Parameter.VAR_KEYWORD
+               for p in params):
+            return factory(cfg, deep=deep)
+        return factory(cfg)
 
     def _make_power_scan_worker(self, only):
         return self._scan_factory(self.config, only=only)

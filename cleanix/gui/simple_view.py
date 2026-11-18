@@ -45,7 +45,7 @@ IDLE_HEADLINE = "Free up disk space"
 IDLE_REASSURANCE = ("Nothing is deleted until you review it. "
                     "Most cleanups can be undone.")
 DEEP_SCAN_TEXT = "Deep scan (slower: duplicates, big files)"
-SLOW = getattr(catalog, "SLOW_SCAN_IDS", ("duplicates", "big_files", "downloads"))
+SLOW = catalog.SLOW_SCAN_IDS
 
 
 def _default_scan_factory(config: Config, deep: bool = False):
@@ -528,10 +528,10 @@ class SimpleView(QWidget):
         groups = curation.build_groups(result, infos)
         review, main, also = [], [], []
         for g in groups:
-            if g.safety is curation.Safety.REVIEW:
-                review.append(g)
-            elif any(preselect(i) for i in g.items):
+            if any(preselect(i) for i in g.items):
                 main.append(g)
+            elif g.safety is curation.Safety.REVIEW:
+                review.append(g)
             else:
                 also.append(g)
 

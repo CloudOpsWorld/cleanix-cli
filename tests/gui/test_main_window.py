@@ -395,3 +395,28 @@ def test_mode_switch_persists_via_isolated_settings(qtbot):
     w.simple_button.click()
     assert main_window._load_mode() == "simple"
     assert w.stack.currentWidget() is w.simple_page
+
+
+def test_simple_scan_worker_forwards_deep(qtbot, monkeypatch):
+    from cleanix.gui import simple_view, workers
+
+    # default factory goes through the Simple mode factory with the flag
+    seen = []
+    monkeypatch.setattr(simple_view, "_default_scan_factory",
+                        lambda cfg, deep=False: seen.append(deep) or "w")
+    w = _window(qtbot, scan_worker_factory=workers.ScanWorker)
+    assert w._make_simple_scan_worker(w.config, deep=True) == "w"
+    assert w._make_simple_scan_worker(w.config) == "w"
+    assert seen == [True, False]
+
+    # injected factory with a deep parameter receives it
+    got = []
+    w = _window(qtbot, scan_worker_factory=lambda cfg, deep=False: got.append(deep))
+    w._make_simple_scan_worker(w.config, deep=True)
+    # injected with **kwargs receives it too
+    w2 = _window(qtbot, scan_worker_factory=lambda cfg, **kw: got.append(kw))
+    w2._make_simple_scan_worker(w2.config, deep=True)
+    # injected without it is called plainly
+    w3 = _window(qtbot, scan_worker_factory=lambda cfg: got.append("plain"))
+    w3._make_simple_scan_worker(w3.config, deep=True)
+    assert got == [True, {"deep": True}, "plain"]
