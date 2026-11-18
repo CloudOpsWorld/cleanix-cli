@@ -777,6 +777,16 @@ def _simple_view(qtbot, monkeypatch, outcome, infos=None):
     return v, confirms
 
 
+def _tick_group(v, title):
+    for tree in v.trees():
+        for i in range(tree.topLevelItemCount()):
+            r = tree.topLevelItem(i)
+            if r.text(0) == title:
+                r.setCheckState(0, Qt.CheckState.Checked)
+                return
+    raise AssertionError(title)
+
+
 def _admin_scan():
     items = [CleanableItem("temp", "user tmp", size=100, path="/t/u"),
              CleanableItem("logs", "system log", size=50, path="/var/log/x",
@@ -789,9 +799,10 @@ def test_simple_confirm_counts_admin_items(qtbot, monkeypatch):
     v, confirms = _simple_view(qtbot, monkeypatch, combined("done", result=elevate.HelperResult(
         freed=50, removed=1, errors=[], unmatched=0)))
     v.set_scan_result(_admin_scan())
-    system = next(c for c in v.cards() if c.category == "system")
-    assert system.mode == "optin"
-    system.checkbox.setChecked(True)
+    assert any(r.text(0) == "Old system logs"
+               for r in (v.also_tree.topLevelItem(i)
+                         for i in range(v.also_tree.topLevelItemCount())))
+    _tick_group(v, "Old system logs")
     v._on_clean_clicked()
     assert confirms[0].admin_items == 1 and confirms[0].count == 2
     assert confirms[0].irreversible == 0
@@ -812,7 +823,7 @@ def test_simple_done_screen_shows_admin_outcome_and_user_part(qtbot, monkeypatch
     outcome = combined(status, result=res, cancelled=status is None)
     v, _ = _simple_view(qtbot, monkeypatch, outcome)
     v.set_scan_result(_admin_scan())
-    next(c for c in v.cards() if c.category == "system").checkbox.setChecked(True)
+    _tick_group(v, "Old system logs")
     v._on_clean_clicked()
     assert v.state() is SimpleState.DONE
     assert v.admin_label.text().startswith(first)
@@ -1191,7 +1202,7 @@ def test_simple_cancel_disabled_while_waiting_for_admin_and_late_cancel_shown(
     holder["v"] = v
     qtbot.addWidget(v)
     v.set_scan_result(_admin_scan())
-    next(c for c in v.cards() if c.category == "system").checkbox.setChecked(True)
+    _tick_group(v, "Old system logs")
     v._on_clean_clicked()
     assert holder["w"].states == [("before", True), ("waiting", False)]
     assert v.state() is SimpleState.DONE

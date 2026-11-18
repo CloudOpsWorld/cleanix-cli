@@ -427,6 +427,10 @@ class SimpleView(QWidget):
         }[state]
         self._stack.setCurrentWidget(page)
 
+    def trees(self) -> Tuple[GroupedResults, ...]:
+        """The result trees: main, also found, needs review."""
+        return self._trees
+
     def also_found_expanded(self) -> bool:
         return self.also_found_toggle.isChecked()
 

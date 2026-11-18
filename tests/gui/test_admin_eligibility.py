@@ -100,20 +100,18 @@ def test_simple_cards_offer_only_what_the_helper_cleans(qtbot):
     v = SimpleView(Config(), allow_admin_items=True)
     qtbot.addWidget(v)
     v.set_scan_result(as_result(items))
-    seen = 0
-    for card in v.cards():
-        for i in card.items:
-            seen += 1
-            if card.mode != "readonly":
-                assert helper_static_accepts(i, allowed), i.description
-            elif not i.report_only and not helper_static_accepts(i, allowed):
-                assert elevated.static_admin_problem(i, allowed) in card.hint_label.fullText()
-        if card.mode == "readonly":
-            assert not card.checkbox.isEnabled()
-    assert seen == len(items)
-    for card in v.cards():
-        if card.mode != "readonly":
-            card.checkbox.setChecked(True)
+    tree = v.also_tree
+    for i in items:
+        reason = tree.refusal_reason(i)
+        if reason is None:
+            assert helper_static_accepts(i, allowed), i.description
+        elif not i.report_only and not helper_static_accepts(i, allowed):
+            assert elevated.static_admin_problem(i, allowed) in reason
+    for t in v.trees():
+        for r in range(t.topLevelItemCount()):
+            row = t.topLevelItem(r)
+            if row.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                row.setCheckState(0, Qt.CheckState.Checked)
     assert all(helper_static_accepts(i, allowed) for i in v.selected_items())
 
 

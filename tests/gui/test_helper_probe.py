@@ -102,8 +102,10 @@ def test_main_window_shows_the_reason_in_both_views(qtbot, monkeypatch, app_env)
     assert w.admin_unavailable_reason == elevation.HELPER_UNAVAILABLE_REASON
     item, result = _admin_result()
     w.simple_view.set_scan_result(result)
-    hints = [c.hint_label.fullText() for c in w.simple_view.cards() if c.hint_label]
+    tree = w.simple_view.also_tree
+    hints = [tree.topLevelItem(i).text(1) for i in range(tree.topLevelItemCount())]
     assert any(elevation.HELPER_UNAVAILABLE_REASON in h for h in hints)
+    assert tree.refusal_reason(item) == elevation.HELPER_UNAVAILABLE_REASON
     assert w.power_view.detail_text(item, allow_admin=False,
                                     unavailable_reason=w.admin_unavailable_reason
                                     ).endswith(elevation.HELPER_UNAVAILABLE_REASON)
