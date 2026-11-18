@@ -175,3 +175,118 @@ def test_empty_groups_shows_nothing_without_error(qtbot):
     assert w.checked_items() == [] and w.checked_size() == 0
     w.set_checked_keys(["x"])
     assert w.checked_keys() == set()
+
+
+def test_set_groups_again_leaves_no_stale_keys(qtbot):
+    g1 = group("a", n=3, top_n=3, zero=0)
+    w = make(qtbot, [g1], preselect=lambda i: True)
+    assert len(w.checked_keys()) == 3
+    g2 = group("b", n=2, top_n=2, zero=0)
+    w.set_groups([g2], lambda i: False)
+    assert w.checked_keys() == set()
+    assert w.checked_items() == []
+
+
+def test_set_allow_admin_items_toggle(qtbot, monkeypatch):
+    g = group("apt", n=3, top_n=3, zero=0, safety=Safety.ADMIN, requires_root=True)
+    monkeypatch.setattr(elevation, "admin_problems", lambda items: {})
+    w = make(qtbot, [g], preselect=lambda i: True, allow_admin_items=True)
+    assert len(w.checked_items()) == 3
+    seen = []
+    w.selection_changed.connect(lambda: seen.append(1))
+    w.set_allow_admin_items(False, "no elevation here")
+    assert w.checked_items() == [] and w.checked_keys() == set()
+    assert seen
+    assert top(w, 0).data(0, Qt.ItemDataRole.CheckStateRole) is None
+    assert top(w, 0).text(1) == "no elevation here"
+    seen.clear()
+    w.set_allow_admin_items(True)
+    assert top(w, 0).data(0, Qt.ItemDataRole.CheckStateRole) is not None
+    assert w.checked_keys() == set() and not seen
+    top(w, 0).setCheckState(0, Qt.CheckState.Checked)
+    assert len(w.checked_items()) == 3
+
+
+def test_command_item_copy_and_open(qtbot, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from cleanix.gui import reveal
+    cmd = CleanableItem(cleaner_id="docker", description="docker: prune",
+                        kind=ItemKind.COMMAND, command=["docker", "system", "prune"])
+    w = make(qtbot, [])
+    w.copy_path(cmd)
+    assert QApplication.clipboard().text() == "docker system prune"
+    called = []
+    monkeypatch.setattr(reveal, "reveal_in_file_manager",
+                        lambda p: called.append(p) or True)
+    assert w.open_location(cmd) is False and not called
+    p = mk("x", 1, 5)
+    assert w.open_location(p) is True and called == [p.path]
+
+
+def test_rest_row_partial_state(qtbot):
+    g = group(n=20, top_n=5, zero=0)
+    w = make(qtbot, [g])
+    top(w, 0).setExpanded(True)
+    w.set_checked_keys([item_key(g.rest[0])])
+    rest = top(w, 0).child(5)
+    assert rest.checkState(0) == Qt.CheckState.PartiallyChecked
+    w.set_checked_keys({item_key(i) for i in g.rest})
+    assert rest.checkState(0) == Qt.CheckState.Checked
+
+
+def test_rest_row_all_refused_shows_reason_and_badge(qtbot):
+    shown = [mk("big", i, 10 * MB) for i in range(2)]
+    rest = [mk("big", 10 + i, MB, requires_root=True) for i in range(3)]
+    g = Group(cleaner_id="big", title="Big", blurb="b", category="apps",
+              safety=Safety.SAFE, items=shown + rest, shown=shown, rest=rest,
+              total_size=sum(i.size for i in shown + rest))
+    w = make(qtbot, [g], preselect=lambda i: True)
+    top(w, 0).setExpanded(True)
+    row = top(w, 0).child(2)
+    assert row.data(0, Qt.ItemDataRole.CheckStateRole) is None
+    assert row.text(1)
+    assert row.text(2) == "Needs admin"
+    assert len(w.checked_items()) == 2
+
+
+def test_raw_visible_with_rest_open(qtbot):
+    g = group(n=10, top_n=3, zero=2)
+    w = make(qtbot, [g])
+    top(w, 0).setExpanded(True)
+    w.show_all(top(w, 0))
+    assert top(w, 0).childCount() == 10
+    w.set_raw_items_visible(True)
+    assert top(w, 0).childCount() == 12
+    w.set_raw_items_visible(False)
+    assert top(w, 0).childCount() == 10
+
+
+def test_show_all_then_tick_5000_is_fast(qtbot):
+    g = group(n=5000, top_n=15, zero=0)
+    w = make(qtbot, [g])
+    top(w, 0).setExpanded(True)
+    w.show_all(top(w, 0))
+    assert top(w, 0).childCount() == 5000
+    t0 = time.perf_counter()
+    top(w, 0).child(100).setCheckState(0, Qt.CheckState.Checked)
+    top(w, 0).setCheckState(0, Qt.CheckState.Checked)
+    assert time.perf_counter() - t0 < 1
+    assert len(w.checked_items()) == 5000
+
+
+def test_enter_on_rest_row_shows_all(qtbot):
+    from PySide6.QtTest import QTest
+    g = group(n=20, top_n=5, zero=0)
+    w = make(qtbot, [g])
+    w.show()
+    top(w, 0).setExpanded(True)
+    w.setCurrentItem(top(w, 0).child(5))
+    QTest.keyClick(w, Qt.Key.Key_Return)
+    assert top(w, 0).childCount() == 20
+
+
+def test_busy_restored_after_expand(qtbot):
+    g = group()
+    w = make(qtbot, [g])
+    top(w, 0).setExpanded(True)
+    assert w._busy is False

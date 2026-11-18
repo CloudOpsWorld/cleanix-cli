@@ -22,6 +22,7 @@ from cleanix.gui import elevation, reveal
 
 COLUMNS = ["Item", "What it is", "Safety", "Items", "Size"]
 _ROLE = Qt.ItemDataRole.UserRole
+_RANK = {Safety.SAFE: 0, Safety.REVIEW: 1, Safety.ADMIN: 2, Safety.PERMANENT: 3}
 _CHECK = Qt.ItemDataRole.CheckStateRole
 _ACCESSIBLE = Qt.ItemDataRole.AccessibleTextRole
 
@@ -103,40 +104,68 @@ class GroupedResults(QTreeWidget):
 
     def set_groups(self, groups: List[Group],
                    preselect: Callable[[CleanableItem], bool]) -> None:
+        prev = self._busy
         self._busy = True
         try:
-            self.clear()
             self._groups = list(groups)
             self._rest_open = set()
-            self._populated = set()
-            self._rest_rows = {}
-            self._group_rows = []
             self._keys = set()
-            every = [i for g in self._groups for i in g.items]
-            self._problems = (elevation.admin_problems(every)
-                              if self._allow_admin else {})
-            self._selectable = []
-            for g in self._groups:
-                sel = [i for i in g.items if self.refusal_reason(i) is None]
-                self._selectable.append(sel)
-                if preselect is not None:
+            self._recompute_selectable()
+            if preselect is not None:
+                for sel in self._selectable:
                     for i in sel:
                         if preselect(i):
                             self._keys.add(item_key(i))
-            for gi, g in enumerate(self._groups):
-                row = self._make_group_row(gi, g)
-                self.addTopLevelItem(row)
-                self._group_rows.append(row)
-                self._refresh_group(gi)
+            self._rebuild_rows(set())
         finally:
-            self._busy = False
+            self._busy = prev
         self.selection_changed.emit()
+
+    def set_allow_admin_items(self, allow: bool, reason: str = "") -> None:
+        """Change admin availability at runtime; rows and selection follow."""
+        self._allow_admin = bool(allow)
+        self._admin_reason = reason
+        prev = self._busy
+        self._busy = True
+        try:
+            before = set(self._keys)
+            expanded = {gi for gi, r in enumerate(self._group_rows) if r.isExpanded()}
+            self._recompute_selectable()
+            valid = {item_key(i) for sel in self._selectable for i in sel}
+            self._keys &= valid
+            self._rebuild_rows(expanded)
+        finally:
+            self._busy = prev
+        if self._keys != before:
+            self.selection_changed.emit()
+
+    def _recompute_selectable(self) -> None:
+        every = [i for g in self._groups for i in g.items]
+        self._problems = (elevation.admin_problems(every)
+                          if self._allow_admin else {})
+        self._selectable = [[i for i in g.items if self.refusal_reason(i) is None]
+                            for g in self._groups]
+
+    def _rebuild_rows(self, expanded: Set[int]) -> None:
+        self.clear()
+        self._populated = set()
+        self._rest_rows = {}
+        self._group_rows = []
+        for gi, g in enumerate(self._groups):
+            row = self._make_group_row(gi, g)
+            self.addTopLevelItem(row)
+            self._group_rows.append(row)
+            self._refresh_group(gi)
+        for gi in sorted(expanded):
+            self._fill_children(gi)
+            self._group_rows[gi].setExpanded(True)
 
     def set_raw_items_visible(self, on: bool) -> None:
         on = bool(on)
         if on == self._raw_visible:
             return
         self._raw_visible = on
+        prev = self._busy
         self._busy = True
         try:
             for gi in sorted(self._populated):
@@ -145,7 +174,7 @@ class GroupedResults(QTreeWidget):
                 self._rest_rows.pop(gi, None)
                 self._fill_children(gi)
         finally:
-            self._busy = False
+            self._busy = prev
 
     def checked_items(self) -> List[CleanableItem]:
         keys = self._keys
@@ -174,13 +203,14 @@ class GroupedResults(QTreeWidget):
             return
         self._rest_open.add(gi)
         if gi in self._populated:
+            prev = self._busy
             self._busy = True
             try:
                 self._group_rows[gi].takeChildren()
                 self._rest_rows.pop(gi, None)
                 self._fill_children(gi)
             finally:
-                self._busy = False
+                self._busy = prev
         else:
             self.expandItem(self._group_rows[gi])
 
@@ -236,6 +266,11 @@ class GroupedResults(QTreeWidget):
             row.setData(c, _ACCESSIBLE, text if c == 0 else row.text(c))
         return row
 
+    @staticmethod
+    def _item_safety(g: Group, item: CleanableItem) -> Safety:
+        return (Safety.REVIEW if item.report_only else
+                Safety.ADMIN if item.requires_root else g.safety)
+
     def _make_item_row(self, gi: int, item: CleanableItem) -> QTreeWidgetItem:
         g = self._groups[gi]
         row = QTreeWidgetItem()
@@ -250,8 +285,7 @@ class GroupedResults(QTreeWidget):
             row.setText(1, shorten_path(full, self._home))
         row.setToolTip(0, full)
         row.setToolTip(1, full)
-        safety = (Safety.REVIEW if item.report_only else
-                  Safety.ADMIN if item.requires_root else g.safety)
+        safety = self._item_safety(g, item)
         self._badge(row, safety)
         row.setText(3, "")
         row.setText(4, human_size(item.size))
@@ -280,7 +314,8 @@ class GroupedResults(QTreeWidget):
         row.setText(1, "Show all (double-click or right-click)")
         row.setText(4, human_size(g.rest_size))
         row.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._badge(row, g.safety)
+        self._badge(row, max((self._item_safety(g, i) for i in g.rest),
+                             key=_RANK.__getitem__, default=g.safety))
         row.setText(3, str(n))
         row.setTextAlignment(3, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
@@ -290,7 +325,11 @@ class GroupedResults(QTreeWidget):
             row.setCheckState(0, Qt.CheckState.Unchecked)
         else:
             row.setFlags(flags)
-        row.setData(0, _ACCESSIBLE, f"{row.text(0)}, {g.safety.value}")
+            reason = self.refusal_reason(g.rest[0]) if g.rest else None
+            if reason:
+                row.setText(1, reason)
+                row.setToolTip(1, reason)
+        row.setData(0, _ACCESSIBLE, f"{row.text(0)}, {row.text(2)}")
         return row
 
     def _fill_children(self, gi: int) -> None:
@@ -322,7 +361,7 @@ class GroupedResults(QTreeWidget):
             return Qt.CheckState.Unchecked
         return Qt.CheckState.Checked if n == len(selectable) else Qt.CheckState.PartiallyChecked
 
-    def _refresh_group(self, gi: int) -> None:
+    def _refresh_group(self, gi: int, children: bool = True) -> None:
         was = self._busy
         self._busy = True
         try:
@@ -334,7 +373,7 @@ class GroupedResults(QTreeWidget):
                 sel = [i for i in self._groups[gi].rest if self.refusal_reason(i) is None]
                 if sel:
                     rest.setCheckState(0, self._state(sel, self._keys))
-            if gi in self._populated:
+            if children and gi in self._populated:
                 for k in range(row.childCount()):
                     child = row.child(k)
                     p = self._payload(child)
@@ -355,11 +394,12 @@ class GroupedResults(QTreeWidget):
         p = self._payload(row)
         if p is None or p.kind != "group" or p.gi in self._populated:
             return
+        prev = self._busy
         self._busy = True
         try:
             self._fill_children(p.gi)
         finally:
-            self._busy = False
+            self._busy = prev
 
     def _on_changed(self, row: QTreeWidgetItem, column: int) -> None:
         if self._busy or column != 0:
@@ -378,9 +418,18 @@ class GroupedResults(QTreeWidget):
         before = set(self._keys)
         for i in targets:
             (self._keys.add if on else self._keys.discard)(item_key(i))
-        self._refresh_group(p.gi)
+        self._refresh_group(p.gi, children=p.kind != "item")
         if self._keys != before:
             self.selection_changed.emit()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            p = self._payload(self.currentItem())
+            if p is not None and p.kind == "rest":
+                self.show_all(self._group_rows[p.gi])
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def _on_double_clicked(self, row: QTreeWidgetItem, column: int) -> None:
         p = self._payload(row)
