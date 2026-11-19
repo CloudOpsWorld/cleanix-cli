@@ -12,15 +12,15 @@ import abc
 import dataclasses
 import sys
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Optional
+from typing import Iterable, Iterator, List, Optional
 
 from cleanix.cleaners.base import SCOPE_SYSTEM, Cleaner
 from cleanix.core import regsnap, winregistry
-from cleanix.core.models import CleanableItem, ItemKind, RegTarget
+from cleanix.core.models import CleanableItem, CleanerReport, ItemKind, RegTarget
 from cleanix.core.platform import WINDOWS
 from cleanix.core.regsafety import Container, check_target, containers_for
 from cleanix.core.regtargets import DetectorContext, default_context
-from cleanix.core.winregistry import RegistryBackend, RegistryError
+from cleanix.core.winregistry import RegistryBackend, RegistryError, RegValue
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,9 @@ class Finding:
     target: RegTarget
     description: str
     evidence: str
+    # A value the detector already read: the base then does not re-read the
+    # whole container to snapshot it (value findings only).
+    value: Optional[RegValue] = None
 
 
 class RegistryDetector(Cleaner):
@@ -36,6 +39,22 @@ class RegistryDetector(Cleaner):
     default_enabled = False
     safe_default = False
     requires_root = False
+    # Reasons the last scan could not examine everything; the base surfaces
+    # them as CleanerReport.incomplete (findings already produced are kept).
+    incomplete: List[str]
+
+    def note_incomplete(self, reason: str) -> None:
+        if not hasattr(self, "incomplete"):
+            self.incomplete = []
+        if reason not in self.incomplete:
+            self.incomplete.append(reason)
+
+    def scan(self) -> CleanerReport:
+        self.incomplete = []
+        report = super().scan()
+        if report.ran and self.incomplete:
+            report.incomplete = "; ".join(self.incomplete)
+        return report
 
     def available(self) -> Optional[str]:
         if sys.platform != "win32" and winregistry.backend_override() is None:
@@ -64,6 +83,7 @@ class RegistryDetector(Cleaner):
         )
 
     def find_items(self) -> Iterator[CleanableItem]:
+        self.incomplete = []
         backend = winregistry.get_backend()
         ctx = self.context()
         for container in containers_for(self.id):
@@ -71,7 +91,11 @@ class RegistryDetector(Cleaner):
                 if check_target(self.id, finding.target, backend) is not None:
                     continue
                 try:
-                    snap = regsnap.snapshot(backend, finding.target)
+                    snap = (
+                        regsnap.value_snapshot(finding.value)
+                        if finding.value is not None and finding.target.value is not None
+                        else regsnap.snapshot(backend, finding.target)
+                    )
                 except (regsnap.SnapshotError, RegistryError):
                     continue
                 try:
