@@ -86,7 +86,7 @@ def test_user_applications_depth_limit(orphan_env):
     put(base, "a/b/c/d/too-deep.desktop", entry("nope2"))  # depth 4: skipped
     rep = scan(orphan_env)
     assert len(rep.items) == 1
-    assert "deep.desktop" in rep.items[0].description
+    assert str(rep.items[0].path).endswith("deep.desktop")  # description truncates long paths
 
 
 def test_desktop_false_positives(orphan_env):
