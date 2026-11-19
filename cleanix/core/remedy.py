@@ -8,6 +8,7 @@ refuse to touch an entry that changed (or was swapped for a symlink) since.
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -53,11 +54,13 @@ def fingerprint_of(path: str) -> Optional[Fingerprint]:
 def path_remedy(path: str, group: Optional[str] = None) -> Optional[Remedy]:
     """A PATH remedy pinned to ``path``'s current lstat identity.
 
-    None when the path cannot be fingerprinted (missing/unreadable): no
-    fingerprint, no remedy.
+    None when the path cannot be fingerprinted (missing/unreadable), is a
+    symlink, or its name holds a newline/CR/NUL: no safe remedy.
     """
+    if any(c in os.path.basename(path) for c in ("\n", "\r", "\0")):
+        return None
     fp = fingerprint_of(path)
-    if fp is None:
+    if fp is None or stat.S_ISLNK(os.lstat(path).st_mode):
         return None
     return Remedy(RemedyKind.PATH, fp, group=group)
 

@@ -200,3 +200,63 @@ def test_notes_have_no_remedy(orphan_env, monkeypatch):
         remedy_kind=RemedyKind.PATH,
     )
     assert rep._item(f, 0, True).remedy is None
+
+
+def _dup_tree(tmp_path, monkeypatch, n):
+    monkeypatch.setattr(duplicates, "home", lambda: tmp_path)
+    size = 12 * 1024 * 1024
+    for k in range(n):
+        p = tmp_path / f"c{k}.iso"
+        p.write_bytes(b"X" * size)
+        _age(p, 3600 + k * 100)  # c{n-1} is the oldest
+    return size
+
+
+@pytest.mark.parametrize("n", [2, 3])
+def test_duplicate_group_size_sum_is_reclaimable(tmp_path, monkeypatch, n):
+    size = _dup_tree(tmp_path, monkeypatch, n)
+    items = list(duplicates.DuplicateFileReporter(Config()).find_items())
+    assert len(items) == n
+    assert sum(i.size for i in items) == (n - 1) * size
+    zero = [i for i in items if i.size == 0]
+    assert len(zero) == 1  # exactly one default survivor
+    assert os.path.basename(zero[0].path) == f"c{n - 1}.iso"  # the oldest
+    assert all(i.size == size for i in items if i is not zero[0])
+
+
+def test_duplicate_report_only_size_unchanged_for_pair(tmp_path, monkeypatch):
+    from cleanix.core.models import CleanerReport, ScanResult
+
+    size = _dup_tree(tmp_path, monkeypatch, 2)
+    items = list(duplicates.DuplicateFileReporter(Config()).find_items())
+    rep = CleanerReport(cleaner_id="duplicates", name="d", description="d",
+                        items=items)
+    assert ScanResult(reports=[rep]).report_only_size == size  # as before
+
+
+def test_duplicate_survivor_not_hidden_by_curation(tmp_path, monkeypatch):
+    from cleanix.core.curation import build_groups, is_empty
+
+    _dup_tree(tmp_path, monkeypatch, 3)
+    items = list(duplicates.DuplicateFileReporter(Config()).find_items())
+    assert not any(is_empty(i) for i in items)  # report-only, group remedy
+
+
+def test_remedy_skipped_for_bad_name(tmp_path):
+    from cleanix.core.remedy import path_remedy
+
+    p = tmp_path / "ok.bin"
+    p.write_bytes(b"x")
+    assert path_remedy(str(p)) is not None
+    assert path_remedy(str(tmp_path / "bad\nname")) is None
+
+
+@posix_only
+def test_remedy_skipped_for_symlink(tmp_path):
+    from cleanix.core.remedy import path_remedy
+
+    real = tmp_path / "real.bin"
+    real.write_bytes(b"x")
+    link = tmp_path / "link.bin"
+    os.symlink(real, link)
+    assert path_remedy(str(link)) is None

@@ -22,6 +22,7 @@ the least work possible:
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import os
 import stat
@@ -53,6 +54,14 @@ _MAX_BUCKET = 500
 
 # Cap how many peer paths are spelled out in a group's hint.
 _HINT_PATHS = 8
+
+
+def _survivor_key(path: str) -> tuple:
+    try:
+        mtime = os.lstat(path).st_mtime_ns
+    except OSError:
+        mtime = 0
+    return (mtime, len(path), path)
 
 
 def _partial_hash(path: str) -> str | None:
@@ -147,8 +156,14 @@ class DuplicateFileReporter(Cleaner):
             n = len(matches)
             # Every copy is its own item (so a later action can pick which
             # one survives); all share ``Remedy.group`` = the full SHA-256 of
-            # the content, a stable id for the hash group. The first copy's
-            # description and hint are exactly what the group item used to be.
+            # the content, a stable id for the hash group.
+            # Sizes: the default survivor (oldest copy by mtime, ties by
+            # shortest then lexicographic path) is sized 0 and every other
+            # copy at its real size, so the group sums to (n-1)*size, the
+            # "reclaimable" figure, and totals do not grow n-fold. A size-0
+            # item is only the default survivor; the executor (Task 4)
+            # computes the real freed bytes at act time.
+            survivor = min(matches, key=_survivor_key)
             for copy in matches:
                 others = [m for m in matches if m != copy]
                 shown = others[:_HINT_PATHS]
@@ -167,4 +182,6 @@ class DuplicateFileReporter(Cleaner):
                     remedy=path_remedy(copy, group=group_id),
                 )
                 if item:
+                    if copy == survivor:
+                        item = dataclasses.replace(item, size=0)
                     yield item
