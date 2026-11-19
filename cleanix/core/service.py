@@ -70,6 +70,29 @@ def scan(
     return result
 
 
+def act(
+    items: Sequence[CleanableItem],
+    config: Config,
+    *,
+    dry_run: bool = True,
+    permanent: bool = False,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+    cancel: CancelCB = None,
+    record_history: bool = True,
+) -> CleanSummary:
+    """Act on report-only findings; see :func:`cleanix.core.actions.act`.
+
+    Each finding is re-verified, then removed through :func:`clean` (same
+    guard, quarantine, history and Undo). ``permanent`` deletes instead of
+    quarantining."""
+    from cleanix.core import actions  # actions imports this module
+
+    return actions.act(
+        items, config, dry_run=dry_run, permanent=permanent, progress=progress,
+        cancel=cancel, record_history=record_history,
+    )
+
+
 def clean(
     items: Sequence[CleanableItem],
     config: Config,

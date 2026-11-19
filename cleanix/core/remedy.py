@@ -65,6 +65,46 @@ def path_remedy(path: str, group: Optional[str] = None) -> Optional[Remedy]:
     return Remedy(RemedyKind.PATH, fp, group=group)
 
 
+_NO_FINGERPRINT: Fingerprint = (0, 0, 0, 0)
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+CHANGED = "changed since scan"
+
+
+def _lstat(path: str) -> os.stat_result:  # indirection: tests inject failures
+    return os.lstat(path)
+
+
+def verify_path(path: str, fingerprint: object, *, allow_dir: bool = True) -> Optional[str]:
+    """Why ``path`` must not be acted on now, or None when it is still the
+    entry fingerprinted at scan time.
+
+    One lstat (never follows links): it must be a regular file (or, with
+    ``allow_dir``, a directory), not a symlink or Windows reparse point, and
+    its (size, mtime_ns, inode, dev) must equal ``fingerprint``. The
+    ``(0, 0, 0, 0)`` placeholder is never a path identity. Any error reading
+    it fails closed.
+    """
+    try:
+        fp = tuple(int(x) for x in fingerprint)  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return "no usable fingerprint"
+    if len(fp) != 4 or fp == _NO_FINGERPRINT:
+        return "no usable fingerprint"
+    try:
+        st = _lstat(path)
+    except (OSError, ValueError):  # missing, unreadable, embedded NUL
+        return f"{CHANGED} (missing or unreadable)"
+    mode = st.st_mode
+    attrs = getattr(st, "st_file_attributes", 0) or 0
+    if stat.S_ISLNK(mode) or attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
+        return f"{CHANGED} (now a link)"
+    if not (stat.S_ISREG(mode) or (allow_dir and stat.S_ISDIR(mode))):
+        return f"{CHANGED} (not a regular file" + (" or folder)" if allow_dir else ")")
+    if (st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev) != fp:
+        return CHANGED
+    return None
+
+
 def unchanged(item: "CleanableItem") -> bool:
     """True when the item's path still has the fingerprint stored in its remedy.
 
