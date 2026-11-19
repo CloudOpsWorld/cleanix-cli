@@ -15,9 +15,6 @@ class WinRegSharedDlls(RegistryDetector):
     name = "Registry: SharedDLLs counts for missing files"
     description = "SharedDLLs counters for files that no longer exist (opt-in)"
 
-    def context(self):  # stub: no evidence context is needed yet
-        return None
-
     def entries(
         self, container: Container, backend: RegistryBackend, ctx: DetectorContext
     ) -> Iterable[Finding]:

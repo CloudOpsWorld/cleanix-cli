@@ -45,7 +45,12 @@ def _no_real_registry():
 
     forbidden = ForbiddenBackend()
     winregistry.set_backend(forbidden)
+    # Also occupy the lazily built "real" backend slot, so set_backend(None)
+    # on win32 still cannot reach the real registry.
+    previous_real = winregistry._real
+    winregistry._real = forbidden
     yield forbidden
+    winregistry._real = previous_real
     winregistry.set_backend(None)
     if forbidden.calls:
         pytest.fail(f"test touched the real registry: {forbidden.calls[:3]}")

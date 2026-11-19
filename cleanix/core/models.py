@@ -9,6 +9,7 @@ easy to serialize (for JSON reports and scheduled runs) and easy to test.
 from __future__ import annotations
 
 import json
+import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Sequence
@@ -38,10 +39,23 @@ class RegTarget:
 
     @property
     def display(self) -> str:
-        text = f"{self.hive}\\{self.key}"
+        """Human-readable path. Format, control and bidi characters are shown
+        as escapes so a name cannot disguise itself in a UI."""
+        text = f"{self.hive}\\{_visible(self.key)}"
         if self.value is not None:
-            text += f" [{self.value}]"
+            text += f" [{_visible(self.value)}]"
         return text
+
+
+def _visible(text: str) -> str:
+    out = []
+    for ch in text:
+        if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp"):
+            n = ord(ch)
+            out.append(f"\\u{n:04x}" if n <= 0xFFFF else f"\\U{n:08x}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 @dataclass

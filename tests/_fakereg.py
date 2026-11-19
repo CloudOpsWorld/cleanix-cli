@@ -45,6 +45,8 @@ class FakeRegistry:
         deny_delete: bool = False,
         deny_read: bool = False,
     ) -> None:
+        if hive not in ("HKCU", "HKLM"):
+            raise ValueError(f"hive not allowed: {hive!r}")
         parts = key.split("\\")
         for i in range(1, len(parts) + 1):
             k = (hive, _path("\\".join(parts[:i])))
@@ -75,6 +77,8 @@ class FakeRegistry:
     # -- internals --------------------------------------------------------
     def _enter(self, op: str, *args) -> None:
         self.calls.append((op,) + args)
+        if args and args[0] not in ("HKCU", "HKLM"):
+            raise ValueError(f"hive not allowed: {args[0]!r}")
         exc = self._fail.pop(op, None)
         if exc is not None:
             raise exc
@@ -112,8 +116,7 @@ class FakeRegistry:
 
     def is_link(self, hive: str, key: str) -> bool:
         self._enter("is_link", hive, key)
-        node = self._nodes.get((hive, _path(key)))
-        return bool(node and node.link)
+        return self._node(hive, key).link
 
     def can_delete(self, hive: str, key: str, value: Optional[str]) -> bool:
         self._enter("can_delete", hive, key, value)

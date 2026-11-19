@@ -15,9 +15,6 @@ class WinRegAppPaths(RegistryDetector):
     name = "Registry: dead App Paths"
     description = "App Paths entries that point at programs that no longer exist (opt-in)"
 
-    def context(self):  # stub: no evidence context is needed yet
-        return None
-
     def entries(
         self, container: Container, backend: RegistryBackend, ctx: DetectorContext
     ) -> Iterable[Finding]:

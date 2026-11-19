@@ -15,9 +15,6 @@ class WinRegUninstall(RegistryDetector):
     name = "Registry: dead uninstall entries"
     description = "Apps & Features entries whose program folder and uninstaller are gone (opt-in)"
 
-    def context(self):  # stub: no evidence context is needed yet
-        return None
-
     def entries(
         self, container: Container, backend: RegistryBackend, ctx: DetectorContext
     ) -> Iterable[Finding]:

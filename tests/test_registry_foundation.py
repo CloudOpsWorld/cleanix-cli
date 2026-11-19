@@ -187,6 +187,8 @@ def test_check_target_links(fake_registry: FakeRegistry):
     fake_registry.add_key("HKLM", base + r"\Bar", link=True)
     assert check_target("win_reg_uninstall", _t("HKLM", base + r"\Bar"), fake_registry)
     # A link in the middle of the path (above the container) is refused too.
+    fake_registry.add_key("HKCU", base + r"\Foo")
+    assert check_target("win_reg_uninstall", _t("HKCU", base + r"\Foo"), fake_registry) is None
     fake_registry.add_key("HKCU", r"SOFTWARE\Microsoft", link=True)
     assert check_target("win_reg_uninstall", _t("HKCU", base + r"\Foo"), fake_registry)
     # The HKCU\SOFTWARE\Classes anchor is trusted.
@@ -456,10 +458,23 @@ def test_detectors_unavailable_off_windows(monkeypatch, _no_real_registry):
 
     winregistry.set_backend(None)
     monkeypatch.setattr(sys, "platform", "linux")
+    # the forbidden backend stays installed as the lazily built "real" one
+    assert winregistry._real is _no_real_registry
     rep = WinRegUninstall(Config()).scan()
     assert rep.skipped_reason == "only available on Windows"
     assert rep.items == []
     assert not _no_real_registry.calls
+    with pytest.raises(winregistry.RegistryUnavailable):
+        winregistry.get_backend().subkeys("HKCU", "SOFTWARE")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="lazy real backend is Windows only")
+def test_no_override_cannot_reach_real_registry(_no_real_registry):
+    winregistry.set_backend(None)
+    with pytest.raises(AssertionError):
+        winregistry.get_backend().subkeys("HKCU", "SOFTWARE")
+    assert _no_real_registry.calls
+    _no_real_registry.calls.clear()
 
 
 def test_core_imports_without_winreg():
@@ -479,10 +494,175 @@ def test_core_imports_without_winreg():
 
 
 def test_winreg_imported_only_in_backend_module():
-    pat = re.compile(r"^\s*(import\s+winreg\b|from\s+winreg\b)", re.M)
+    pat = re.compile(
+        r"^\s*import\s+[^\n#]*\bwinreg\b|^\s*from\s+winreg\b"
+        r"|import_module\(\s*['\"]winreg|__import__\(\s*['\"]winreg",
+        re.M,
+    )
+    for sample in (
+        "import os, winreg", "import winreg as w", "from winreg import X",
+        'importlib.import_module("winreg")', "__import__('winreg')",
+    ):
+        assert pat.search(sample), sample
+    assert not pat.search("import winregistry")
     hits = [
         p.relative_to(REPO).as_posix()
         for p in (REPO / "cleanix").rglob("*.py")
         if pat.search(p.read_text(encoding="utf-8"))
     ]
     assert set(hits) <= {"cleanix/core/winregistry_win.py"}
+
+
+# -- fix round 1 -------------------------------------------------------------
+def test_wow6432node_cannot_be_a_file_assoc_entry():
+    for hive in ("HKCU", "HKLM"):
+        for name in ("Wow6432Node", "WOW6432NODE", "wow6432node"):
+            for key in (
+                rf"SOFTWARE\Classes\{name}",
+                rf"SOFTWARE\Classes\{name}\{name}",
+                rf"SOFTWARE\{name}\Classes",
+                rf"SOFTWARE\Classes\Applications\{name}",
+                rf"SOFTWARE\Classes\{name}\Foo",
+            ):
+                assert check_target("win_reg_file_assoc", _t(hive, key)), (hive, key)
+    assert check_target(
+        "win_reg_uninstall",
+        _t("HKLM", r"SOFTWARE\Wow6432Node\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Foo"),
+    )
+
+
+def test_hive_spelling_is_exact(fake_registry):
+    key = CV + r"\Uninstall\Foo"
+    fake_registry.add_key("HKCU", key, link=True)
+    for hive in ("hkcu", "HKEY_CURRENT_USER", "HKCR", "", "Hkcu"):
+        assert check_target("win_reg_uninstall", _t(hive, key), fake_registry), hive
+        assert check_target("win_reg_uninstall", _t(hive, key)), hive
+    assert check_target("win_reg_uninstall", _t("HKCU", key), fake_registry)
+
+
+def test_fake_registry_is_strict(fake_registry):
+    with pytest.raises(winregistry.KeyMissing):
+        fake_registry.is_link("HKCU", r"SOFTWARE\nope")
+    with pytest.raises(ValueError):
+        fake_registry.add_key("HKCR", r"SOFTWARE\x")
+    with pytest.raises(ValueError):
+        fake_registry.key_exists("hkcu", r"SOFTWARE\x")
+
+
+def test_one_bad_finding_does_not_abort_scan(fake_registry, monkeypatch):
+    from cleanix.cleaners.winreg_base import Finding, RegistryDetector
+    from cleanix.core.regtargets import DetectorContext
+
+    base = CV + r"\Uninstall"
+    for n in ("A", "B"):
+        fake_registry.add_key("HKCU", base + "\\" + n)
+
+    class Det(RegistryDetector):
+        id = "win_reg_uninstall"
+        name = description = "t"
+
+        def context(self):
+            return DetectorContext({}, None, r"C:\Users", r"C:\Windows")
+
+        def entries(self, container, backend, ctx):
+            if (container.hive, container.key) == ("HKCU", base):
+                yield Finding(RegTarget("hkcu", base + r"\A"), "bad hive", "")
+                yield Finding(RegTarget("HKCU", base + r"\A"), "A", "")
+                yield Finding(RegTarget("HKCU", base + r"\B"), "B", "")
+
+    orig = RegistryDetector.registry_item
+    seen = []
+
+    def flaky(self, finding, fp):
+        seen.append(finding.description)
+        if finding.description == "A":
+            raise ValueError("model refused")
+        return orig(self, finding, fp)
+
+    monkeypatch.setattr(RegistryDetector, "registry_item", flaky)
+    rep = Det(Config()).scan()
+    assert rep.skipped_reason is None
+    assert [i.description for i in rep.items] == ["B"]
+    assert seen == ["A", "B"]
+
+
+def test_lookalike_characters_are_refused():
+    names = [
+        "CLS\u0131D",           # dotless i: upper() is I
+        "Pol\u0131cies",
+        "M\u0131crosoft.X",
+        "Local \u017fettings",  # long s: upper() is S
+        "msi.pac\u212aage",     # Kelvin sign
+        "M\u0130crosoft.X",     # capital I with dot
+        "\uff23\uff2c\uff33\uff29\uff24",  # fullwidth CLSID
+        "Foo\u202e",
+        "Foo\u200b",
+    ]
+    for hive in ("HKCU", "HKLM"):
+        for n in names:
+            assert check_target("win_reg_file_assoc", _t(hive, "SOFTWARE\\Classes\\" + n)), n
+    # lookalikes above the entry name (inside the container path) are refused
+    assert check_target(
+        "win_reg_uninstall",
+        _t("HKLM", CV.replace("Windows", "W\u0131ndows") + r"\Uninstall\Foo"),
+    )
+    assert check_target(
+        "win_reg_uninstall",
+        _t("HKCU", "\u017fOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Foo"),
+    )
+    assert check_target(
+        "win_reg_uninstall", _t("HKCU", CV + "\\Uninstall\u212a\\Foo"),
+    )
+    assert check_target(
+        "win_reg_startup", _t("HKLM", CV.replace("Windows", "W\u0131ndows") + r"\Run", "x")
+    )
+    # a normal non-ASCII app name is still fine in an Uninstall entry
+    assert check_target("win_reg_uninstall", _t("HKCU", CV + "\\Uninstall\\\u4e2d\u6587")) is None
+
+
+def test_value_names_validated():
+    for bad in ("a\x00b", "a\nb", "x\x7f"):
+        assert check_target("win_reg_startup", _t("HKCU", CV + r"\Run", bad)), repr(bad)
+    assert check_target("win_reg_shared_dlls", _t("HKLM", CV + r"\SharedDLLs", "C:\\a b\\c.dll")) is None
+
+
+def test_display_escapes_format_characters():
+    t = RegTarget("HKCU", "SOFTWARE\\a\u202eb\u200bc\u2066", "v\u202a", "fp")
+    d = t.display
+    for ch in ("\u202e", "\u200b", "\u2066", "\u202a"):
+        assert ch not in d
+    for esc in (r"\u202e", r"\u200b", r"\u2066", r"\u202a"):
+        assert esc in d
+    assert RegTarget("HKCU", r"SOFTWARE\X", "v", "fp").display == r"HKCU\SOFTWARE\X [v]"
+
+
+def test_snapshot_counts_list_multisz():
+    class ListBackend(FakeRegistry):
+        def values(self, hive, key):
+            return [RegValue("m", REG_MULTI_SZ, ["x" * 600_000, "y" * 600_000])]
+
+    reg = ListBackend()
+    reg.add_key("HKCU", CV + r"\Uninstall\Big")
+    t = RegTarget("HKCU", CV + r"\Uninstall\Big", None, "")
+    with pytest.raises(SnapshotError):
+        regsnap.snapshot(reg, t)
+
+    class Small(FakeRegistry):
+        def values(self, hive, key):
+            return [RegValue("m", REG_MULTI_SZ, ["a", ""])]
+
+    s = Small()
+    s.add_key("HKCU", CV + r"\Uninstall\S")
+    t2 = RegTarget("HKCU", CV + r"\Uninstall\S", None, "")
+    snap = regsnap.snapshot(s, t2)
+    assert snap.values[0].data == ("a", "")
+    assert regsnap.fingerprint(t2, snap)
+
+
+def test_stub_detectors_use_the_base_context():
+    from cleanix.cleaners import ALL_CLEANERS
+    from cleanix.cleaners.winreg_base import RegistryDetector
+
+    for cls in ALL_CLEANERS:
+        if cls.id in catalog.REGISTRY_IDS:
+            assert cls.context is RegistryDetector.context, cls.__name__

@@ -40,14 +40,22 @@ def _data_size(data: Any) -> int:
         return len(data)
     if isinstance(data, str):
         return len(data) * 2
-    if isinstance(data, tuple):
-        return sum(_data_size(x) for x in data)
+    if isinstance(data, (tuple, list)):
+        return sum(_data_size(x) + 2 for x in data)
     return 8
+
+
+def _norm(v: RegValue) -> RegValue:
+    """winreg returns REG_MULTI_SZ as a list; keep values hashable and
+    consistent by storing a tuple."""
+    if isinstance(v.data, list):
+        return RegValue(v.name, v.type, tuple(v.data))
+    return v
 
 
 def read_values(backend: RegistryBackend, hive: str, key: str) -> Dict[str, RegValue]:
     """The values of one key, keyed by casefolded name."""
-    return {v.name.casefold(): v for v in backend.values(hive, key)}
+    return {v.name.casefold(): _norm(v) for v in backend.values(hive, key)}
 
 
 class _Budget:
@@ -64,7 +72,7 @@ def _walk(backend: RegistryBackend, hive: str, key: str, name: str, b: _Budget) 
     try:
         if backend.is_link(hive, key):
             raise SnapshotError("registry link in the tree")
-        values = backend.values(hive, key)
+        values = [_norm(v) for v in backend.values(hive, key)]
         subs = backend.subkeys(hive, key)
     except RegistryError as exc:
         raise SnapshotError(str(exc) or type(exc).__name__) from exc
@@ -104,7 +112,7 @@ def snapshot(backend: RegistryBackend, target: RegTarget) -> Snapshot:
 def _data_to_json(data: Any) -> Any:
     if isinstance(data, (bytes, bytearray)):
         return {"b64": base64.b64encode(bytes(data)).decode("ascii")}
-    if isinstance(data, tuple):
+    if isinstance(data, (tuple, list)):
         return list(data)
     return data
 

@@ -15,9 +15,6 @@ class WinRegFileAssoc(RegistryDetector):
     name = "Registry: dead file-type handlers"
     description = "Open-with handlers pointing at deleted programs (opt-in)"
 
-    def context(self):  # stub: no evidence context is needed yet
-        return None
-
     def entries(
         self, container: Container, backend: RegistryBackend, ctx: DetectorContext
     ) -> Iterable[Finding]:

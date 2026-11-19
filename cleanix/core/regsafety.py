@@ -123,10 +123,7 @@ def normalize(hive: str, key: str) -> Tuple[str, Tuple[str, ...]]:
     return short, tuple(comps)
 
 
-def match_form(hive: str, key: str) -> Tuple[str, ...]:
-    """Normalized components with the ``wow6432node`` alias removed when it
-    directly follows ``software`` or ``software\\classes``."""
-    _hive, comps = normalize(hive, key)
+def _strip_wow(comps: Tuple[str, ...]) -> Tuple[str, ...]:
     if len(comps) > 1 and comps[1] == "wow6432node":
         return (comps[0],) + comps[2:]
     if len(comps) > 2 and comps[1] == "classes" and comps[2] == "wow6432node":
@@ -134,25 +131,52 @@ def match_form(hive: str, key: str) -> Tuple[str, ...]:
     return comps
 
 
+def match_form(hive: str, key: str) -> Tuple[str, ...]:
+    """Normalized components with the ``wow6432node`` alias removed when it
+    directly follows ``software`` or ``software\\classes``."""
+    _hive, comps = normalize(hive, key)
+    return _strip_wow(comps)
+
+
 def containers_for(cleaner_id: str) -> Tuple[Container, ...]:
     return CONTAINERS.get(cleaner_id, ())
 
 
+def _folds(text: str) -> Tuple[str, str]:
+    """Both comparison forms of a name. Windows compares by upper-casing,
+    Python's casefold differs for a few characters (dotless i, long s), so a
+    name is judged by both forms."""
+    return text.casefold(), text.upper().casefold()
+
+
 def _class_name_denied(name: str) -> bool:
-    n = name.casefold()
-    return (
-        n.startswith(".")
-        or n in _DENY_CLASS_EXACT
-        or n.startswith(_DENY_CLASS_PREFIXES)
-    )
+    for n in _folds(name):
+        if (
+            n.startswith(".")
+            or n in _DENY_CLASS_EXACT
+            or n.startswith(_DENY_CLASS_PREFIXES)
+        ):
+            return True
+    return False
 
 
-def _all_container_keys() -> set:
+def _bad_text(text: str) -> bool:
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in text)
+
+
+def _all_container_matches() -> set:
     out = set()
     for conts in CONTAINERS.values():
         for c in conts:
-            out.add(normalize(c.hive, c.key))
+            out.add(match_form(c.hive, c.key))
     return out
+
+
+def _denied(comps: Tuple[str, ...]) -> bool:
+    if DENY_COMPONENTS & set(comps):
+        return True
+    match = _strip_wow(comps)
+    return any(match[: len(p)] == p for p in DENY_PREFIXES)
 
 
 def check_target(
@@ -165,20 +189,39 @@ def check_target(
     containers = containers_for(cleaner_id)
     if not containers:
         return "unknown registry cleaner"
+    if target.hive not in ("HKCU", "HKLM"):
+        return "registry hive not allowed"
+    hive = target.hive
     try:
-        hive, comps = normalize(target.hive, target.key)
-        match = match_form(target.hive, target.key)
+        _h, comps = normalize(hive, target.key)
     except ValueError:
         return "not a valid registry location"
+    parts = target.key.split("\\")
 
-    if DENY_COMPONENTS & set(comps):
-        return "Windows-owned key (policies)"
-    for prefix in DENY_PREFIXES:
-        if match[: len(prefix)] == prefix:
+    if target.value is not None:
+        if not isinstance(target.value, str) or not target.value:
+            return "invalid value name"
+        if _bad_text(target.value):
+            return "invalid value name"
+
+    # Everything above the entry name (the whole key for a value target)
+    # must be plain ASCII: lookalike characters never reach a container.
+    above = parts if target.value is not None else parts[:-1]
+    if not all(p.isascii() for p in above):
+        return "non-ASCII characters in the registry path"
+
+    # The entry name is judged in both case-folding forms.
+    last = () if target.value is not None else (parts[-1],)
+    for form in range(2):
+        variant = comps[: len(above)] + tuple(_folds(x)[form] for x in last)
+        if _denied(variant):
             return "Windows-owned key"
 
-    if target.value is None and (hive, comps) in _all_container_keys():
-        return "a container key, not an entry"
+    if target.value is None:
+        if _strip_wow(comps) in _all_container_matches():
+            return "a container key, not an entry"
+        if "wow6432node" in _folds(parts[-1]):
+            return "Windows redirection key"
 
     found = None
     for c in containers:
@@ -193,23 +236,24 @@ def check_target(
             ):
                 found = c
                 break
-        elif target.value and comps == ccomps:
+        elif target.value is not None and comps == ccomps:
             found = c
             break
     if found is None:
         return "not inside an allowed registry location"
 
-    if cleaner_id == "win_reg_file_assoc" and _class_name_denied(comps[-1]):
-        return "Windows-owned file-type key"
+    if cleaner_id == "win_reg_file_assoc":
+        name = parts[-1]
+        if not name.isascii() or _class_name_denied(name):
+            return "Windows-owned file-type key"
 
     if backend is not None:
-        parts = target.key.split("\\")
         for depth in range(2, len(parts) + 1):
             if hive == "HKCU" and depth == 2 and comps[1] == "classes":
                 continue  # trusted anchor
             path = "\\".join(parts[:depth])
             try:
-                if backend.is_link(target.hive, path):
+                if backend.is_link(hive, path):
                     return "registry link (symbolic link) in the path"
             except RegistryError:
                 return "could not verify the key is not a link"

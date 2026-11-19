@@ -74,6 +74,10 @@ class RegistryDetector(Cleaner):
                     snap = regsnap.snapshot(backend, finding.target)
                 except (regsnap.SnapshotError, RegistryError):
                     continue
-                yield self.registry_item(
-                    finding, regsnap.fingerprint(finding.target, snap)
-                )
+                try:
+                    item = self.registry_item(
+                        finding, regsnap.fingerprint(finding.target, snap)
+                    )
+                except ValueError:
+                    continue  # the model refused it: skip, never abort the scan
+                yield item
