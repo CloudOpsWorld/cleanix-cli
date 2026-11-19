@@ -73,9 +73,14 @@ What it checks:
      follows the link; what `DeleteKeyEx` removes when the final path component
      is a link is **measured and printed** (`R17 measurement:` line). The link
      is deleted itself with an `REG_OPTION_OPEN_LINK` handle and `NtDeleteKey`.
-   - `reg query /reg:64` sees the key written with `KEY_WOW64_64KEY`; the
-     Python bitness is reported (run it once with a 32-bit Python if one is
-     installed).
+   - `reg query /reg:64` sees the test key, and the Python bitness is reported.
+     This is informational only: `HKCU\Software` is not WOW64-redirected, so it
+     does **not** prove that `KEY_WOW64_64KEY` is honoured. That flag's effect on
+     `HKLM\SOFTWARE` (and `WOW6432Node`) cannot be tested inside
+     `HKCU\Software\CleanixTest`; it is covered only by the fake-`winreg` unit
+     tests that pin the flag. A 32-bit Python run is still useful for ctypes and
+     handle-size issues (the link and `REG_MULTI_SZ` probes), not for view
+     semantics.
 6. Cleanup: link keys, then the test tree; the test key is gone;
    `HKCU\SOFTWARE\Cleanix` is unchanged (if the GUI has ever run, QSettings
    legitimately created it: the script never touches it).
@@ -108,8 +113,9 @@ Use a normal (non-admin) account first, then an Administrator terminal.
       final-component link and deletes the target, the README text for R17
       already says so; nothing else changes. If it deletes the link only, the
       README wording can be softened. Either way, record the outcome here.
-- [ ] 32-bit Python (if available): same script, all `PASS`; the key is seen
-      by `reg query /reg:64`.
+- [ ] 32-bit Python (if available): same script, all `PASS` (checks the ctypes
+      and handle-size paths; it does not verify WOW64 view semantics, see
+      above).
 - [ ] `cleanix scan` lists no registry cleaners. `cleanix scan --registry` lists
       findings and writes nothing: `reg export` the five containers
       (`...\Uninstall`, `...\App Paths`, `HKCU\Software\Classes`,

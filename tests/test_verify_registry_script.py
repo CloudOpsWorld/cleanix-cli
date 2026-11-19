@@ -296,3 +296,12 @@ def test_whole_flow_on_the_fake_registry(v, tmp_path, capsys, monkeypatch):
     for c in fake.calls:
         if c[0] in ("create_key", "set_value", "delete_key", "delete_value"):
             assert c[1] == "HKCU" and c[2].startswith(ROOT), c
+
+
+def test_script_compiles_without_warnings():
+    import warnings
+
+    src = SCRIPT.read_text(encoding="utf-8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # e.g. an invalid escape sequence
+        compile(src, str(SCRIPT), "exec")

@@ -68,7 +68,8 @@ PROBES = (
     "registry link keys made with REG_OPTION_CREATE_LINK (ctypes): is_link, "
     "OPEN_LINK vs followed handles, what DeleteKeyEx removes for a link as "
     "the final path component",
-    "reg query /reg:64 sees the test key; Python bitness is reported",
+    "reg query /reg:64 sees the test key (informational: HKCU\\Software is not "
+    "WOW64-redirected); Python bitness is reported",
 )
 
 
@@ -876,7 +877,7 @@ def run_probes(inner, report: Report, tmp: Path, links: List[str]) -> None:
     # -- the 64-bit view is what reg.exe /reg:64 sees ----------------------------------------------
     try:
         cp = _run_reg(["query", "HKCU\\" + TEST_ROOT, "/reg:64"])
-        report.step("probe: reg query /reg:64 sees the key written with KEY_WOW64_64KEY",
+        report.step("probe (informational, HKCU is not redirected): reg query /reg:64 sees the test key",
                     cp.returncode == 0)
     except Exception as exc:  # noqa: BLE001
         report.step("probe: reg query /reg:64", False, f"{type(exc).__name__}: {exc}")
