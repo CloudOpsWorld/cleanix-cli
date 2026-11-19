@@ -81,6 +81,58 @@ def test_power_table_ticks_exactly_what_the_helper_cleans(qtbot):
     assert_power_parity(admin_items(), allowed)
 
 
+def registry_items():
+    """For every registry detector: an HKLM entry inside its own container
+    (deletable by the helper on Windows), an HKLM entry under a denied
+    Policies key, an HKCU entry flagged admin and a COMMAND item. A literal
+    fingerprint: the static rules never snapshot."""
+    from cleanix.core.models import RegTarget
+    from cleanix.core.regsafety import containers_for
+
+    out = []
+    for cid in catalog.REGISTRY_IDS:
+        for c in containers_for(cid):
+            if c.hive != "HKLM":
+                continue
+            target = (RegTarget("HKLM", c.key, "Gone.dll", "f" * 64) if c.level == "value"
+                      else RegTarget("HKLM", c.key + r"\GoneApp", None, "f" * 64))
+            out.append(CleanableItem(cid, f"{cid} HKLM {c.key}", size=0,
+                                     kind=ItemKind.REGISTRY, requires_root=True,
+                                     reg=target))
+            break
+        out.append(CleanableItem(
+            cid, f"{cid} HKLM policies", size=0, kind=ItemKind.REGISTRY, requires_root=True,
+            reg=RegTarget("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\Run",
+                          "x", "f" * 64)))
+        # An HKCU entry wrongly flagged as needing admin is never offered.
+        out.append(CleanableItem(
+            cid, f"{cid} HKCU", size=0, kind=ItemKind.REGISTRY, requires_root=True,
+            reg=RegTarget("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                          "x", "f" * 64)))
+        out.append(CleanableItem(cid, f"{cid} command", size=1, kind=ItemKind.COMMAND,
+                                 command=["tool", cid], requires_root=True))
+    return out
+
+
+@pytest.mark.parametrize("windows", [True, False])
+def test_power_table_registry_rows_match_the_helper(qtbot, monkeypatch, windows):
+    monkeypatch.setattr(elevated, "_registry_supported", lambda: windows)
+    items = registry_items()
+    assert_power_parity(items, elevated.admin_cleaner_ids())
+    m = ItemTableModel(allow_admin_items=True)
+    m.set_result(as_result(items))
+    ok = {m.item_at(r).description for r in range(m.rowCount()) if tickable(m, r)}
+    hklm = {i.description for i in items
+            if i.kind is ItemKind.REGISTRY and i.reg.hive == "HKLM"
+            and "policies" not in i.description}
+    if windows:
+        assert len(hklm) == len(catalog.REGISTRY_IDS)
+        assert hklm <= ok
+        assert not {d for d in ok if "policies" in d or "command" in d}
+    else:
+        assert not ok & hklm
+
+
 def test_power_table_windows_path_rules(qtbot, windows_dirs, monkeypatch):
     monkeypatch.setattr(elevated, "admin_cleaner_ids", lambda: frozenset({"win_system_temp"}))
     items = windows_path_items(windows_dirs, "win_system_temp")

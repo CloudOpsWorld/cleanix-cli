@@ -79,6 +79,18 @@ def _norm(p) -> str:
 
 
 @pytest.fixture(autouse=True)
+def _never_elevate(monkeypatch):
+    """No test here may reach a real elevation prompt."""
+    from cleanix.core import elevate_launch
+
+    def never(*a, **k):
+        pytest.fail("a real elevation was attempted")
+
+    monkeypatch.setattr(elevate_launch, "launch_elevated", never)
+    monkeypatch.setattr(winenv, "run_elevated", never)
+
+
+@pytest.fixture(autouse=True)
 def _restore_environ():
     saved = dict(os.environ)
     yield
@@ -650,14 +662,23 @@ def test_helper_mode_scan_reads_no_hkcu_key(h):
     assert seen == {"helper_mode": True, "HKCU": "missing"}
 
 
+REAL_IDS = ("win_reg_startup", "win_reg_app_paths")
+
+
 @pytest.fixture
 def real_detectors(h, monkeypatch):
-    """The real win_reg_startup detector through the real service.scan and
-    Engine (parallel) path, with an evidence context whose prober says every
-    target is MISSING."""
+    """Two real registry detectors through the real service.scan and Engine
+    path (two cleaners: the engine scans them on its thread pool), with an
+    evidence context whose prober says every target is MISSING. Records
+    (detector id, container hive, owner_matches, worker thread?) per
+    container the detector is asked about."""
+    import threading
+
     from _fakereg import FakeProber
     from cleanix.cleaners import winreg_base
-    from cleanix.core import registry
+    from cleanix.cleaners.winreg_app_paths import WinRegAppPaths
+    from cleanix.cleaners.winreg_startup import WinRegStartup
+    from cleanix.core import registry, regtargets
     from cleanix.core.regtargets import DetectorContext, Existence
 
     monkeypatch.setattr(service, "build_cleaners", registry.build_cleaners)
@@ -668,53 +689,70 @@ def real_detectors(h, monkeypatch):
         return DetectorContext(env, FakeProber({}, Existence.MISSING), r"C:\Users",
                                r"C:\Windows")
 
+    # Both the name the base imported and the module function (a
+    # centralised context() may call either).
     monkeypatch.setattr(winreg_base, "default_context", fake_default_context)
-    from cleanix.cleaners.winreg_startup import WinRegStartup
+    monkeypatch.setattr(regtargets, "default_context", fake_default_context)
+    main = threading.main_thread()
+    for cls in (WinRegStartup, WinRegAppPaths):
+        real_entries = cls.entries
 
-    real_entries = WinRegStartup.entries
+        def spy_entries(self, container, backend, ctx, _real=real_entries):
+            contexts.append((self.id, container.hive, ctx.owner_matches,
+                             threading.current_thread() is not main))
+            return _real(self, container, backend, ctx)
 
-    def spy_entries(self, container, backend, ctx):
-        contexts.append((container.hive, ctx.owner_matches))
-        return real_entries(self, container, backend, ctx)
-
-    monkeypatch.setattr(WinRegStartup, "entries", spy_entries)
+        monkeypatch.setattr(cls, "entries", spy_entries)
     return contexts
+
+
+def _gui_scan_item(value):
+    """The GUI's own (non-helper) scan with the real startup detector."""
+    from cleanix.config import Config
+    from cleanix.core import registry
+
+    det = registry.build_cleaners(Config(), only=["win_reg_startup"])[0]
+    return [i for i in det.scan().items if i.reg.value == value][0]
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="real registry detectors are Windows-only")
 def test_real_detector_helper_scan_reads_no_hkcu(h, real_detectors):
-    from cleanix.core import registry
-    from cleanix.config import Config
-
-    det = [c for c in registry.build_cleaners(Config(), only=["win_reg_startup"])][0]
-    user_items = det.scan().items                  # the GUI's own scan (reads HKCU)
-    foo = [i for i in user_items if i.reg.value == "Foo"][0]
+    foo = _gui_scan_item("Foo")
     run = gui_backup(h, [foo])
     h.reg.calls.clear()
     real_detectors.clear()
-    assert run_helper(h, selection(h, [item_key(foo)], run)) == 0
+    assert run_helper(h, selection(h, [item_key(foo)], run, only=REAL_IDS)) == 0
     assert not [c for c in h.reg.calls if "HKCU" in c]
-    assert real_detectors  # the real detector ran
+    assert {d for d, *_ in real_detectors} == set(REAL_IDS)   # both real detectors ran
+    assert any(worker for *_, worker in real_detectors)      # on the engine's pool
     assert not present(h, "Foo") and present(h, "Mine", "HKCU")
     assert elevate.read_result(h.result).removed == 1
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="real registry detectors are Windows-only")
-def test_real_detector_helper_scan_uses_owner_matches_false(h, real_detectors, monkeypatch):
-    """Through the helper's real path (service.scan -> parallel Engine), the
-    detector context says the scanning process is not the hive owner."""
-    from cleanix.cleaners import winreg_base
+def test_real_detector_helper_scan_uses_owner_matches_false(h, real_detectors):
+    """Through the helper's real path (service.scan -> Engine thread pool),
+    every detector context says the scanning process is not the hive owner
+    and no HKCU container is examined."""
+    from cleanix.cleaners.winreg_startup import WinRegStartup
+    from cleanix.config import Config
 
-    if not hasattr(winreg_base, "scanmode"):
+    with scanmode.helper_mode():
+        probe = WinRegStartup(Config()).context()
+    if probe.owner_matches:
         pytest.skip("owner_matches centralisation (RegistryDetector.context reading "
                     "scanmode.is_helper_mode) is not merged in this branch")
-    item = reg_item(h.reg, "Foo")
-    run = gui_backup(h, [item])
+    foo = _gui_scan_item("Foo")
+    run = gui_backup(h, [foo])
+    real_detectors.clear()
     # No process-wide switch here (conftest disables it): the helper's own
     # scanmode.helper_mode() around its scan must reach the engine threads.
-    assert run_helper(h, selection(h, [item_key(item)], run)) == 0
-    assert real_detectors and all(om is False for _hive, om in real_detectors)
-    assert all(hive == "HKLM" for hive, _om in real_detectors)
+    assert run_helper(h, selection(h, [item_key(foo)], run, only=REAL_IDS)) == 0
+    assert {d for d, *_ in real_detectors} == set(REAL_IDS)
+    assert any(worker for *_, worker in real_detectors)
+    assert all(om is False for _d, _hive, om, _w in real_detectors)
+    assert all(hive == "HKLM" for _d, hive, _om, _w in real_detectors)
+    assert not present(h, "Foo")
 
 
 def test_main_enables_process_helper_mode_before_running(monkeypatch):
@@ -1068,24 +1106,5 @@ def test_dry_run_preview_registry_wording(monkeypatch):
                               admin_preview_registry=2)
     monkeypatch.setattr(regpromises, "UNDO_SHIPPED", True)
     assert "registry entries are backed up first" in elevation.admin_outcome_lines(summary)[0]
-
-
-def test_dry_run_worker_counts_registry_previews(fake_registry, monkeypatch):
-    pytest.importorskip("PySide6")
-    from cleanix.config import Config
-    from cleanix.gui import workers
-
-    fake_registry.add_key("HKLM", RUN, {"Foo": (REG_SZ, "x")})
-    item = reg_item(fake_registry)
-    from cleanix.gui import elevation
-
-    called = []
-    monkeypatch.setattr(elevation, "run_elevated_part", lambda *a, **k: called.append(1))
-    w = workers.ElevatedCleanWorker([item], Config(), dry_run=True, use_quarantine=False,
-                                    launcher=lambda argv: called.append(argv))
-    got = []
-    w.finished.connect(got.append)
-    w.run()
-    (summary,) = got
-    assert summary.admin_preview_count == 1 and summary.admin_preview_registry == 1
-    assert called == []
+    # The worker side (admin_preview_registry set by the dry run) is in
+    # tests/gui/test_elevated_flow.py.
