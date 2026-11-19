@@ -107,6 +107,22 @@ Merge order inside a wave is free. Merge each wave before starting the next.
 - **R15** The scope is `SCOPE_SYSTEM`. HKCU is the hive of the running process: in an elevated CLI that is the administrator account's hive, and `--all-users` does not iterate other users' hives (NTUSER.DAT loading is out of scope).
 - **R16** Snapshot limits: at most 256 keys, 4096 values and 1 MiB of data per target, and no registry link anywhere in the target tree. Above that, the target is skipped as ambiguous.
 - **R17** No transactional registry API is used (that would need ctypes `RegCreateKeyTransacted`). The window between the final fingerprint check and the delete is accepted and documented.
+  - The real consequence is worse than deleting a stale entry. `WinRegBackend.delete_key` checks link-ness and leaf-ness on a `REG_OPTION_OPEN_LINK` handle, then `DeleteKeyEx` resolves the path again. `RegDeleteKeyEx` very likely follows a registry link in the last path component. So if the leaf is replaced by a link inside that window, the link's **target** key may be deleted when it is a leaf.
+  - Mitigations:
+    - the window is minimal: the handle check runs immediately before `DeleteKeyEx`, with no other work in between;
+    - Task 11 must re-verify the fingerprint of the target path immediately before each `delete_key`/`delete_value` call;
+    - Task 14 measures what a raw `DeleteKeyEx` on a link path deletes.
+  - The T3 tests model this pessimistically: `FakeWinreg(delete_follows_final_link=True)` and `test_r17_link_swapped_in_after_check_deletes_target`.
+  - Task 11 outcome: a link swapped in inside that window is reported as "partially deleted … scan again", never as success. The post-delete check still finds the entry.
+  - Other residuals, accepted:
+    - Values or subkeys written to a leaf key after its pre-delete re-snapshot and before `delete_key` are deleted with it, and they are not in the backup. A subkey makes the backend refuse the non-leaf key instead. The outcome is a success.
+    - An ancestor swapped for a link needs write access to the container's parent: the same user for HKCU, an administrator for HKLM. That writer could already change the entry directly, so this is the accepted threat model.
+  - Detected immediately before each delete call:
+    - the remaining tree changed in any name, type or data;
+    - a key became a link, anywhere from `SOFTWARE\<next>` down to the leaf;
+    - the entry or an ancestor is gone;
+    - any safety rule now fails.
+  - Not detected: changes in the few instructions between that check and the backend call, and inside the backend between its handle check and `DeleteKeyEx`.
 
 ## Risks
 
@@ -821,6 +837,24 @@ Tests:
   - [ ] `cleanix gui`, Power mode: tick a registry cleaner in "Choose what to scan" and scan. The groups show the Review badge, the Evidence text, no Open location, and the confirm wording from T5 (do NOT clean real entries). Simple mode shows the registry note.
   - [ ] The `.reg` written by the script opens in Notepad as readable UTF-16 text, with the header and the expected values.
   - [ ] Elevated helper path: covered by the unit tests only. Do not clean real HKLM entries on the verification machine.
+  - [ ] **Real-`winreg` backend checks (from the T3 review).** `scripts/verify_registry_cleanup.py` implements these as extra PASS/FAIL steps under `HKCU\Software\CleanixTest` only.
+    - **Link fixtures.** `winreg` cannot create links. Use ctypes `RegCreateKeyExW` with `REG_OPTION_CREATE_LINK` (0x2), then set `SymbolicLinkValue` as `REG_LINK` holding `\REGISTRY\USER\<SID>\Software\CleanixTest\Target`. Clean up by deleting the link through an `REG_OPTION_OPEN_LINK` handle (ctypes `NtDeleteKey`, or an equivalent verified on the machine), never by its path.
+    1. `OpenKeyEx` with `REG_OPTION_OPEN_LINK` passed as `reserved` opens the link itself. `QueryValueEx(h, "SymbolicLinkValue")` returns type 6. `is_link` is True for the link and False for the target and for a plain key.
+    2. `delete_key` and `delete_value` refuse the link, and the target is untouched.
+    3. MEASURE what a raw `DeleteKeyEx` on the link path deletes: the link or the target. Record the result in R17.
+    4. `DeleteKeyEx` on a non-leaf key fails with winerror 5 and deletes nothing.
+    5. The end of enumeration is winerror 259. A missing key is winerror 2.
+    6. REG_MULTI_SZ round-trips `['a','','b']`, `['a','']`, `['']` and `[]` through `set_value`/`values`.
+    7. Lossy reads:
+       - REG_SZ/REG_EXPAND_SZ with an embedded NUL is cut at the NUL;
+       - DWORD/QWORD with wrong-size data is read through a pointer cast;
+       - a zero-length MULTI_SZ reads as `[]`.
+
+       Expected: the backup and the fingerprint agree with each other but not with the raw bytes. Either document this, or make the detectors skip such values.
+    8. REG_NONE, type 0x20 and REG_BINARY round-trip as bytes. Writing REG_DWORD 2^32 raises `OverflowError`.
+    9. `CreateKeyEx` creates missing intermediate keys. Run once under 32-bit Python on 64-bit Windows, with explicit `Wow6432Node` paths.
+    10. The script removes `CleanixTest` completely, including the link key.
+    11. Under the elevated helper, HKCU is the elevated account's hive (T13 note).
 - [ ] **Step 7: Commit** `docs: registry cleanup (Windows, opt-in) and verification script`.
 
 ## Open questions for the user

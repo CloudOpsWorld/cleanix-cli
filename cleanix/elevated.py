@@ -21,7 +21,9 @@ nothing in it beyond *identifiers*, and nothing in its environment:
 5. Only cleaners on a helper-side ALLOWLIST (``admin_cleaner_ids``: system
    cleaners that can yield root items on this platform, default-enabled or
    explicitly listed, plus ``temp``) are scanned; other requested cleaner ids
-   are refused before any scan code runs.
+   are refused before any scan code runs. Registry detectors are never on
+   it: registry entries come only through the separate registry action
+   (point 10), with its own allowlist ``admin_registry_cleaner_ids``.
 6. A fresh scan is run with built-in DEFAULT settings; from the user's
    config file only ``protected_globs`` is taken (it can only add protection).
 7. An item is cleaned only if its key was requested AND it is in the fresh
@@ -34,14 +36,47 @@ nothing in it beyond *identifiers*, and nothing in its environment:
    and their ancestors, so without this a symlink planted in a world-writable
    tree (``/var/tmp/abrt -> /etc``) would turn ``/etc/*`` into items.
    Deletion then goes through the normal engine and its safety guard, one
-   item at a time.
+   item at a time. REGISTRY items are never deleted by this file path.
 8. Nothing is written under the user's home: no quarantine (the request's
-   ``use_quarantine`` is ignored), no history, no manifest. The GUI records
-   history itself, as the user, from the result.
+   ``use_quarantine`` is ignored), no history, no manifest, no quarantine
+   run (also not for registry entries: their backup was written by the GUI,
+   as the user, before the launch). The GUI records history itself, as the
+   user, from the result.
 9. The helper has its own deadline (at most 3300 s, below the launcher's
    3600 s); each COMMAND item's timeout is clamped to the time left when it
    starts, and a watchdog writes the work done so far and ends the process
    ``grace`` seconds after the deadline (never after a completed run).
+10. Registry action (Windows only; the optional ``registry`` part of the
+    request: registry detector ids, item keys, a backup RUN ID and the
+    invoking user's quarantine root -- never a key list to delete). Before
+    anything is deleted (else exit 1, nothing deleted, also no files):
+    every detector id is on ``admin_registry_cleaner_ids``, every key names
+    HKLM, the run id is a plain name, the process is elevated, the
+    quarantine root is a LOCAL-DRIVE path (judged from its text alone,
+    before any filesystem call: never UNC/WebDAV/device paths, which an
+    administrator process would open over the network), the request
+    directory and request are owned by one user SID, that SID's profile
+    (HKLM ProfileList, writable by administrators only, itself a local
+    path) strictly contains the quarantine root, which is
+    ``...\\cleanix\\quarantine``, with no link/junction (lstat) from the
+    profile down to the run, its registry folder and manifest, equal to its
+    realpath, and whose root, run directory and manifest are owned by that
+    SID. Then the
+    helper re-scans with exactly those detectors in helper scan mode
+    (``scanmode``: owner_matches=False) through an HKLM-only backend (an
+    HKCU call never reaches the registry: R15, HKCU here is the
+    administrator's hive), and deletes only REGISTRY HKLM items of its own
+    scan whose key (fingerprint included) was requested and that pass the
+    registry safety rules, each with ``service.clean(...,
+    use_quarantine=False, record_history=False,
+    registry_backup_elsewhere=True, registry_backup_run=<run>,
+    registry_verified_backups=<backups preloaded at validation>)``, so
+    ``VerifyOnlySink`` deletes only what that run can restore. The run's
+    manifest and the needed backup JSONs are read ONCE, during validation,
+    each opened right after its lstat and checked by handle (``fstat``:
+    same file), and verified in memory; after validation nothing of the
+    run is opened or resolved by path (the helper's own %LOCALAPPDATA%
+    quarantine is never consulted either).
 
 What the design does and does not protect:
 * The nonce only detects stale or mixed-up result files; it provides no
@@ -74,6 +109,25 @@ Known residuals, accepted for now:
 (e) Windows: ``win_system_temp`` cleans only plain files under
     ``Windows\\Temp`` in elevated runs; directories there (user-creatable,
     swappable for junctions mid-delete) are refused.
+(f) Registry action: a same-user (medium-integrity) program can edit the
+    request and the backup run between the GUI and the helper. It can only
+    pick among HKLM entries the helper's own allowlisted scan finds dead,
+    and each delete still needs a verified backup in the run (so it stays
+    restorable from an Administrator terminal); it can also tamper with
+    the backup files afterwards, which is why HKLM restore is never offered
+    by the GUI and shows exactly what it writes (T4). The R17 window
+    (``RegDeleteKeyEx`` re-resolving the path after the last check) applies
+    unchanged; the outcome is then "partially deleted", never success.
+    Path validation is check-then-use: a non-local root is refused from its
+    text before any filesystem call, and the run is read once, by handle,
+    right after each lstat. What remains is a micro-window between the
+    last lstat of a path and its open: a program running as the user that
+    can create symbolic links (Developer Mode, or an object-manager
+    symlink) could swap a component in that window and make the
+    administrator's open follow it (possibly to a network path). The
+    handle check then refuses the file, but the open already happened.
+    Handle-relative opening (NtCreateFile with a parent handle) is future
+    work, as for (d).
 
 Exit codes (126/127 are never used: pkexec reserves them):
 0 completed (details in the result file), 1 request unreadable/refused
@@ -83,18 +137,21 @@ Exit codes (126/127 are never used: pkexec reserves them):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import functools
 import math
 import ntpath
 import os
+import re
+import stat as _stat_mod
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import FrozenSet, List, Optional, Sequence
+from typing import FrozenSet, Iterator, List, Optional, Sequence
 
-from cleanix.core import context, elevate, service
+from cleanix.core import context, elevate, scanmode, service, winregistry
 from cleanix.core.models import ItemKind, item_key
 
 EXIT_OK = 0
@@ -354,6 +411,382 @@ def admin_cleaner_ids() -> FrozenSet[str]:
 
 
 # --------------------------------------------------------------------------
+# registry action: allowlist and eligibility
+# --------------------------------------------------------------------------
+_FIXED_LIST_REASON = ("Cannot be cleaned with administrator permission from the GUI: "
+                      "the administrator helper only cleans a fixed list of system locations")
+HKLM_ONLY_REASON = ("Only machine-wide (HKLM) registry entries are cleaned with "
+                    "administrator permission")
+REGISTRY_BLOCKED_REASON = "Blocked by registry safety rules"
+
+
+def _registry_supported() -> bool:
+    """The one platform gate of the registry action (helper AND GUI)."""
+    from cleanix.core import platform as plat
+
+    return plat.is_windows()
+
+
+def admin_registry_cleaner_ids() -> FrozenSet[str]:
+    """Registry detectors whose HKLM entries the helper may delete: the
+    HKLM-capable ``catalog.REGISTRY_IDS`` on Windows, nothing elsewhere.
+    Separate from ``admin_cleaner_ids`` (the file-cleaner allowlist)."""
+    if not _registry_supported():
+        return frozenset()
+    from cleanix.core import catalog
+
+    return frozenset(catalog.admin_registry_cleaner_ids())
+
+
+def _is_registry_candidate(item) -> bool:
+    from cleanix.core import catalog
+
+    return item.kind is ItemKind.REGISTRY or item.cleaner_id in catalog.REGISTRY_IDS
+
+
+def _registry_problem(item, reg_allowed: Optional[FrozenSet[str]] = None) -> Optional[str]:
+    """Why the helper never deletes this registry candidate (None: it may).
+    Only REGISTRY items of an allowlisted registry detector, in HKLM, that
+    pass the static registry safety rules."""
+    allowed = admin_registry_cleaner_ids() if reg_allowed is None else reg_allowed
+    if item.kind is not ItemKind.REGISTRY or item.reg is None or item.cleaner_id not in allowed:
+        return _FIXED_LIST_REASON
+    if item.reg.hive != "HKLM":
+        return HKLM_ONLY_REASON
+    from cleanix.core.regsafety import check_target
+
+    if check_target(item.cleaner_id, item.reg) is not None:
+        return REGISTRY_BLOCKED_REASON
+    return None
+
+
+def _registry_eligible(item, reg_allowed: FrozenSet[str]) -> bool:
+    """May the helper delete this (already key-matched) registry item?"""
+    return (not item.report_only and bool(item.requires_root)
+            and _registry_problem(item, reg_allowed) is None)
+
+
+class _MachineOnlyBackend:
+    """The registry backend the helper scans and deletes through (R15).
+
+    Running elevated, HKCU is the ADMINISTRATOR's hive, never the invoking
+    user's: every HKCU call is answered here as "absent" and never reaches
+    the real backend. Nothing is ever written (create/set are refused for
+    every hive: the helper never restores). HKLM reads and deletes are
+    forwarded unchanged."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    @staticmethod
+    def _machine(hive: str) -> bool:
+        return hive == "HKLM"
+
+    def subkeys(self, hive, key):
+        if not self._machine(hive):
+            raise winregistry.KeyMissing(f"{hive} is not read by the administrator helper")
+        return self._inner.subkeys(hive, key)
+
+    def values(self, hive, key):
+        if not self._machine(hive):
+            raise winregistry.KeyMissing(f"{hive} is not read by the administrator helper")
+        return self._inner.values(hive, key)
+
+    def key_exists(self, hive, key):
+        if not self._machine(hive):
+            return False
+        return self._inner.key_exists(hive, key)
+
+    def is_link(self, hive, key):
+        if not self._machine(hive):
+            raise winregistry.KeyMissing(f"{hive} is not read by the administrator helper")
+        return self._inner.is_link(hive, key)
+
+    def can_delete(self, hive, key, value):
+        if not self._machine(hive):
+            return False
+        return self._inner.can_delete(hive, key, value)
+
+    def delete_key(self, hive, key):
+        if not self._machine(hive):
+            raise winregistry.AccessDenied(f"{hive} is never changed by the administrator helper")
+        return self._inner.delete_key(hive, key)
+
+    def delete_value(self, hive, key, name):
+        if not self._machine(hive):
+            raise winregistry.AccessDenied(f"{hive} is never changed by the administrator helper")
+        return self._inner.delete_value(hive, key, name)
+
+    def create_key(self, hive, key):
+        raise winregistry.AccessDenied("the administrator helper never writes the registry")
+
+    def set_value(self, hive, key, value):
+        raise winregistry.AccessDenied("the administrator helper never writes the registry")
+
+
+# The invoking account: the owner of the request directory (created by the
+# unelevated GUI). Domain/local (S-1-5-21-...) and Azure AD (S-1-12-1-...)
+# user SIDs only; never Administrators, SYSTEM or another well-known SID.
+_USER_SID_RE = re.compile(r"S-1-5-21(?:-\d{1,10}){4}|S-1-12-1(?:-\d{1,10}){4}")
+PROFILE_LIST = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+_PROFILE_VARS = re.compile(r"%([^%]*)%")
+
+
+def _owner_sid(path) -> Optional[str]:
+    """Owner SID (string form) of a file or directory; None if unknown."""
+    try:
+        from cleanix.core import regbackup
+
+        return regbackup._win_security().file_owner(str(path))
+    except Exception:  # noqa: BLE001 - unknown owner: callers fail closed
+        return None
+
+
+def _invoking_sid(rdir: elevate.RequestDir) -> str:
+    owner = _owner_sid(rdir.path)
+    if not isinstance(owner, str) or not _USER_SID_RE.fullmatch(owner):
+        raise Refused("the request directory is not owned by a user account")
+    if _owner_sid(rdir.path / elevate.REQUEST_NAME) != owner:
+        raise Refused("the request is not owned by the account that owns its directory")
+    return owner
+
+
+def _profile_for_sid(sid: str) -> str:
+    """The account's profile directory from HKLM ProfileList (writable by
+    administrators only). REG_SZ or REG_EXPAND_SZ only; the one expansion
+    is %SystemDrive% (any other %VAR% refuses); the result must be an
+    absolute path on a local drive (a UNC/roaming profile refuses).
+    Lexical only: nothing on the filesystem is touched here."""
+    from cleanix.core.winregistry import REG_EXPAND_SZ, REG_SZ, RegistryError
+
+    try:
+        values = winregistry.get_backend().values("HKLM", PROFILE_LIST + "\\" + sid)
+    except RegistryError:
+        raise Refused("the requesting account has no profile") from None
+    raw = None
+    for v in values:
+        if v.name.casefold() == "profileimagepath":
+            if v.type not in (REG_SZ, REG_EXPAND_SZ) or not isinstance(v.data, str):
+                raise Refused("the requesting account's profile path is not usable")
+            raw = v.data
+            break
+    if not raw:
+        raise Refused("the requesting account has no profile")
+
+    def expand(m):
+        if m.group(1).casefold() == "systemdrive":
+            for k, val in os.environ.items():
+                if k.casefold() == "systemdrive" and val:
+                    return val
+        return m.group(0)
+
+    path = _PROFILE_VARS.sub(expand, raw)
+    if "%" in path:
+        raise Refused("the requesting account's profile path is not usable")
+    path = os.path.normpath(path)  # lexical
+    if not elevate.is_local_absolute_path(path):
+        raise Refused("the requesting account's profile path is not usable")
+    return path
+
+
+def _no_link(path: str, what: str, *, directory: bool = True) -> None:
+    """lstat (never follows) ``path``: no symlink/junction/reparse point,
+    and a directory (or a regular file with ``directory=False``)."""
+    try:
+        st = _lstat(path)
+    except OSError:
+        raise Refused(f"{what} cannot be inspected") from None
+    if (_stat_mod.S_ISLNK(st.st_mode)
+            or getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT):
+        raise Refused(f"{what} is a link or junction")
+    if directory and not _stat_mod.S_ISDIR(st.st_mode):
+        raise Refused(f"{what} is not a directory")
+    if not directory and not _stat_mod.S_ISREG(st.st_mode):
+        raise Refused(f"{what} is not a regular file")
+
+
+def _read_pinned(path: str, limit: int, what: str) -> bytes:
+    """Read a small file the user can write, as tightly as stdlib allows:
+    lstat it (a regular file, not a link or reparse point, at most
+    ``limit`` bytes), open it right away (``O_NOFOLLOW`` where available),
+    check that the OPENED file is the one just inspected (``fstat``:
+    same device and inode / file index, still regular), then read at most
+    ``limit`` bytes through that descriptor. Refused on any doubt."""
+    try:
+        st0 = _lstat(path)
+    except OSError:
+        raise Refused(f"{what} cannot be inspected") from None
+    if (_stat_mod.S_ISLNK(st0.st_mode)
+            or getattr(st0, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+            or not _stat_mod.S_ISREG(st0.st_mode)):
+        raise Refused(f"{what} is a link or not a regular file")
+    if getattr(st0, "st_size", 0) > limit:
+        raise Refused(f"{what} is too large")
+    flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        raise Refused(f"{what} could not be opened") from None
+    try:
+        st1 = _fstat(fd)
+        if (not _stat_mod.S_ISREG(st1.st_mode)
+                or (st1.st_dev, st1.st_ino) != (getattr(st0, "st_dev", None),
+                                                getattr(st0, "st_ino", None))):
+            raise Refused(f"{what} changed while it was being opened")
+        chunks, total = [], 0
+        while total <= limit:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except OSError:
+        raise Refused(f"{what} could not be read") from None
+    finally:
+        os.close(fd)
+    if total > limit:
+        raise Refused(f"{what} is too large")
+    return b"".join(chunks)
+
+
+def _preload_backups(req: elevate.RegistryRequest, run_dir: str, manifest: str) -> dict:
+    """Read the run's manifest and the registry backups the request needs,
+    ONCE, by pinned handle (``_read_pinned``), and fully verify them in
+    memory. ``{item key: regclean.VerifiedBackup}``; a key whose backup is
+    missing, unreadable or does not verify is simply absent (the delete of
+    that item is then refused by the sink)."""
+    import json
+
+    from cleanix.core import quarantine, regbackup, regclean, regsnap
+    from cleanix.core.models import RegTarget
+
+    raw = _read_pinned(manifest, quarantine.MAX_MANIFEST_BYTES, "the backup run's manifest")
+    try:
+        doc = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError):
+        raise Refused("the backup run's manifest is not valid") from None
+    entries = doc.get("items") if isinstance(doc, dict) else None
+    if not isinstance(entries, list):
+        raise Refused("the backup run's manifest is not valid")
+    wanted: dict = {}
+    for key in dict.fromkeys(req.keys):
+        cid, hive, rkey, value, fp = elevate.registry_key_parts(key)
+        wanted.setdefault((cid, hive, rkey, value), []).append((key, fp))
+    reg_dir = os.path.join(run_dir, "registry")
+    out: dict = {}
+    for entry in entries[:regclean.MAX_BACKUP_FILES]:
+        if not (isinstance(entry, dict) and entry.get("type") == "registry"
+                and entry.get("deleted") is not False):
+            continue
+        sig = (entry.get("cleaner_id"), entry.get("hive"), entry.get("key"),
+               entry.get("value"))
+        if sig not in wanted:
+            continue
+        name = Path(str(entry.get("json") or "")).name
+        if not regbackup.is_backup_json_name(name):
+            continue
+        try:
+            data = _read_pinned(os.path.join(reg_dir, name), regbackup.MAX_FILE_BYTES,
+                                "a registry backup")
+            cid, target, snap = regbackup.load_verified_bytes(data)
+        except (Refused, regbackup.RestoreError):
+            continue
+        got = regsnap.fingerprint(target, snap)
+        for key, fp in wanted[sig]:
+            if (key not in out and cid == sig[0] and got == fp
+                    and target == RegTarget(sig[1], sig[2], sig[3], fp)):
+                out[key] = regclean.VerifiedBackup(cid, target, got)
+    return out
+
+
+@dataclasses.dataclass(frozen=True)
+class _RegistryPlan:
+    only: List[str]
+    keys: List[str]
+    backup_run: str
+    quarantine_root: str
+    # Every backup the request needs, read and verified at validation time:
+    # nothing of the run is read by name after _prepare_registry.
+    backups: dict = dataclasses.field(default_factory=dict)
+
+
+def _lexical_root_problem(root: str) -> Optional[str]:
+    """Checks of the quarantine root that need no filesystem access."""
+    if not elevate.is_local_absolute_path(root):
+        return "the quarantine root is not a path on a local drive"
+    if os.path.normpath(root) != root:
+        return "the quarantine root is not a normalised absolute path"
+    if [p.casefold() for p in Path(root).parts[-2:]] != ["cleanix", "quarantine"]:
+        return "the quarantine root is not a cleanix quarantine"
+    return None
+
+
+def _prepare_registry(req: elevate.RegistryRequest, rdir: elevate.RequestDir) -> _RegistryPlan:
+    """Validate the registry action BEFORE anything is deleted (Refused on
+    any problem): Windows, allowlisted detectors, an elevated process, and
+    the backup run in the INVOKING account's own quarantine root.
+
+    Order matters (C1): every check on the caller-chosen root that needs no
+    filesystem access runs FIRST -- a local-drive path (never UNC, WebDAV,
+    ``\\\\?\\`` or device paths, which an administrator process would
+    open over the network), normalised, ending in ``cleanix\\quarantine``,
+    strictly inside the profile that HKLM ProfileList gives for the owner of
+    the request directory. Only then is the filesystem touched: lstat (never
+    following links) from the profile down to the run, its ``registry``
+    folder and manifest (no link or junction anywhere), the realpath, and
+    the owner of the root, run and manifest (that same account)."""
+    from cleanix.core import winenv
+
+    if not _registry_supported():
+        raise Refused("registry cleaning is only available on Windows")
+    allowed = admin_registry_cleaner_ids()
+    if not req.only or any(cid not in allowed for cid in req.only):
+        raise Refused("the registry part names a detector the helper does not run")
+    if not winenv.is_admin():
+        raise Refused("the helper is not elevated; registry entries were not removed")
+    root = req.quarantine_root
+    problem = _lexical_root_problem(root)
+    if problem:
+        raise Refused(problem)
+    sid = _invoking_sid(rdir)
+    profile = _profile_for_sid(sid)
+    if not _is_under(root, profile) or _is_under(profile, root):
+        raise Refused("the quarantine root is not inside the requesting account's profile")
+
+    # From here on only local paths inside the profile are touched.
+    chain = [p for p in Path(root).parents if _is_under(str(p), profile)]
+    for p in reversed(chain):
+        _no_link(str(p), "a directory of the quarantine root")
+    _no_link(root, "the quarantine root")
+    run_dir = os.path.join(root, req.backup_run)
+    _no_link(run_dir, "the backup run")
+    reg_dir = os.path.join(run_dir, "registry")
+    if os.path.lexists(reg_dir):
+        _no_link(reg_dir, "the backup run's registry folder")
+    manifest = os.path.join(run_dir, "manifest.json")
+    _no_link(manifest, "the backup run's manifest", directory=False)
+    if os.path.normcase(os.path.realpath(root)) != os.path.normcase(root):
+        raise Refused("the quarantine root is reached through a link")
+    for path, what in ((root, "the quarantine root"), (run_dir, "the backup run"),
+                       (manifest, "the backup run's manifest")):
+        if _owner_sid(path) != sid:
+            raise Refused(f"{what} does not belong to the requesting account")
+    # The ONLY reads of the run's files, right after their checks; the
+    # delete phase uses these in-memory, verified copies (no path is opened
+    # or resolved again while the helper scans and deletes).
+    backups = _preload_backups(req, run_dir, manifest)
+    return _RegistryPlan(list(dict.fromkeys(req.only)), list(dict.fromkeys(req.keys)),
+                         req.backup_run, root, backups)
+
+
+@contextlib.contextmanager
+def _helper_registry(guard) -> Iterator[None]:
+    with scanmode.helper_mode(), winregistry.using_backend(guard):
+        yield
+
+
+# --------------------------------------------------------------------------
 # parent-chain trust (the real defence against planted symlinks)
 # --------------------------------------------------------------------------
 _LOGIN_DEFS = "/etc/login.defs"
@@ -431,6 +864,7 @@ def _component_problem(st, expected_uid: Optional[int],
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _lstat = os.lstat
+_fstat = os.fstat
 
 
 def _is_under(path: str, root: str) -> bool:
@@ -467,10 +901,13 @@ def static_admin_problem(item, cleaner_id_allowlist=None) -> Optional[str]:
         return "Review only: Cleanix never deletes this item"
     if not item.requires_root:
         return "Does not need administrator permission"
+    if _is_registry_candidate(item):
+        # Registry items have their own allowlist (never the caller's file
+        # allowlist): HKLM entries of a registry detector, safety rules pass.
+        return _registry_problem(item)
     allowed = admin_cleaner_ids() if cleaner_id_allowlist is None else cleaner_id_allowlist
     if item.cleaner_id not in allowed:
-        return ("Cannot be cleaned with administrator permission from the GUI: "
-                "the administrator helper only cleans a fixed list of system locations")
+        return _FIXED_LIST_REASON
     if _is_posix() or item.kind is not ItemKind.PATH or not item.path:
         return None
     programdata, system_root = _static_win_dirs()
@@ -757,13 +1194,22 @@ def _run_session(session: _Session, config_path: Optional[str],
         name = _check_identity(selection.invoking_user, expected_uid)
         user = _bind_user(name, expected_uid)
         config = _load_config(config_path, Path(user.home), expected_uid)
+        reg_plan = None
+        if selection.registry is not None:
+            try:
+                reg_plan = _prepare_registry(selection.registry, session.rdir)
+            except Refused:
+                raise
+            except Exception:  # noqa: BLE001 - fail closed, never echo details
+                raise Refused("the registry part could not be validated") from None
     except Refused as exc:
         session.finish([f"request refused: {exc}"])
         return EXIT_REFUSED
 
     try:
         return _execute(session, selection, config, cancel, deadline, start,
-                        expected_uid, _user_groups(user) if _is_posix() else frozenset())
+                        expected_uid, _user_groups(user) if _is_posix() else frozenset(),
+                        reg_plan)
     except Exception as exc:  # noqa: BLE001
         session.finish([f"internal error in the elevated helper ({type(exc).__name__})"])
         if session.aborted:
@@ -771,10 +1217,18 @@ def _run_session(session: _Session, config_path: Optional[str],
         return EXIT_INTERNAL
 
 
-def _eligible(item, allowed: FrozenSet[str]) -> bool:
-    """May the helper clean this (already key-matched) item as admin?"""
-    return (not item.report_only and bool(item.requires_root)
-            and item.cleaner_id in allowed)
+def _eligible(item, allowed: FrozenSet[str],
+              reg_allowed: Optional[FrozenSet[str]] = None) -> bool:
+    """May the helper clean this (already key-matched) item as admin?
+    Registry candidates (REGISTRY items, or any item of a registry detector)
+    are judged by the registry rules only (``reg_allowed`` defaults to
+    ``admin_registry_cleaner_ids()``); everything else by ``allowed``."""
+    if item.report_only or not item.requires_root:
+        return False
+    if _is_registry_candidate(item):
+        return _registry_eligible(
+            item, admin_registry_cleaner_ids() if reg_allowed is None else reg_allowed)
+    return item.cleaner_id in allowed
 
 
 def _clamp_command(item, remaining: float):
@@ -785,17 +1239,56 @@ def _clamp_command(item, remaining: float):
     return dataclasses.replace(item, timeout=max(1, int(limit)))
 
 
+def _execute_registry(session: _Session, plan: _RegistryPlan, config, cancel,
+                      deadline: float, start: float) -> bool:
+    """The registry action (validated by ``_prepare_registry``). Re-scans
+    as administrator with exactly the requested registry detectors, in
+    helper scan mode and through the HKLM-only backend (HKCU is never
+    read), and deletes only HKLM items its own scan produced whose key
+    (fingerprint included) was requested, each verified against the
+    invoking user's backup run (``VerifyOnlySink``). Writes nothing.
+    Returns True when the deadline stopped it. Raises service.Cancelled
+    when the deadline is reached during the scan."""
+    reg_allowed = admin_registry_cleaner_ids()
+    wanted = set(plan.keys)
+    if not wanted:
+        return False
+    guard = _MachineOnlyBackend(winregistry.get_backend())
+    with _helper_registry(guard):
+        scan = service.scan(config, only=plan.only, cancel=cancel)
+    matched = set()
+    eligible = []
+    for item in scan.all_items():
+        key = item_key(item)
+        if key not in wanted or key in matched:
+            continue
+        matched.add(key)
+        if not _registry_eligible(item, reg_allowed):
+            session.note(refused=1)
+            continue
+        eligible.append(item)
+    session.note(unmatched=len(wanted - matched))
+    with session.lock:
+        session.total += len(eligible)
+    for item in eligible:
+        if deadline - (_monotonic() - start) <= 0 or cancel():
+            return True
+        with _helper_registry(guard):
+            summary = service.clean([item], config, dry_run=False, use_quarantine=False,
+                                    record_history=False, registry_backup_elsewhere=True,
+                                    registry_backup_run=plan.backup_run,
+                                    registry_verified_backups=plan.backups,
+                                    cancel=cancel)
+        if not summary.result.outcomes:
+            return True
+        session.record(summary)
+    return False
+
+
 def _execute(session: _Session, selection: elevate.Selection, config, cancel,
              deadline: float, start: float, expected_uid: Optional[int],
-             group_ids: Optional[FrozenSet[int]]) -> int:
-    allowed = admin_cleaner_ids()
-    wanted = set(selection.keys)
-    # Keys of cleaners the helper never runs are refused without scanning.
-    pre_refused = {k for k in wanted if k.split("|", 1)[0] not in allowed}
-    scan_keys = wanted - pre_refused
-    only = [c for c in dict.fromkeys(selection.only) if c in allowed]
-    session.note(refused=len(pre_refused))
-
+             group_ids: Optional[FrozenSet[int]],
+             reg_plan: Optional[_RegistryPlan] = None) -> int:
     def finish(extra=(), hit=False) -> int:
         ok = session.finish(extra, hit)
         if session.aborted:
@@ -803,6 +1296,25 @@ def _execute(session: _Session, selection: elevate.Selection, config, cancel,
         if not ok:
             return EXIT_INTERNAL
         return EXIT_DEADLINE if hit else EXIT_OK
+
+    if reg_plan is not None:
+        try:
+            if _execute_registry(session, reg_plan, config, cancel, deadline, start):
+                return finish(["deadline reached; the remaining items were not cleaned"],
+                              hit=True)
+        except service.Cancelled:
+            return finish(["deadline reached while scanning; nothing more was cleaned"],
+                          hit=True)
+
+    allowed = admin_cleaner_ids()
+    wanted = set(selection.keys)
+    # Keys of cleaners the helper never runs (incl. every registry detector:
+    # registry entries come only through the registry action) are refused
+    # without scanning.
+    pre_refused = {k for k in wanted if k.split("|", 1)[0] not in allowed}
+    scan_keys = wanted - pre_refused
+    only = [c for c in dict.fromkeys(selection.only) if c in allowed]
+    session.note(refused=len(pre_refused))
 
     if not only or not scan_keys:
         # Fail closed: an empty cleaner list never means "every cleaner".
@@ -821,13 +1333,15 @@ def _execute(session: _Session, selection: elevate.Selection, config, cancel,
         if key not in scan_keys or key in matched_keys:
             continue
         matched_keys.add(key)
-        if not _eligible(item, allowed):
+        # Registry entries are never deleted by the file path (no backup
+        # verification there): an empty registry allowlist refuses them.
+        if item.kind is ItemKind.REGISTRY or not _eligible(item, allowed, frozenset()):
             session.note(refused=1)
             continue
         eligible.append(item)
     session.note(unmatched=len(scan_keys - matched_keys))
     with session.lock:
-        session.total = len(eligible)
+        session.total += len(eligible)
 
     # One item at a time: the parent chain is re-checked right before each
     # deletion, and each command's timeout is clamped to the time left NOW.
@@ -906,6 +1420,10 @@ def _main(argv: Optional[Sequence[str]]) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
+        # Before any scan, for every thread (the engine scans on a pool):
+        # registry detectors never read HKCU and judge evidence with
+        # owner_matches=False in this process (R15).
+        scanmode.enable_process_helper_mode()
         rc = _main(argv)
     except BaseException:  # noqa: BLE001 - incl. SystemExit/KeyboardInterrupt
         return EXIT_INTERNAL

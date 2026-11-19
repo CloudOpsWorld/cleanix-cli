@@ -32,11 +32,14 @@ from PySide6.QtWidgets import (
 )
 
 from cleanix.config import Config
-from cleanix.core import catalog, curation, report
+from cleanix.core import catalog, curation, regpromises, report
 from cleanix.core.curation import Safety, is_empty
-from cleanix.core.models import CleanableItem, ItemKind, ScanResult, item_key
+from cleanix.core.models import (
+    CleanableItem, ItemKind, ScanResult, item_key, item_target,
+)
 from cleanix.core.utils import human_size
 from cleanix.gui import elevation, workers
+from cleanix.gui import models as gm
 from cleanix.gui.grouped_results import GroupedResults
 from cleanix.gui.models import (
     BadgeRole,
@@ -438,7 +441,8 @@ class PowerView(QWidget):
         self._bulk = True
         try:
             for r in self._actionable_rows():
-                m.set_checked(r, bool(predicate(m.item_at(r))))
+                it = m.item_at(r)
+                m.set_checked(r, gm.is_bulk_selectable(it) and bool(predicate(it)))
         finally:
             self._bulk = False
         self._model_to_tree()
@@ -489,15 +493,22 @@ class PowerView(QWidget):
                     problem: Optional[str] = None,
                     unavailable_reason: str = "") -> str:
         lines = [item.description]
+        registry = item.kind is ItemKind.REGISTRY
         if item.kind is ItemKind.COMMAND:
             lines.append("Command: " + " ".join(item.command or []))
+        elif registry:
+            lines.append("Registry: " + item_target(item))
         else:
             lines.append(f"Path: {item.path}")
         if item.hint:
-            lines.append(f"Hint: {item.hint}")
+            lines.append(f"{'Evidence' if registry else 'Hint'}: {item.hint}")
         if item.report_only:
             lines.append("Review only: Cleanix never deletes this item.")
-        lines.append(f"Size: {human_size(item.size)}")
+        if registry:
+            if regpromises.registry_undo_shipped():
+                lines.append("Backed up before removal (.reg in quarantine).")
+        else:
+            lines.append(f"Size: {human_size(item.size)}")
         if item.requires_root:
             lines.append("Requires administrator")
             if not allow_admin:
@@ -543,7 +554,9 @@ class PowerView(QWidget):
         try:
             rows = self._actionable_rows() if on else self._visible_rows()
             for r in rows:
-                self.item_model.set_checked(r, on)  # refuses report-only rows
+                if on and not gm.is_bulk_selectable(self.item_model.item_at(r)):
+                    continue  # never bulk-tick report-only or registry rows
+                self.item_model.set_checked(r, on)
         finally:
             self._bulk = False
         self._model_to_tree()
@@ -627,17 +640,35 @@ class PowerView(QWidget):
     def confirm_text(items: List[CleanableItem], hidden: int, keep_copy: bool) -> str:
         size = human_size(sum(i.size for i in items))
         lines = [f"{len(items)} selected item(s), {size}."]
-        admin = sum(1 for i in items if i.requires_root)
-        commands = sum(1 for i in items
+        shipped = regpromises.registry_undo_shipped()
+        reg = [i for i in items if i.kind is ItemKind.REGISTRY]
+        reg_user = sum(1 for i in reg if not i.requires_root)
+        reg_admin = len(reg) - reg_user
+        other = [i for i in items if i.kind is not ItemKind.REGISTRY]
+        admin = sum(1 for i in other if i.requires_root)
+        commands = sum(1 for i in other
                        if i.kind is ItemKind.COMMAND and not i.requires_root)
         if keep_copy:
-            if admin < len(items):
+            if other and admin < len(other):
                 lines.append("A copy of each removed file is kept so you can restore it"
                              + (" (except administrator items)." if admin else "."))
             if commands:
                 lines.append(f"{commands} command item(s) cannot be kept or undone.")
-        else:
-            lines.append("These items will be permanently removed. This cannot be undone.")
+        elif other:
+            lines.append("Files and commands will be permanently removed; registry "
+                         "entries are still backed up." if reg and shipped else
+                         "These items will be permanently removed. This cannot be undone.")
+        if reg and not shipped:
+            lines.append(regpromises.PERMANENT_LINE)
+        if reg_user and shipped:
+            lines.append(f"{reg_user} registry entr{'y' if reg_user == 1 else 'ies'} "
+                         "will be backed up first and can be restored from the "
+                         "Quarantine tab.")
+        if reg_admin and shipped:
+            lines.append(f"{reg_admin} administrator registry entr"
+                         f"{'y' if reg_admin == 1 else 'ies'} will be backed up first; "
+                         "restoring them needs an Administrator terminal "
+                         "(cleanix restore).")
         if admin:
             lines.append(f"{admin} item(s) need administrator permission: you will be "
                          "asked once, and they are removed permanently (cannot be undone).")
@@ -721,7 +752,7 @@ class PowerView(QWidget):
     def show_results(self, summary, text: str) -> None:
         lines = [text]
         for o in summary.errors[:10]:
-            lines.append(f"{o.item.path or ' '.join(o.item.command or [])}: {o.error}")
+            lines.append(f"{item_target(o.item)}: {o.error}")
         QMessageBox.information(self, "Cleanix results", "\n".join(lines))
 
     # ----- export -----

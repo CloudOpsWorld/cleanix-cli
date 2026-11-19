@@ -21,7 +21,7 @@ from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from cleanix.config import Config
 from cleanix.core import service
-from cleanix.core.models import CleanableItem
+from cleanix.core.models import CleanableItem, ItemKind
 
 _active: set = set()  # (thread, worker) pairs
 
@@ -243,6 +243,8 @@ class ElevatedCleanWorker(_BaseWorker):
             user_removed=user.removed,
             admin_preview_count=len(admin_items),
             admin_preview_size=preview_size,
+            admin_preview_registry=sum(1 for i in admin_items
+                                       if i.kind is ItemKind.REGISTRY),
         )
         self._emit(self.finished, combined)
 

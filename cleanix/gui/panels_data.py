@@ -120,7 +120,10 @@ class QuarantinePanel(QWidget):
         for row, r in enumerate(runs):
             self.table.setItem(row, 0, _item(str(r["run_id"])))
             self.table.setItem(row, 1, _item(_fmt_time(r.get("created", 0))))
-            self.table.setItem(row, 2, _item(str(r.get("count", 0)), True))
+            items = str(r.get("count", 0))
+            if r.get("registry", 0) > 0:
+                items += f" ({r['registry']} registry)"
+            self.table.setItem(row, 2, _item(items, True))
             self.table.setItem(row, 3, _item(human_size(r.get("size", 0)), True))
         total = sum(r.get("size", 0) for r in runs)
         if runs:

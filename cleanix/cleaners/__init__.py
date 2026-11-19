@@ -186,6 +186,13 @@ from cleanix.cleaners.windows_apps import (
     WinVisualStudioCleaner,
 )
 
+# Windows registry detectors (opt-in)
+from cleanix.cleaners.winreg_uninstall import WinRegUninstall
+from cleanix.cleaners.winreg_app_paths import WinRegAppPaths
+from cleanix.cleaners.winreg_file_assoc import WinRegFileAssoc
+from cleanix.cleaners.winreg_startup import WinRegStartup
+from cleanix.cleaners.winreg_shared_dlls import WinRegSharedDlls
+
 ALL_CLEANERS: List[Type[Cleaner]] = [
     # Cross-platform user junk
     TrashCleaner,
@@ -315,6 +322,12 @@ ALL_CLEANERS: List[Type[Cleaner]] = [
     WinPackageCacheCleaner,
     WinVisualStudioCleaner,
     WslDiskReporter,
+    # Windows registry (opt-in; always backed up first)
+    WinRegUninstall,
+    WinRegAppPaths,
+    WinRegFileAssoc,
+    WinRegStartup,
+    WinRegSharedDlls,
     # BSD
     FreeBsdPkgCleaner,
     BsdDistfilesCleaner,

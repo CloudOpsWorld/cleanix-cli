@@ -1,0 +1,1867 @@
+"""The elevated helper's registry action: machine-wide (HKLM) registry
+deletions, backed up first by the GUI as the user (ruling R6).
+
+Everything runs against FakeRegistry: no real registry access, no real
+elevation prompt (every launcher is a stub), nothing outside tmp_path.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import sys
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from cleanix import elevated
+from cleanix.core import (
+    catalog,
+    context,
+    elevate,
+    engine,
+    history,
+    quarantine,
+    regpromises,
+    regsnap,
+    safety,
+    scanmode,
+    service,
+    winenv,
+    winregistry,
+)
+from cleanix.core.models import (
+    CleanableItem,
+    CleanerReport,
+    ItemKind,
+    RegTarget,
+    item_key,
+)
+from cleanix.core.winregistry import REG_EXPAND_SZ, REG_SZ, KeyMissing
+
+POSIX = os.name != "nt"
+UID = os.getuid() if POSIX else 1000
+CV = r"SOFTWARE\Microsoft\Windows\CurrentVersion"
+RUN = CV + r"\Run"
+USER_SID = "S-1-5-21-111-222-333-1001"
+OTHER_SID = "S-1-5-21-111-222-333-1002"
+ADMINS_SID = "S-1-5-32-544"
+LOCAL_ROOT = (r"C:\Users\a\AppData\Local\cleanix\quarantine" if not POSIX
+              else "/home/a/.local/state/cleanix/quarantine")
+
+
+# --------------------------------------------------------------------------
+# fixtures / helpers
+# --------------------------------------------------------------------------
+class FakeCleaner:
+    def __init__(self, cid, items):
+        self.id = cid
+        self.name = cid
+        self._items = items
+
+    def scan(self):
+        items = self._items() if callable(self._items) else self._items
+        return CleanerReport(cleaner_id=self.id, name=self.name, description="d",
+                             items=list(items))
+
+
+def reg_item(reg, value="Foo", *, hive="HKLM", key=RUN, cid="win_reg_startup"):
+    t = RegTarget(hive, key, value)
+    fp = regsnap.fingerprint(t, regsnap.snapshot(reg, t))
+    return CleanableItem(cleaner_id=cid, description=f"Startup entry: {value}", size=0,
+                         kind=ItemKind.REGISTRY, requires_root=(hive == "HKLM"),
+                         reg=dataclasses.replace(t, fingerprint=fp))
+
+
+def _norm(p) -> str:
+    return os.path.normcase(os.path.abspath(str(p)))
+
+
+@pytest.fixture(autouse=True)
+def _never_elevate(monkeypatch):
+    """No test here may reach a real elevation prompt."""
+    from cleanix.core import elevate_launch
+
+    def never(*a, **k):
+        pytest.fail("a real elevation was attempted")
+
+    monkeypatch.setattr(elevate_launch, "launch_elevated", never)
+    monkeypatch.setattr(winenv, "run_elevated", never)
+
+
+@pytest.fixture(autouse=True)
+def _restore_environ():
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+    assert not scanmode.is_helper_mode()
+
+
+@pytest.fixture
+def h(tmp_path, monkeypatch, fake_registry):
+    """Helper environment: alice's profile under tmp_path, her quarantine
+    root inside it, FakeRegistry with live HKLM/HKCU Run values and the
+    ProfileList entry for her SID, and a DIFFERENT default quarantine root
+    for the helper process (the administrator's)."""
+    home = tmp_path / "home" / "alice"
+    home.mkdir(parents=True)
+    qroot = home / "AppData" / "Local" / "cleanix" / "quarantine"
+    admin_root = tmp_path / "adminprofile" / "AppData" / "Local" / "cleanix" / "quarantine"
+    user = context.TargetUser("alice", home, UID, UID, True)
+
+    def fake_invoking_user():
+        return user
+
+    fake_invoking_user.cache_clear = lambda: None  # type: ignore[attr-defined]
+    monkeypatch.setattr(context, "invoking_user", fake_invoking_user)
+    monkeypatch.setattr(history, "invoking_user", fake_invoking_user)
+    monkeypatch.setattr(quarantine, "invoking_user", fake_invoking_user)
+    monkeypatch.setattr(elevated, "_user_for_uid", lambda uid: "alice" if uid == UID else None)
+    for var in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(var, str(home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(home / ".local" / "state"))
+    monkeypatch.setenv("LOCALAPPDATA", str(admin_root.parent.parent))
+    monkeypatch.setenv("APPDATA", str(home / "AppData" / "Roaming"))
+    monkeypatch.delenv("PKEXEC_UID", raising=False)
+    # The helper's own default quarantine root is the administrator's.
+    monkeypatch.setattr(quarantine, "quarantine_root", lambda: admin_root)
+    monkeypatch.setattr(engine, "is_root", lambda: True)
+    monkeypatch.setattr(winenv, "is_admin", lambda: True)
+    monkeypatch.setattr(elevated, "_registry_supported", lambda: True)
+    monkeypatch.setattr(elevated, "admin_cleaner_ids", lambda: frozenset({"logs"}))
+    monkeypatch.setattr(elevated, "_trusted_owner", lambda st, uid: True)
+    monkeypatch.setattr(elevated, "_untrusted_group", lambda st, groups: False)
+    owners = {}
+    monkeypatch.setattr(elevated, "_owner_sid",
+                        lambda p: owners.get(_norm(p), USER_SID))
+
+    reg = fake_registry
+    reg.add_key("HKLM", RUN, {"Foo": (REG_SZ, r"C:\Gone\foo.exe"),
+                              "Bar": (REG_SZ, r"C:\Gone\bar.exe")})
+    reg.add_key("HKCU", RUN, {"Mine": (REG_SZ, r"C:\Gone\mine.exe")})
+    reg.add_key("HKLM", elevated.PROFILE_LIST + "\\" + USER_SID,
+                {"ProfileImagePath": (REG_EXPAND_SZ, str(home))})
+
+    cleaners = []
+
+    def fake_build(config, only=None, exclude=None):
+        wanted = {c.lower() for c in only} if only else None
+        return [c for c in cleaners if wanted is None or c.id.lower() in wanted]
+
+    monkeypatch.setattr(service, "build_cleaners", fake_build)
+    reqdir = tmp_path / "req"
+    reqdir.mkdir()
+    if POSIX:
+        os.chmod(reqdir, 0o700)
+    ns = SimpleNamespace(tmp=tmp_path, home=home, qroot=qroot, admin_root=admin_root,
+                         reg=reg, cleaners=cleaners, owners=owners, reqdir=reqdir,
+                         result=reqdir / elevate.RESULT_NAME)
+    yield ns
+    context.configure(None)
+    safety.set_protected_globs([])
+
+
+def startup_cleaner(h, hive="HKLM"):
+    """A stand-in for win_reg_startup: one item per live value in ``hive``'s
+    Run key, built from the registry AT SCAN TIME (so the fingerprint is
+    what the helper sees)."""
+    def scan():
+        backend = winregistry.get_backend()
+        out = []
+        for v in backend.values(hive, RUN):
+            out.append(reg_item(backend, v.name, hive=hive))
+        return out
+
+    return FakeCleaner("win_reg_startup", scan)
+
+
+def gui_backup(h, items) -> str:
+    """What the GUI does before launching: back the entries up AS THE USER
+    into her quarantine root; returns the run id."""
+    saved = quarantine.quarantine_root
+    quarantine.quarantine_root = lambda: h.qroot
+    try:
+        run = quarantine.new_run()
+        for it in items:
+            run.store_registry(it, h.reg)
+        return run.run_id
+    finally:
+        quarantine.quarantine_root = saved
+
+
+def selection(h, reg_keys, run, *, only=("win_reg_startup",), root=None,
+              file_keys=(), file_only=()):
+    return elevate.Selection(
+        invoking_user="alice", only=list(file_only), keys=list(file_keys),
+        use_quarantine=False, nonce=uuid.uuid4().hex,
+        registry=elevate.RegistryRequest(list(only), list(reg_keys), run,
+                                         str(root if root is not None else h.qroot)))
+
+
+def run_helper(h, sel, **kw):
+    req = elevate.write_request(h.reqdir, sel)
+    return elevated.run(req, h.result, None, expected_uid=UID, **kw)
+
+
+def write_raw_request(h, mutate):
+    sel = selection(h, [], "20261119-000000-1-abcd")
+    req = elevate.write_request(h.reqdir, sel)
+    data = json.loads(req.read_text(encoding="utf-8"))
+    mutate(data)
+    req.write_text(json.dumps(data), encoding="utf-8")
+    return req
+
+
+def present(h, value, hive="HKLM"):
+    return value.casefold() in {v.name.casefold() for v in h.reg.values(hive, RUN)}
+
+
+def tree(root):
+    return sorted(str(p.relative_to(root)) for p in Path(root).rglob("*"))
+
+
+# --------------------------------------------------------------------------
+# allowlists
+# --------------------------------------------------------------------------
+def test_catalog_admin_registry_ids_are_the_five_hklm_capable():
+    ids = catalog.admin_registry_cleaner_ids()
+    assert ids == frozenset(catalog.REGISTRY_IDS)
+    from cleanix.core.regsafety import containers_for
+
+    for cid in ids:
+        assert any(c.hive == "HKLM" for c in containers_for(cid))
+
+
+def test_registry_ids_allowlisted_on_windows_only(monkeypatch):
+    from cleanix.core import platform as plat
+
+    monkeypatch.setattr(plat, "is_windows", lambda: True)
+    assert elevated.admin_registry_cleaner_ids() == frozenset(catalog.REGISTRY_IDS)
+    monkeypatch.setattr(plat, "is_windows", lambda: False)
+    assert elevated.admin_registry_cleaner_ids() == frozenset()
+
+
+def test_registry_ids_stay_out_of_the_file_allowlist():
+    assert not set(catalog.REGISTRY_IDS) & set(elevated.admin_cleaner_ids())
+
+
+# --------------------------------------------------------------------------
+# protocol
+# --------------------------------------------------------------------------
+def test_request_roundtrip_with_registry_part(tmp_path, fake_registry):
+    fake_registry.add_key("HKLM", RUN, {"Foo": (REG_SZ, "x")})
+    key = item_key(reg_item(fake_registry))
+    sel = elevate.Selection(invoking_user="alice", only=[], keys=[], use_quarantine=False,
+                            registry=elevate.RegistryRequest(
+                                ["win_reg_startup"], [key], "20261119-1-ab", LOCAL_ROOT))
+    path = elevate.write_request(tmp_path, sel)
+    assert elevate.read_request(path, expected_uid=UID if POSIX else None) == sel
+
+
+def test_request_without_registry_part_parses_as_before(tmp_path):
+    sel = elevate.Selection(invoking_user="alice", only=["logs"], keys=["logs|path|/x"],
+                            use_quarantine=False)
+    path = elevate.write_request(tmp_path, sel)
+    assert "registry" not in json.loads(path.read_text(encoding="utf-8"))
+    assert elevate.read_request(path, expected_uid=UID if POSIX else None).registry is None
+
+
+HKCU_KEY = "win_reg_startup|reg|" + json.dumps(["HKCU", RUN, "Mine", "f" * 64])
+HKLM_KEY = "win_reg_startup|reg|" + json.dumps(["HKLM", RUN, "Foo", "f" * 64])
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d["registry"].update(keys=[HKCU_KEY]),                       # HKCU target
+    lambda d: d["registry"].update(keys=[HKLM_KEY, HKCU_KEY]),             # mixed
+    lambda d: d["registry"].update(keys=[HKLM_KEY.replace("HKLM", "HKU")]),
+    lambda d: d["registry"].update(keys=["win_reg_startup|path|C:\\x"]),   # not a reg key
+    lambda d: d["registry"].update(keys=["win_reg_startup|reg|[1,2]"]),
+    lambda d: d["registry"].update(keys=[HKLM_KEY.replace("win_reg_startup", "win_reg_uninstall")]),
+    lambda d: d["registry"].update(extra=1),                               # extra keys
+    lambda d: d["registry"].pop("backup_run"),
+    lambda d: d["registry"].update(backup_run="..\\other"),                # separators
+    lambda d: d["registry"].update(backup_run="a/b"),
+    lambda d: d["registry"].update(backup_run="a\\b"),
+    lambda d: d["registry"].update(backup_run=".."),
+    lambda d: d["registry"].update(backup_run="C:x"),
+    lambda d: d["registry"].update(backup_run=""),
+    lambda d: d["registry"].update(backup_run=5),
+    lambda d: d["registry"].update(quarantine_root=""),
+    lambda d: d["registry"].update(quarantine_root="C:\\q\x00"),
+    lambda d: d["registry"].update(quarantine_root=["C:\\q"]),
+    lambda d: d["registry"].update(only=[]),
+    lambda d: d["registry"].update(only=["../x"]),
+    lambda d: d.update(registry=[]),
+    lambda d: d.update(registry=None),
+    lambda d: d["registry"].update(quarantine_root=r"\\attacker\share\cleanix\quarantine"),
+])
+def test_malformed_registry_part_is_refused(tmp_path, mutate):
+    sel = elevate.Selection(invoking_user="alice", only=[], keys=[], use_quarantine=False,
+                            registry=elevate.RegistryRequest(
+                                ["win_reg_startup"], [HKLM_KEY], "20261119-1-ab", LOCAL_ROOT))
+    path = elevate.write_request(tmp_path, sel)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    # the unmutated request is valid: each case fails only for its mutation
+    elevate.parse_request(json.dumps(data).encode("utf-8"))
+    mutate(data)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError):
+        elevate.read_request(path, expected_uid=UID if POSIX else None)
+
+
+# --------------------------------------------------------------------------
+# the helper: happy path and invariants
+# --------------------------------------------------------------------------
+def test_helper_deletes_backed_up_hklm_entry(h):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    rc = run_helper(h, selection(h, [item_key(item)], run))
+    assert rc == elevated.EXIT_OK
+    assert not present(h, "Foo") and present(h, "Bar") and present(h, "Mine", "HKCU")
+    res = elevate.read_result(h.result)
+    assert res.removed == 1 and res.unmatched == 0 and res.refused == 0 and res.errors == []
+
+
+def test_helper_writes_nothing_creates_no_run_and_records_no_history(h):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    before = tree(h.home)
+    manifest = (h.qroot / run / "manifest.json").read_bytes()
+    rc = run_helper(h, selection(h, [item_key(item)], run))
+    assert rc == 0 and not present(h, "Foo")
+    assert tree(h.home) == before                      # no new run, no history
+    assert (h.qroot / run / "manifest.json").read_bytes() == manifest
+    assert not h.admin_root.exists()                   # nothing in its own profile
+    assert not history.state_dir().exists() or not any(history.state_dir().iterdir())
+
+
+def test_helper_ignores_its_own_quarantine_root(h):
+    """A valid backup in the HELPER's own %LOCALAPPDATA% quarantine never
+    counts: only the invoking user's root (from the request) is used."""
+    item = reg_item(h.reg, "Foo")
+    saved = h.qroot
+    h.qroot = h.admin_root
+    run = gui_backup(h, [item])           # backup in the administrator's root
+    h.qroot = saved
+    # same run id in alice's root, with a manifest that holds nothing
+    (h.qroot / run).mkdir(parents=True)
+    (h.qroot / run / "manifest.json").write_text(
+        json.dumps({"run_id": run, "created": 0, "items": []}), encoding="utf-8")
+    h.cleaners.append(startup_cleaner(h))
+    rc = run_helper(h, selection(h, [item_key(item)], run))
+    assert rc == 0
+    assert present(h, "Foo")
+    res = elevate.read_result(h.result)
+    assert res.removed == 0 and any("backup" in e for e in res.errors)
+
+
+def test_helper_deletes_from_preloaded_backups_only(h, monkeypatch):
+    """The delete uses the backups verified during validation (in memory);
+    the helper never asks quarantine_root() (the ADMINISTRATOR's
+    %LOCALAPPDATA%) and passes no root to resolve."""
+    from cleanix.core import regclean
+
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    seen = []
+    real_clean = service.clean
+
+    def spy_clean(items, config, **kw):
+        seen.append(kw)
+        return real_clean(items, config, **kw)
+
+    def forbidden():
+        raise AssertionError("the helper asked for its own quarantine root")
+
+    monkeypatch.setattr(service, "clean", spy_clean)
+    monkeypatch.setattr(quarantine, "quarantine_root", forbidden)
+    assert run_helper(h, selection(h, [item_key(item)], run)) == 0
+    assert not present(h, "Foo")
+    (kw,) = seen
+    assert kw.get("registry_backup_root") is None and kw["registry_backup_run"] == run
+    pre = kw["registry_verified_backups"]
+    assert set(pre) == {item_key(item)}
+    assert pre[item_key(item)] == regclean.VerifiedBackup(
+        "win_reg_startup", item.reg, item.reg.fingerprint)
+
+
+@pytest.fixture
+def after_validation(monkeypatch):
+    """Run ``hook()`` right after ``_prepare_registry`` returned."""
+    hooks = []
+    real = elevated._prepare_registry
+
+    def wrapped(req, rdir):
+        plan = real(req, rdir)
+        for hook in hooks:
+            hook()
+        return plan
+
+    monkeypatch.setattr(elevated, "_prepare_registry", wrapped)
+    return hooks
+
+
+def test_no_filesystem_access_to_the_run_after_validation(h, monkeypatch, after_validation):
+    """After _prepare_registry: no realpath/stat/lstat/open/scandir/Path.*
+    call at all while the helper scans and deletes (the result write comes
+    after the spy is removed)."""
+    import builtins
+
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    calls = []
+    installed = []
+
+    def install():
+        def wrap(owner, name):
+            real = getattr(owner, name)
+
+            def spy(*a, **k):
+                calls.append((name, str(a[:1])[:120]))
+                return real(*a, **k)
+
+            monkeypatch.setattr(owner, name, spy)
+            installed.append((owner, name, real))
+
+        for owner, name in ((os.path, "realpath"), (os.path, "exists"),
+                            (os.path, "lexists"), (os.path, "isdir"), (os.path, "isfile"),
+                            (os, "stat"), (os, "lstat"), (os, "open"), (os, "scandir"),
+                            (os, "listdir"), (builtins, "open"), (elevated, "_lstat"),
+                            (elevated, "_owner_sid"), (Path, "exists"), (Path, "is_dir"),
+                            (Path, "stat"), (Path, "lstat"), (Path, "open"),
+                            (Path, "read_bytes"), (Path, "read_text"), (Path, "resolve"),
+                            (Path, "iterdir")):
+            wrap(owner, name)
+
+    after_validation.append(install)
+    real_clean = service.clean
+    phase = []
+
+    def spy_clean(items, config, **kw):
+        out = real_clean(items, config, **kw)
+        phase.append(list(calls))
+        return out
+
+    monkeypatch.setattr(service, "clean", spy_clean)
+    assert run_helper(h, selection(h, [item_key(item)], run)) == 0
+    assert not present(h, "Foo")
+    assert phase == [[]], phase
+
+
+def test_swapping_the_run_after_validation_has_no_effect(h, after_validation):
+    """Deleting or rewriting the run's files after validation changes
+    nothing: the sink uses the preloaded copies."""
+    import shutil
+
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    after_validation.append(lambda: shutil.rmtree(h.qroot / run))
+    assert run_helper(h, selection(h, [item_key(item)], run)) == 0
+    assert not present(h, "Foo")
+    assert elevate.read_result(h.result).removed == 1
+
+
+def test_preloaded_sink_refuses_an_item_without_its_backup(fake_registry):
+    from cleanix.core import regbackup, regclean
+
+    fake_registry.add_key("HKLM", RUN, {"Foo": (REG_SZ, "x"), "Bar": (REG_SZ, "y")})
+    foo, bar = reg_item(fake_registry, "Foo"), reg_item(fake_registry, "Bar")
+    sink = regclean.VerifyOnlySink.from_preloaded(
+        "20261119-1-ab", {item_key(bar): regclean.VerifiedBackup(
+            bar.cleaner_id, bar.reg, bar.reg.fingerprint)})
+    sink.before_delete(bar, fake_registry)
+    for wrong in (foo,
+                  dataclasses.replace(bar, cleaner_id="win_reg_app_paths"),
+                  dataclasses.replace(bar, reg=dataclasses.replace(bar.reg, fingerprint="0" * 64))):
+        with pytest.raises(regbackup.BackupError):
+            sink.before_delete(wrong, fake_registry)
+    assert sink.backup_dir is None
+    bad = regclean.VerifyOnlySink.from_preloaded("../x", {item_key(bar): regclean.VerifiedBackup(
+        bar.cleaner_id, bar.reg, bar.reg.fingerprint)})
+    with pytest.raises(regbackup.BackupError):
+        bad.before_delete(bar, fake_registry)
+    fake_registry.calls.clear()
+    with pytest.raises(regbackup.BackupError):
+        sink.before_delete(foo, fake_registry)
+    assert fake_registry.calls == []
+
+
+def test_preload_skips_a_backup_that_does_not_verify(h):
+    """A tampered backup JSON is not preloaded: the delete is refused."""
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    (js,) = list((h.qroot / run / "registry").glob("*.json"))
+    js.write_bytes(js.read_bytes().replace(b"Gone", b"Gona"))
+    h.cleaners.append(startup_cleaner(h))
+    assert run_helper(h, selection(h, [item_key(item)], run)) == 0
+    assert present(h, "Foo")
+    assert any("backup" in e for e in elevate.read_result(h.result).errors)
+
+
+def test_pinned_read_refuses_a_file_swapped_after_its_lstat(tmp_path, monkeypatch):
+    p = tmp_path / "manifest.json"
+    p.write_bytes(b"{}")
+    assert elevated._read_pinned(str(p), 100, "m") == b"{}"
+    real = os.fstat
+
+    def other_file(fd):
+        st = real(fd)
+        return SimpleNamespace(st_mode=st.st_mode, st_dev=st.st_dev, st_ino=st.st_ino + 1)
+
+    monkeypatch.setattr(elevated, "_fstat", other_file)
+    with pytest.raises(elevated.Refused, match="changed"):
+        elevated._read_pinned(str(p), 100, "m")
+
+
+def test_pinned_read_caps_and_refuses_non_regular(tmp_path):
+    p = tmp_path / "big.json"
+    p.write_bytes(b"x" * 101)
+    with pytest.raises(elevated.Refused, match="too large"):
+        elevated._read_pinned(str(p), 100, "m")
+    with pytest.raises(elevated.Refused):
+        elevated._read_pinned(str(tmp_path), 100, "m")
+    with pytest.raises(elevated.Refused):
+        elevated._read_pinned(str(tmp_path / "missing"), 100, "m")
+
+
+def test_lstat_chain_runs_profile_down_and_stops_at_a_link(h, monkeypatch):
+    """The chain is walked from the profile DOWN; a link at AppData stops it
+    before anything deeper (Local, cleanix, ...) is examined."""
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    seen = []
+    real = os.lstat
+    appdata = _norm(h.home / "AppData")
+
+    def lstat(p, *a, **k):
+        seen.append(_norm(p))
+        st = real(p, *a, **k)
+        if _norm(p) == appdata:
+            return SimpleNamespace(st_mode=st.st_mode, st_file_attributes=0x400)
+        return st
+
+    monkeypatch.setattr(elevated, "_lstat", lstat)
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)),
+                   reason="link or junction")
+    assert seen == [_norm(h.home), appdata]
+
+
+def test_root_reached_through_a_link_above_the_profile_is_refused(h, monkeypatch):
+    """Only the realpath check can see a link above the profile."""
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    real = os.path.realpath
+    target = _norm(h.qroot)
+
+    def realpath(p, *a, **k):
+        if _norm(p) == target:
+            return str(h.tmp / "elsewhere" / "cleanix" / "quarantine")
+        return real(p, *a, **k)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)),
+                   reason="reached through a link")
+
+
+def test_backup_run_without_this_entry_refuses_delete(h):
+    foo, bar = reg_item(h.reg, "Foo"), reg_item(h.reg, "Bar")
+    run = gui_backup(h, [bar])            # the run holds Bar only
+    h.cleaners.append(startup_cleaner(h))
+    rc = run_helper(h, selection(h, [item_key(foo)], run))
+    assert rc == 0
+    assert present(h, "Foo")
+    res = elevate.read_result(h.result)
+    assert res.removed == 0 and res.errors and "backup" in res.errors[0]
+
+
+def test_fingerprint_mismatch_is_unmatched(h):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.reg.set_value("HKLM", RUN, winregistry.RegValue("Foo", REG_SZ, r"C:\Gone\new.exe"))
+    h.cleaners.append(startup_cleaner(h))
+    rc = run_helper(h, selection(h, [item_key(item)], run))
+    assert rc == 0
+    assert present(h, "Foo")
+    res = elevate.read_result(h.result)
+    assert res.unmatched == 1 and res.removed == 0
+
+
+def test_target_absent_from_helper_scan_is_unmatched(h):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    # allowlisted detector, but its scan does not produce this target
+    h.cleaners.append(FakeCleaner("win_reg_startup", []))
+    rc = run_helper(h, selection(h, [item_key(item)], run))
+    assert rc == 0
+    assert present(h, "Foo")
+    assert elevate.read_result(h.result).unmatched == 1
+
+
+def test_scan_item_from_wrong_detector_or_hive_is_refused(h):
+    """Defence in depth after the scan: an HKCU item or an item reporting a
+    non-registry cleaner id is refused even if its key was requested."""
+    hkcu = reg_item(h.reg, "Mine", hive="HKCU")
+    hklm = reg_item(h.reg, "Foo")
+    forged = dataclasses.replace(hklm, cleaner_id="win_reg_app_paths")
+    run = gui_backup(h, [hklm])
+    h.cleaners.append(FakeCleaner("win_reg_startup", [forged]))
+    h.cleaners.append(FakeCleaner("win_reg_app_paths", [forged]))
+    rc = run_helper(h, selection(h, [item_key(forged)], run,
+                                 only=("win_reg_startup", "win_reg_app_paths")))
+    assert rc == 0 and present(h, "Foo")
+    assert elevate.read_result(h.result).refused == 1
+    assert not elevated._registry_eligible(hkcu, elevated.admin_registry_cleaner_ids())
+
+
+def test_combined_file_and_registry_parts_one_run(h):
+    junk = h.tmp / "junk"
+    junk.mkdir()
+    f = junk / "a.log"
+    f.write_bytes(b"x" * 10)
+    fitem = CleanableItem(cleaner_id="logs", description="a", size=10, path=str(f),
+                          requires_root=True)
+    h.cleaners.append(FakeCleaner("logs", [fitem]))
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    rc = run_helper(h, selection(h, [item_key(item)], run,
+                                 file_keys=[item_key(fitem)], file_only=["logs"]))
+    assert rc == 0
+    assert not f.exists() and not present(h, "Foo")
+    assert elevate.read_result(h.result).removed == 2
+
+
+def test_registry_key_in_file_part_is_refused(h):
+    item = reg_item(h.reg, "Foo")
+    h.cleaners.append(startup_cleaner(h))
+    sel = elevate.Selection(invoking_user="alice", only=["win_reg_startup"],
+                            keys=[item_key(item)], use_quarantine=False)
+    req = elevate.write_request(h.reqdir, sel)
+    assert elevated.run(req, h.result, None, expected_uid=UID) == 0
+    assert present(h, "Foo")
+    assert elevate.read_result(h.result).refused == 1
+
+
+# --------------------------------------------------------------------------
+# the helper: refusals (exit 1, nothing deleted)
+# --------------------------------------------------------------------------
+def assert_refused(h, rc, *, file=None, reason=None):
+    assert rc == elevated.EXIT_REFUSED
+    assert present(h, "Foo") and present(h, "Bar") and present(h, "Mine", "HKCU")
+    if file is not None:
+        assert file.exists()
+    res = elevate.read_result(h.result)
+    assert res.removed == 0 and res.errors and res.errors[0].startswith("request refused")
+    if reason is not None:
+        assert reason in res.errors[0], res.errors[0]
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d["registry"].update(keys=[HKCU_KEY]),
+    lambda d: d["registry"].update(extra="x"),
+    lambda d: d["registry"].update(backup_run="..\\..\\x"),
+    lambda d: d["registry"].update(backup_run="a/b"),
+])
+def test_forged_registry_request_refused_before_anything_is_deleted(h, mutate):
+    junk = h.tmp / "junk"
+    junk.mkdir()
+    f = junk / "a.log"
+    f.write_bytes(b"x")
+    h.cleaners.append(FakeCleaner("logs", [CleanableItem(
+        cleaner_id="logs", description="a", size=1, path=str(f), requires_root=True)]))
+    h.cleaners.append(startup_cleaner(h))
+    req = write_raw_request(h, mutate)
+    assert_refused(h, elevated.run(req, h.result, None, expected_uid=UID))
+
+
+def test_non_registry_detector_id_in_registry_part_refused(h):
+    h.cleaners.append(FakeCleaner("logs", []))
+    key = "logs|reg|" + json.dumps(["HKLM", RUN, "Foo", "f" * 64])
+    assert_refused(h, run_helper(h, selection(h, [key], "20261119-1-ab", only=("logs",))))
+
+
+def test_registry_part_refused_when_not_elevated(h, monkeypatch):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    monkeypatch.setattr(winenv, "is_admin", lambda: False)
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+def test_registry_part_refused_off_windows(h, monkeypatch):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    monkeypatch.setattr(elevated, "_registry_supported", lambda: False)
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+def test_run_of_another_account_refused(h):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.owners[_norm(h.qroot / run)] = OTHER_SID
+    h.cleaners.append(startup_cleaner(h))
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+def test_manifest_of_another_account_refused(h):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.owners[_norm(h.qroot / run / "manifest.json")] = ADMINS_SID
+    h.cleaners.append(startup_cleaner(h))
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+def test_quarantine_root_of_another_account_refused(h):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.owners[_norm(h.qroot)] = OTHER_SID
+    h.cleaners.append(startup_cleaner(h))
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+@pytest.mark.parametrize("owner", [None, ADMINS_SID, "S-1-5-18", "garbage"])
+def test_request_dir_not_owned_by_a_user_account_refused(h, owner):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.owners[_norm(h.reqdir)] = owner
+    h.cleaners.append(startup_cleaner(h))
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+def test_request_file_owned_by_another_account_refused(h):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.owners[_norm(h.reqdir / elevate.REQUEST_NAME)] = OTHER_SID
+    h.cleaners.append(startup_cleaner(h))
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+def test_quarantine_root_of_the_other_account_profile_refused(h):
+    """The run exists, owned by alice, but the root is not under the profile
+    that ProfileList gives for the request directory's owner."""
+    item = reg_item(h.reg, "Foo")
+    elsewhere = h.tmp / "elsewhere" / "cleanix" / "quarantine"
+    saved = h.qroot
+    h.qroot = elsewhere
+    run = gui_backup(h, [item])
+    h.qroot = saved
+    h.cleaners.append(startup_cleaner(h))
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run, root=elsewhere)))
+
+
+def test_lexical_normpath_check(monkeypatch):
+    """A path the local-path rule lets through (POSIX form) but that is not
+    normalised is refused by the normpath check."""
+    monkeypatch.setattr(elevate, "_POSIX", True)
+    assert elevated._lexical_root_problem(
+        "/home/a/x/../cleanix/quarantine") == "the quarantine root is not a normalised absolute path"
+    if POSIX:
+        assert elevated._lexical_root_problem(
+            "/home/a/x/quarantine") == "the quarantine root is not a cleanix quarantine"
+
+
+@pytest.mark.parametrize("make_root, reason", [
+    (lambda h: h.home / "AppData" / "Local" / "cleanix", "not a cleanix quarantine"),
+    (lambda h: h.home / "AppData" / "Local" / "x" / "quarantine", "not a cleanix quarantine"),
+    (lambda h: h.home, "not a cleanix quarantine"),                        # the profile
+    # Windows: a ".." component already fails the local-path rule (parse);
+    # POSIX: the normpath check in _prepare_registry refuses it.
+    (lambda h: str(h.qroot) + os.sep + ".." + os.sep + "quarantine",
+     "not a normalised absolute path" if POSIX else "'registry.quarantine_root' is invalid"),
+    (lambda h: "cleanix" + os.sep + "quarantine", "'registry.quarantine_root' is invalid"),
+])
+def test_bad_quarantine_root_refused(h, make_root, reason):
+    """Each bad root is refused by ITS check (a complete, valid copy of the
+    run sits under the bad root, so no later check could refuse it)."""
+    import shutil
+
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    root = make_root(h)
+    if os.path.isabs(str(root)) and _norm(root) != _norm(h.qroot):
+        dst = Path(os.path.normpath(str(root))) / run
+        if not dst.exists():
+            shutil.copytree(h.qroot / run, dst)
+    h.cleaners.append(startup_cleaner(h))
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run, root=root)),
+                   reason=reason)
+
+
+def test_missing_profile_list_entry_refused(h):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.reg.add_key("HKLM", elevated.PROFILE_LIST + "\\" + OTHER_SID,
+                  {"ProfileImagePath": (REG_SZ, str(h.home))})
+    h.owners[_norm(h.reqdir)] = "S-1-5-21-9-9-9-9"
+    h.owners[_norm(h.reqdir / elevate.REQUEST_NAME)] = "S-1-5-21-9-9-9-9"
+    h.cleaners.append(startup_cleaner(h))
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+def test_reparse_point_on_quarantine_root_chain_refused(h, monkeypatch):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    real = os.lstat
+    local = _norm(h.home / "AppData" / "Local")
+
+    def lstat(p, *a, **k):
+        st = real(p, *a, **k)
+        if _norm(p) == local:
+            return SimpleNamespace(st_mode=st.st_mode, st_file_attributes=0x400,
+                                   st_uid=getattr(st, "st_uid", 0))
+        return st
+
+    monkeypatch.setattr(elevated, "_lstat", lstat)
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+def test_run_dir_is_a_link_refused(h, monkeypatch):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    real = os.lstat
+    target = _norm(h.qroot / run)
+
+    def lstat(p, *a, **k):
+        st = real(p, *a, **k)
+        if _norm(p) == target:
+            return SimpleNamespace(st_mode=st.st_mode, st_file_attributes=0x400,
+                                   st_uid=getattr(st, "st_uid", 0))
+        return st
+
+    monkeypatch.setattr(elevated, "_lstat", lstat)
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+# --------------------------------------------------------------------------
+# HKCU is never read (R15)
+# --------------------------------------------------------------------------
+def test_machine_only_backend_never_forwards_hkcu(fake_registry):
+    fake_registry.add_key("HKCU", RUN, {"Mine": (REG_SZ, "x")})
+    fake_registry.add_key("HKLM", RUN, {"Foo": (REG_SZ, "x")})
+    guard = elevated._MachineOnlyBackend(fake_registry)
+    assert guard.key_exists("HKCU", RUN) is False
+    for call in (lambda: guard.subkeys("HKCU", "SOFTWARE"), lambda: guard.values("HKCU", RUN),
+                 lambda: guard.is_link("HKCU", RUN)):
+        with pytest.raises(KeyMissing):
+            call()
+    assert guard.can_delete("HKCU", RUN, "Mine") is False
+    for call in (lambda: guard.delete_value("HKCU", RUN, "Mine"),
+                 lambda: guard.delete_key("HKCU", RUN),
+                 lambda: guard.create_key("HKLM", RUN + r"\x"),
+                 lambda: guard.set_value("HKLM", RUN, winregistry.RegValue("a", REG_SZ, "b"))):
+        with pytest.raises(winregistry.AccessDenied):
+            call()
+    assert not [c for c in fake_registry.calls if "HKCU" in c]
+    assert [v.name for v in guard.values("HKLM", RUN)] == ["Foo"]
+
+
+def test_helper_mode_scan_reads_no_hkcu_key(h):
+    """A detector run by the helper reads HKCU (as every real detector's
+    container list does): the helper's backend makes HKCU look absent and
+    never forwards a single HKCU call; HKLM findings are kept."""
+    seen = {}
+
+    def scan():
+        backend = winregistry.get_backend()
+        seen["helper_mode"] = scanmode.is_helper_mode()
+        out = []
+        for hive in ("HKCU", "HKLM"):
+            try:
+                for v in backend.values(hive, RUN):
+                    out.append(reg_item(backend, v.name, hive=hive))
+            except winregistry.RegistryError:
+                seen[hive] = "missing"
+        return out
+
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(FakeCleaner("win_reg_startup", scan))
+    h.reg.calls.clear()
+    assert run_helper(h, selection(h, [item_key(item)], run)) == 0
+    assert not [c for c in h.reg.calls if "HKCU" in c]
+    assert not present(h, "Foo") and present(h, "Mine", "HKCU")
+    assert seen == {"helper_mode": True, "HKCU": "missing"}
+
+
+REAL_IDS = ("win_reg_startup", "win_reg_app_paths")
+
+
+@pytest.fixture
+def real_detectors(h, monkeypatch):
+    """Two real registry detectors through the real service.scan and Engine
+    path (two cleaners: the engine scans them on its thread pool), with an
+    evidence context whose prober says every target is MISSING. Records
+    (detector id, container hive, owner_matches, worker thread?) per
+    container the detector is asked about."""
+    import threading
+
+    from _fakereg import FakeProber
+    from cleanix.cleaners import winreg_base
+    from cleanix.cleaners.winreg_app_paths import WinRegAppPaths
+    from cleanix.cleaners.winreg_startup import WinRegStartup
+    from cleanix.core import registry, regtargets
+    from cleanix.core.regtargets import DetectorContext, Existence
+
+    monkeypatch.setattr(service, "build_cleaners", registry.build_cleaners)
+    contexts = []
+    env = {"SystemRoot": r"C:\Windows", "ProgramFiles": r"C:\Program Files"}
+
+    def fake_default_context(owner_matches=True):
+        return DetectorContext(env, FakeProber({}, Existence.MISSING), r"C:\Users",
+                               r"C:\Windows", owner_matches)
+
+    # Both the name the base imported and the module function (a
+    # centralised context() may call either).
+    monkeypatch.setattr(winreg_base, "default_context", fake_default_context)
+    monkeypatch.setattr(regtargets, "default_context", fake_default_context)
+    main = threading.main_thread()
+    for cls in (WinRegStartup, WinRegAppPaths):
+        real_entries = cls.entries
+
+        def spy_entries(self, container, backend, ctx, _real=real_entries):
+            contexts.append((self.id, container.hive, ctx.owner_matches,
+                             threading.current_thread() is not main))
+            return _real(self, container, backend, ctx)
+
+        monkeypatch.setattr(cls, "entries", spy_entries)
+    return contexts
+
+
+def _gui_scan_item(value):
+    """The GUI's own (non-helper) scan with the real startup detector."""
+    from cleanix.config import Config
+    from cleanix.core import registry
+
+    det = registry.build_cleaners(Config(), only=["win_reg_startup"])[0]
+    return [i for i in det.scan().items if i.reg.value == value][0]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real registry detectors are Windows-only")
+def test_real_detector_helper_scan_reads_no_hkcu(h, real_detectors):
+    foo = _gui_scan_item("Foo")
+    run = gui_backup(h, [foo])
+    h.reg.calls.clear()
+    real_detectors.clear()
+    assert run_helper(h, selection(h, [item_key(foo)], run, only=REAL_IDS)) == 0
+    assert not [c for c in h.reg.calls if "HKCU" in c]
+    assert {d for d, *_ in real_detectors} == set(REAL_IDS)   # both real detectors ran
+    assert any(worker for *_, worker in real_detectors)      # on the engine's pool
+    assert not present(h, "Foo") and present(h, "Mine", "HKCU")
+    assert elevate.read_result(h.result).removed == 1
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real registry detectors are Windows-only")
+def test_real_detector_helper_scan_uses_owner_matches_false(h, real_detectors):
+    """Through the helper's real path (service.scan -> Engine thread pool),
+    every detector context says the scanning process is not the hive owner
+    and no HKCU container is examined."""
+    from cleanix.cleaners.winreg_startup import WinRegStartup
+    from cleanix.config import Config
+
+    with scanmode.helper_mode():
+        probe = WinRegStartup(Config()).context()
+    if probe.owner_matches:
+        pytest.skip("owner_matches centralisation (RegistryDetector.context reading "
+                    "scanmode.is_helper_mode) is not merged in this branch")
+    foo = _gui_scan_item("Foo")
+    run = gui_backup(h, [foo])
+    real_detectors.clear()
+    # No process-wide switch here (conftest disables it): the helper's own
+    # scanmode.helper_mode() around its scan must reach the engine threads.
+    assert run_helper(h, selection(h, [item_key(foo)], run, only=REAL_IDS)) == 0
+    assert {d for d, *_ in real_detectors} == set(REAL_IDS)
+    assert any(worker for *_, worker in real_detectors)
+    assert all(om is False for _d, _hive, om, _w in real_detectors)
+    assert all(hive == "HKLM" for _d, hive, _om, _w in real_detectors)
+    assert not present(h, "Foo")
+
+
+def test_main_enables_process_helper_mode_before_running(monkeypatch):
+    order = []
+    monkeypatch.setattr(scanmode, "enable_process_helper_mode", lambda: order.append("mode"))
+    monkeypatch.setattr(elevated, "_main", lambda argv: order.append("run") or 0)
+    assert elevated.main([]) == 0
+    assert order == ["mode", "run"]
+
+
+# --------------------------------------------------------------------------
+# deadline / exit codes
+# --------------------------------------------------------------------------
+def test_deadline_during_registry_scan_deletes_nothing_exit_3(h, monkeypatch):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    clock = [0.0]
+
+    def slow():
+        clock[0] = 10_000.0
+        return [reg_item(winregistry.get_backend(), "Foo")]
+
+    h.cleaners.append(FakeCleaner("win_reg_startup", slow))
+    monkeypatch.setattr(elevated, "_monotonic", lambda: clock[0])
+    rc = run_helper(h, selection(h, [item_key(item)], run), deadline=100)
+    assert rc == elevated.EXIT_DEADLINE
+    assert present(h, "Foo")
+    res = elevate.read_result(h.result)
+    assert res.deadline_hit and res.removed == 0
+
+
+def test_internal_error_in_registry_part_exits_2(h, monkeypatch):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+
+    def boom(*a, **k):
+        raise RuntimeError("secret")
+
+    monkeypatch.setattr(elevated, "_registry_eligible", boom)
+    assert run_helper(h, selection(h, [item_key(item)], run)) == elevated.EXIT_INTERNAL
+    assert present(h, "Foo")
+    assert all("secret" not in e for e in elevate.read_result(h.result).errors)
+
+
+def test_registry_result_echoes_nonce(h):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    sel = selection(h, [item_key(item)], run)
+    assert run_helper(h, sel) == 0
+    assert elevate.read_result(h.result).nonce == sel.nonce
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+def test_world_writable_request_dir_refused_for_registry(h):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    os.chmod(h.reqdir, 0o777)
+    rc = run_helper(h, selection(h, [item_key(item)], run))
+    assert rc == 1 and present(h, "Foo") and not h.result.exists()
+
+
+# --------------------------------------------------------------------------
+# static eligibility parity (what the GUI offers == what the helper cleans)
+# --------------------------------------------------------------------------
+def _variants(cid, reg):
+    hklm = reg_item(reg, "Foo")
+    hkcu = reg_item(reg, "Mine", hive="HKCU")
+    return [
+        dataclasses.replace(hklm, cleaner_id=cid),
+        dataclasses.replace(hkcu, cleaner_id=cid),
+        dataclasses.replace(hklm, cleaner_id=cid, report_only=True),
+        CleanableItem(cleaner_id=cid, description="c", size=1, kind=ItemKind.COMMAND,
+                      command=["tool"], requires_root=True),
+        dataclasses.replace(hklm, cleaner_id=cid, reg=dataclasses.replace(
+            hklm.reg, key=r"SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\Run")),
+    ]
+
+
+@pytest.mark.parametrize("windows", [True, False])
+def test_static_problem_parity_registry(fake_registry, monkeypatch, windows):
+    from cleanix.core import registry
+
+    monkeypatch.setattr(elevated, "_registry_supported", lambda: windows)
+    fake_registry.add_key("HKLM", RUN, {"Foo": (REG_SZ, "x")})
+    fake_registry.add_key("HKCU", RUN, {"Mine": (REG_SZ, "x")})
+    allowed = frozenset({"logs"})
+    offered = set()
+    for cid in sorted({c.id for c in registry.ALL_CLEANERS}) + ["not_a_cleaner"]:
+        for item in _variants(cid, fake_registry):
+            static_ok = elevated.static_admin_problem(item, allowed) is None
+            assert static_ok == elevated._eligible(item, allowed), (cid, item)
+            if static_ok and item.kind is ItemKind.REGISTRY:
+                offered.add(cid)
+    if windows:
+        # Only the startup id has a container for RUN: the HKLM variant of
+        # every other registry id is outside its detector's containers.
+        assert offered == {"win_reg_startup"}
+    else:
+        assert offered == set()
+
+
+def test_static_problem_registry_reasons(fake_registry, monkeypatch):
+    monkeypatch.setattr(elevated, "_registry_supported", lambda: True)
+    fake_registry.add_key("HKLM", RUN, {"Foo": (REG_SZ, "x")})
+    fake_registry.add_key("HKCU", RUN, {"Mine": (REG_SZ, "x")})
+    hklm = reg_item(fake_registry, "Foo")
+    hkcu_root = dataclasses.replace(reg_item(fake_registry, "Mine", hive="HKCU"),
+                                    requires_root=True)
+    assert elevated.static_admin_problem(hklm, frozenset()) is None
+    assert "HKLM" in elevated.static_admin_problem(hkcu_root, frozenset())
+    assert not elevated._eligible(hkcu_root, frozenset())
+    blocked = dataclasses.replace(hklm, reg=dataclasses.replace(
+        hklm.reg, key=r"SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\Run"))
+    assert "safety rules" in elevated.static_admin_problem(blocked, frozenset())
+    other = dataclasses.replace(hklm, cleaner_id="logs")
+    assert "fixed list" in elevated.static_admin_problem(other, frozenset({"logs"}))
+    assert not elevated._eligible(other, frozenset({"logs"}))
+
+
+def test_admin_problems_registry_items_ignore_the_file_allowlist(fake_registry, monkeypatch):
+    from cleanix.gui import elevation
+
+    monkeypatch.setattr(elevated, "_registry_supported", lambda: True)
+    monkeypatch.setattr(elevation, "admin_allowlist", lambda: frozenset({"logs"}))
+    fake_registry.add_key("HKLM", RUN, {"Foo": (REG_SZ, "x")})
+    ok = reg_item(fake_registry, "Foo")
+    bad = dataclasses.replace(ok, reg=dataclasses.replace(
+        ok.reg, key=r"SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\Run"))
+    problems = elevation.admin_problems([ok, bad])
+    assert id(ok) not in problems and id(bad) in problems
+
+
+# --------------------------------------------------------------------------
+# GUI side (no Qt): backup before launch, one launch, purge on decline
+# --------------------------------------------------------------------------
+@pytest.fixture
+def gui(h, monkeypatch):
+    """The GUI's quarantine root is alice's; the helper (launcher stub) is
+    run in-process with the administrator's default root."""
+    from cleanix.gui import elevation
+
+    monkeypatch.setattr(quarantine, "quarantine_root", lambda: h.qroot)
+    monkeypatch.setattr(elevation, "_invoking_user_name", lambda: "alice")
+    calls = []
+
+    def helper_launcher(argv):
+        req = Path(argv[argv.index("--request") + 1])
+        res = Path(argv[argv.index("--result") + 1])
+        sel = elevate.read_request(req, expected_uid=UID if POSIX else None)
+        run = sel.registry.backup_run if sel.registry else None
+        calls.append(SimpleNamespace(
+            sel=sel, backup_exists=bool(run) and (h.qroot / run / "manifest.json").is_file()))
+        saved = quarantine.quarantine_root
+        quarantine.quarantine_root = lambda: h.admin_root
+        try:
+            if POSIX:
+                os.chmod(req.parent, 0o700)
+            rc = elevated.run(req, res, None, expected_uid=UID)
+        finally:
+            quarantine.quarantine_root = saved
+        if rc != 0:
+            from cleanix.core import elevate_launch
+
+            errors = elevate.read_result(res).errors if res.exists() else []
+            raise elevate_launch.ElevationFailed(f"helper failed {errors}", exit_code=rc)
+        return 0
+
+    return SimpleNamespace(calls=calls, launcher=helper_launcher)
+
+
+def test_gui_writes_backup_before_launch_and_helper_deletes(h, gui):
+    from cleanix.gui import elevation
+
+    h.cleaners.append(startup_cleaner(h))
+    item = reg_item(h.reg, "Foo")
+    out = elevation.run_elevated_part([item], launcher=gui.launcher)
+    assert out.status == elevation.DONE, (out.message, out.detail)
+    (call,) = gui.calls
+    assert call.backup_exists
+    reg = call.sel.registry
+    assert reg.only == ["win_reg_startup"] and reg.keys == [item_key(item)]
+    assert reg.backup_run == out.registry_backup_run
+    assert os.path.normcase(reg.quarantine_root) == os.path.normcase(str(h.qroot))
+    assert call.sel.keys == [] and call.sel.only == []
+    assert not present(h, "Foo") and out.result.removed == 1
+    # the run is kept (restorable from an Administrator terminal)
+    assert (h.qroot / out.registry_backup_run / "manifest.json").is_file()
+
+
+def test_gui_combined_file_and_registry_launches_once(h, gui):
+    from cleanix.gui import elevation
+
+    junk = h.tmp / "junk"
+    junk.mkdir()
+    f = junk / "a.log"
+    f.write_bytes(b"x" * 10)
+    fitem = CleanableItem(cleaner_id="logs", description="a", size=10, path=str(f),
+                          requires_root=True)
+    h.cleaners.append(FakeCleaner("logs", [fitem]))
+    h.cleaners.append(startup_cleaner(h))
+    item = reg_item(h.reg, "Foo")
+    out = elevation.run_elevated_part([fitem, item], launcher=gui.launcher)
+    assert out.status == elevation.DONE
+    assert len(gui.calls) == 1
+    assert gui.calls[0].sel.keys == [item_key(fitem)]
+    assert not f.exists() and not present(h, "Foo")
+    assert out.result.removed == 2
+
+
+def test_backup_failure_drops_item_from_request(h, gui, monkeypatch):
+    from cleanix.gui import elevation
+
+    h.cleaners.append(startup_cleaner(h))
+    foo, bar = reg_item(h.reg, "Foo"), reg_item(h.reg, "Bar")
+    real = quarantine.Quarantine.store_registry
+
+    def store(self, item, backend):
+        if item.reg.value == "Bar":
+            raise OSError("disk full")
+        return real(self, item, backend)
+
+    monkeypatch.setattr(quarantine.Quarantine, "store_registry", store)
+    out = elevation.run_elevated_part([foo, bar], launcher=gui.launcher)
+    assert out.status == elevation.DONE
+    assert out.registry_backup_failed == 1
+    assert gui.calls[0].sel.registry.keys == [item_key(foo)]
+    assert not present(h, "Foo") and present(h, "Bar")
+
+
+def test_all_backups_failed_nothing_launched(h, gui, monkeypatch):
+    from cleanix.gui import elevation
+
+    def store(self, item, backend):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(quarantine.Quarantine, "store_registry", store)
+    out = elevation.run_elevated_part([reg_item(h.reg, "Foo")], launcher=gui.launcher)
+    assert out.status == elevation.FAILED
+    assert out.message == "Registry backup failed; nothing was removed."
+    assert gui.calls == [] and present(h, "Foo")
+    assert not h.qroot.exists() or quarantine.list_runs() == []
+
+
+@pytest.mark.parametrize("exc_name, status", [
+    ("ElevationDeclined", "declined"), ("ElevationUnavailable", "unavailable")])
+def test_declined_or_unavailable_purges_backup_run(h, gui, exc_name, status):
+    from cleanix.core import elevate_launch
+    from cleanix.gui import elevation
+
+    seen = []
+
+    def launcher(argv):
+        req = Path(argv[argv.index("--request") + 1])
+        seen.append(elevate.read_request(req, expected_uid=UID if POSIX else None))
+        raise getattr(elevate_launch, exc_name)("no")
+
+    out = elevation.run_elevated_part([reg_item(h.reg, "Foo")], launcher=launcher)
+    assert out.status == status
+    assert seen and (h.qroot / seen[0].registry.backup_run).exists() is False
+    assert quarantine.list_runs() == []
+    assert out.registry_backup_run is None
+    assert present(h, "Foo")
+
+
+def test_cancel_before_launch_purges_backup_run(h, gui):
+    from cleanix.gui import elevation
+
+    out = elevation.run_elevated_part([reg_item(h.reg, "Foo")], launcher=gui.launcher,
+                                      cancel=lambda: True)
+    assert out is None and gui.calls == []
+    assert quarantine.list_runs() == []
+
+
+def test_launch_failure_keeps_backup_run(h, gui):
+    from cleanix.core import elevate_launch
+    from cleanix.gui import elevation
+
+    def launcher(argv):
+        raise elevate_launch.ElevationFailed("boom", exit_code=2)
+
+    out = elevation.run_elevated_part([reg_item(h.reg, "Foo")], launcher=launcher)
+    assert out.status == elevation.FAILED
+    assert out.registry_backup_run and len(quarantine.list_runs()) == 1
+
+
+def test_build_selection_never_puts_registry_items_in_the_file_part(fake_registry):
+    from cleanix.gui import elevation
+
+    fake_registry.add_key("HKLM", RUN, {"Foo": (REG_SZ, "x")})
+    item = reg_item(fake_registry)
+    sel = elevation.build_selection([item])
+    assert sel.keys == [] and sel.only == [] and sel.registry is None
+
+
+# --------------------------------------------------------------------------
+# wording
+# --------------------------------------------------------------------------
+def _summary(outcome, selected=1, **kw):
+    from cleanix.gui import elevation
+
+    return SimpleNamespace(admin=outcome, admin_selected=selected, late_cancel=False,
+                           admin_preview_count=0, admin_preview_size=0,
+                           admin_preview_registry=0, **kw)
+
+
+def test_outcome_lines_registry_wording_when_undo_shipped(monkeypatch, tmp_path):
+    from cleanix.gui import elevation
+
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", True)
+    run_dir = tmp_path / "q" / "20261119-1-ab"
+    out = elevation.ElevatedOutcome(
+        elevation.DONE, "ok", elevate.HelperResult(freed=0, removed=1, errors=[], unmatched=0),
+        registry_backup_run="20261119-1-ab", registry_backup_dir=str(run_dir),
+        registry_selected=1)
+    text = "\n".join(elevation.admin_outcome_lines(_summary(out)))
+    assert "20261119-1-ab" in text and str(run_dir) in text and "reg import" in text
+    assert "Administrator terminal" in text
+    assert "Administrator files and commands are removed permanently" in text
+    assert "Administrator items are removed permanently" not in text
+    # Safe under over-the-shoulder UAC (I2): the folder is user-writable,
+    # every .reg is inspected first, the 64-bit view is explicit, and
+    # cleanix restore is promised only for the same account.
+    assert "changed by any program running as you" in text
+    assert "inspect every .reg file" in text
+    assert "/reg:64" in text
+    assert "works only when the Administrator terminal runs as this same account" in text
+
+
+def test_outcome_lines_changed_and_not_prepared_wording(monkeypatch):
+    from cleanix.gui import elevation
+
+    out = elevation.ElevatedOutcome(
+        elevation.DONE, "ok", elevate.HelperResult(freed=0, removed=1, errors=[], unmatched=0),
+        registry_selected=3, registry_changed=1,
+        registry_backup_error=elevation.BACKUP_NOT_PREPARED)
+    text = "\n".join(elevation.admin_outcome_lines(_summary(out)))
+    assert "1 registry entry changed since the scan and was not removed; scan again" in text
+    assert "could not be backed up" not in text
+    assert "Registry backup could not be prepared; registry entries were not removed" in text
+
+
+def test_outcome_lines_registry_wording_before_undo_ships(monkeypatch, tmp_path):
+    from cleanix.gui import elevation
+
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", False)
+    out = elevation.ElevatedOutcome(
+        elevation.DONE, "ok", elevate.HelperResult(freed=0, removed=1, errors=[], unmatched=0),
+        registry_backup_run="20261119-1-ab", registry_backup_dir=str(tmp_path),
+        registry_selected=1, registry_backup_failed=2)
+    text = "\n".join(elevation.admin_outcome_lines(_summary(out)))
+    assert "reg import" not in text and "backed up to quarantine run" not in text
+    assert "cannot be undone" in text
+    assert "2 registry entries could not be backed up" in text
+
+
+def test_dry_run_preview_registry_wording(monkeypatch):
+    from cleanix.gui import elevation
+
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", True)
+    line = elevation.admin_preview_line(3, 100, registry=2)
+    assert "files and commands cannot be undone" in line
+    assert "2 registry entries are backed up first" in line
+    assert "1 registry entry is backed up first" in elevation.admin_preview_line(1, 0, registry=1)
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", False)
+    assert "backed up" not in elevation.admin_preview_line(3, 100, registry=2)
+    assert elevation.admin_preview_line(3, 100) == elevation.admin_preview_line(3, 100, registry=0)
+    summary = SimpleNamespace(admin_preview_count=3, admin_preview_size=100,
+                              admin_preview_registry=2)
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", True)
+    assert "registry entries are backed up first" in elevation.admin_outcome_lines(summary)[0]
+    # The worker side (admin_preview_registry set by the dry run) is in
+    # tests/gui/test_elevated_flow.py.
+
+
+# --------------------------------------------------------------------------
+# C1: a caller-chosen root is refused LEXICALLY, before any filesystem call
+# --------------------------------------------------------------------------
+NON_LOCAL_ROOTS = [
+    r"\\attacker.example\share\cleanix\quarantine",          # UNC (SMB)
+    r"\\attacker@80\dav\cleanix\quarantine",                 # WebDAV
+    r"\\attacker@SSL@443\dav\cleanix\quarantine",
+    r"\\?\UNC\attacker\share\cleanix\quarantine",
+    r"\\?\GLOBALROOT\Device\Mup\attacker\share\cleanix\quarantine",
+    r"\\?\C:\Users\a\AppData\Local\cleanix\quarantine",
+    r"\\.\pipe\cleanix\quarantine",
+    "//attacker/share/cleanix/quarantine",
+    r"\Users\a\AppData\Local\cleanix\quarantine",            # rooted, no drive
+    r"C:Users\a\cleanix\quarantine",                         # drive-relative
+    r"C:/Users/a/AppData/Local/cleanix/quarantine",          # forward slashes
+    r"C:\Users\a\NUL\cleanix\quarantine",                    # device name
+    r"C:\Users\a\com1.txt\cleanix\quarantine",
+    r"C:\Users\a\x:ads\cleanix\quarantine",                  # stream
+    r"C:\Users\a.\cleanix\quarantine",                       # trailing dot
+    r"C:\Users\a \cleanix\quarantine",                       # trailing space
+    "C:\\Users\\\\a\\cleanix\\quarantine",                   # empty component
+    "C:\\Users\\a\x00\\cleanix\\quarantine",                 # NUL
+    "C:\\Users\\a\\COM\u00b9\\cleanix\\quarantine",          # superscript devices
+    "C:\\Users\\a\\lpt\u00b3.log\\cleanix\\quarantine",
+    r"C:\Users\con.CORP\AppData\Local\cleanix\quarantine",   # device before the dot
+    "//home/a/cleanix/quarantine",                           # POSIX network form
+]
+
+
+@pytest.mark.parametrize("root", NON_LOCAL_ROOTS)
+def test_non_local_root_is_not_a_local_path(root):
+    assert not elevate.is_local_absolute_path(root)
+
+
+@pytest.mark.skipif(POSIX, reason="Windows path forms")
+def test_local_drive_paths_are_accepted():
+    for ok in (r"C:\Users\a\AppData\Local\cleanix\quarantine", "D:\\", r"c:\x\y.z"):
+        assert elevate.is_local_absolute_path(ok), ok
+
+
+@pytest.mark.parametrize("root", NON_LOCAL_ROOTS)
+def test_non_local_root_refused_by_parse(tmp_path, root):
+    sel = elevate.Selection(invoking_user="alice", only=[], keys=[], use_quarantine=False,
+                            registry=elevate.RegistryRequest(
+                                ["win_reg_startup"], [HKLM_KEY], "20261119-1-ab", root))
+    path = elevate.write_request(tmp_path, sel)
+    with pytest.raises(ValueError):
+        elevate.read_request(path, expected_uid=UID if POSIX else None)
+
+
+@pytest.fixture
+def fs_spy(monkeypatch):
+    """Records every filesystem entry point the validation could use."""
+    import builtins
+
+    calls = []
+
+    def wrap(owner, name):
+        real = getattr(owner, name)
+
+        def spy(*a, **k):
+            calls.append((name, a[:1]))
+            return real(*a, **k)
+
+        monkeypatch.setattr(owner, name, spy)
+
+    for owner, name in ((os.path, "realpath"), (os.path, "exists"), (os.path, "lexists"),
+                        (os.path, "isdir"), (os, "lstat"), (os, "stat"), (os, "open"),
+                        (os, "scandir"), (os, "listdir"), (builtins, "open"),
+                        (elevated, "_lstat"), (elevated, "_owner_sid")):
+        wrap(owner, name)
+    return calls
+
+
+def _profile_of(root):
+    return root.split(os.sep + "AppData")[0] if not POSIX else root.split("/.local")[0]
+
+
+@pytest.mark.parametrize("root", NON_LOCAL_ROOTS)
+def test_prepare_refuses_non_local_root_without_touching_the_filesystem(
+        root, monkeypatch, fs_spy):
+    """Even with parse_request bypassed, _prepare_registry refuses the root
+    before any realpath/lstat/stat/open/owner lookup (an administrator
+    opening a UNC or WebDAV path would send its NTLM credentials)."""
+    monkeypatch.setattr(elevated, "_registry_supported", lambda: True)
+    monkeypatch.setattr(winenv, "is_admin", lambda: True)
+    monkeypatch.setattr(elevated, "_invoking_sid", lambda rdir: USER_SID)
+    monkeypatch.setattr(elevated, "_profile_for_sid", lambda sid: _profile_of(LOCAL_ROOT))
+    req = elevate.RegistryRequest(["win_reg_startup"], [], "20261119-000000-1-abcd", root)
+    with pytest.raises(elevated.Refused):
+        elevated._prepare_registry(req, None)
+    assert fs_spy == []
+
+
+def test_prepare_refuses_root_outside_profile_without_touching_the_filesystem(
+        monkeypatch, fs_spy):
+    monkeypatch.setattr(elevated, "_registry_supported", lambda: True)
+    monkeypatch.setattr(winenv, "is_admin", lambda: True)
+    monkeypatch.setattr(elevated, "_invoking_sid", lambda rdir: USER_SID)
+    other = r"C:\Users\b" if not POSIX else "/home/b"
+    monkeypatch.setattr(elevated, "_profile_for_sid", lambda sid: other)
+    req = elevate.RegistryRequest(["win_reg_startup"], [], "20261119-000000-1-abcd",
+                                  LOCAL_ROOT)
+    with pytest.raises(elevated.Refused):
+        elevated._prepare_registry(req, None)
+    assert fs_spy == []
+
+
+@pytest.mark.parametrize("value", [
+    r"\\server\profiles\alice",
+    r"\\?\UNC\server\profiles\alice",
+    r"%USERPROFILE%",                       # only %SystemDrive% is expanded
+    r"%SystemRoot%\..\Users\alice",
+    r"%HOMEDRIVE%\Users\alice",
+    r"Users\alice",                         # relative
+])
+def test_profile_path_must_be_local_and_unexpanded_otherwise(value, fake_registry,
+                                                             monkeypatch, fs_spy):
+    monkeypatch.setenv("USERPROFILE", _profile_of(LOCAL_ROOT))
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setenv("HOMEDRIVE", "C:")
+    fake_registry.add_key("HKLM", elevated.PROFILE_LIST + "\\" + USER_SID,
+                          {"ProfileImagePath": (REG_EXPAND_SZ, value)})
+    with pytest.raises(elevated.Refused):
+        elevated._profile_for_sid(USER_SID)
+    assert fs_spy == []
+
+
+@pytest.mark.parametrize("typ, data", [
+    (winregistry.REG_MULTI_SZ, ("C:\\Users\\alice",)),
+    (winregistry.REG_DWORD, 1),
+    (winregistry.REG_BINARY, b"C:\\Users\\alice"),
+    (winregistry.REG_MULTI_SZ, "C:\\Users\\alice"),    # wrong type, str data
+])
+def test_profile_value_must_be_a_string_type(typ, data, fake_registry):
+    fake_registry.add_key("HKLM", elevated.PROFILE_LIST + "\\" + USER_SID,
+                          {"ProfileImagePath": (typ, data)})
+    with pytest.raises(elevated.Refused, match="profile path is not usable"):
+        elevated._profile_for_sid(USER_SID)
+
+
+def test_gui_keeps_the_run_if_an_exit_1_result_reports_removals(h, gui):
+    """Exit 1 means "refused, nothing deleted"; a result that nonetheless
+    reports removals keeps the backups."""
+    from cleanix.core import elevate_launch
+    from cleanix.gui import elevation
+
+    def launcher(argv):
+        req = Path(argv[argv.index("--request") + 1])
+        res = Path(argv[argv.index("--result") + 1])
+        sel = elevate.read_request(req, expected_uid=UID if POSIX else None)
+        elevate.write_result(res, elevate.HelperResult(
+            freed=0, removed=1, errors=[], unmatched=0, nonce=sel.nonce))
+        raise elevate_launch.ElevationFailed("refused", exit_code=1)
+
+    out = elevation.run_elevated_part([reg_item(h.reg, "Foo")], launcher=launcher)
+    assert out.status == elevation.FAILED and out.helper_exit == 1
+    assert out.registry_backup_run and len(quarantine.list_runs()) == 1
+
+
+@pytest.mark.skipif(POSIX, reason="Windows drive paths")
+def test_profile_expands_system_drive_only(fake_registry, monkeypatch):
+    monkeypatch.setenv("SystemDrive", "C:")
+    fake_registry.add_key("HKLM", elevated.PROFILE_LIST + "\\" + USER_SID,
+                          {"ProfileImagePath": (REG_EXPAND_SZ, r"%SystemDrive%\Users\alice")})
+    assert elevated._profile_for_sid(USER_SID) == r"C:\Users\alice"
+
+
+def test_root_equal_to_the_profile_is_refused(h):
+    """A profile that itself ends in cleanix\\quarantine: the root must be
+    STRICTLY inside it."""
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.reg.add_key("HKLM", elevated.PROFILE_LIST + "\\" + USER_SID,
+                  {"ProfileImagePath": (REG_EXPAND_SZ, str(h.qroot))})
+    h.cleaners.append(startup_cleaner(h))
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+# --------------------------------------------------------------------------
+# I1: mutants of the helper validation
+# --------------------------------------------------------------------------
+def test_non_allowlisted_detector_refused_even_with_a_valid_run(h):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    h.cleaners.append(FakeCleaner("logs", []))
+    rc = run_helper(h, selection(h, [item_key(item)], run,
+                                 only=("win_reg_startup", "logs")))
+    assert_refused(h, rc)
+
+
+@pytest.mark.parametrize("sid", ["S-1-5-18", "S-1-5-19", "S-1-5-20", "S-1-5-32-544",
+                                 "S-1-5-21-1-2-3", "S-1-5-21-1-2-3-4-5",
+                                 "S-1-5-21-1-2-3-4x", "S-1-12-1-1-2-3"])
+def test_non_user_sid_owner_refused_by_the_regex_alone(h, sid):
+    """ProfileList HAS an entry for these SIDs pointing at alice's profile,
+    so only the user-SID shape check can refuse."""
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.reg.add_key("HKLM", elevated.PROFILE_LIST + "\\" + sid,
+                  {"ProfileImagePath": (REG_EXPAND_SZ, str(h.home))})
+    for p in (h.reqdir, h.reqdir / elevate.REQUEST_NAME, h.qroot, h.qroot / run,
+              h.qroot / run / "manifest.json"):
+        h.owners[_norm(p)] = sid
+    h.cleaners.append(startup_cleaner(h))
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+def test_unexpected_validation_error_refuses_the_whole_request(h, monkeypatch):
+    junk = h.tmp / "junk"
+    junk.mkdir()
+    f = junk / "a.log"
+    f.write_bytes(b"x")
+    fitem = CleanableItem(cleaner_id="logs", description="a", size=1, path=str(f),
+                          requires_root=True)
+    h.cleaners.append(FakeCleaner("logs", [fitem]))
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+
+    def boom(sid):
+        raise RuntimeError("secret detail")
+
+    monkeypatch.setattr(elevated, "_profile_for_sid", boom)
+    rc = run_helper(h, selection(h, [item_key(item)], run, file_keys=[item_key(fitem)],
+                                 file_only=["logs"]))
+    assert_refused(h, rc, file=f)
+    assert all("secret" not in e for e in elevate.read_result(h.result).errors)
+
+
+def test_hkcu_unreachable_while_the_delete_runs(h, monkeypatch):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    seen = []
+    real_clean = service.clean
+
+    def spy_clean(items, config, **kw):
+        backend = winregistry.get_backend()
+        seen.append((isinstance(backend, elevated._MachineOnlyBackend),
+                     backend.key_exists("HKCU", RUN), scanmode.is_helper_mode()))
+        return real_clean(items, config, **kw)
+
+    monkeypatch.setattr(service, "clean", spy_clean)
+    h.reg.calls.clear()
+    assert run_helper(h, selection(h, [item_key(item)], run)) == 0
+    assert seen == [(True, False, True)]
+    assert not [c for c in h.reg.calls if "HKCU" in c]
+    assert not present(h, "Foo")
+
+
+def test_deadline_between_registry_deletes_stops_before_the_next(h, monkeypatch):
+    foo, bar = reg_item(h.reg, "Foo"), reg_item(h.reg, "Bar")
+    run = gui_backup(h, [foo, bar])
+    h.cleaners.append(startup_cleaner(h))
+    clock = [0.0]
+    monkeypatch.setattr(elevated, "_monotonic", lambda: clock[0])
+    calls = []
+    real_clean = service.clean
+
+    def clean_then_time_passes(items, config, **kw):
+        calls.append(items)
+        # the engine itself never sees the deadline here: only the helper's
+        # own check between items can stop the loop
+        summary = real_clean(items, config, **dict(kw, cancel=None))
+        clock[0] = 10_000.0
+        return summary
+
+    monkeypatch.setattr(service, "clean", clean_then_time_passes)
+    rc = run_helper(h, selection(h, [item_key(foo), item_key(bar)], run), deadline=100)
+    assert rc == elevated.EXIT_DEADLINE
+    assert len(calls) == 1
+    res = elevate.read_result(h.result)
+    assert res.deadline_hit and res.removed == 1
+    assert present(h, "Foo") != present(h, "Bar")
+
+
+def test_empty_outcomes_stop_the_registry_loop(h, monkeypatch):
+    from cleanix.core.models import CleanResult
+
+    foo, bar = reg_item(h.reg, "Foo"), reg_item(h.reg, "Bar")
+    run = gui_backup(h, [foo, bar])
+    h.cleaners.append(startup_cleaner(h))
+    calls = []
+
+    def stopped(items, config, **kw):
+        calls.append(items)
+        return service.CleanSummary(result=CleanResult(dry_run=False))
+
+    monkeypatch.setattr(service, "clean", stopped)
+    rc = run_helper(h, selection(h, [item_key(foo), item_key(bar)], run))
+    assert rc == elevated.EXIT_DEADLINE
+    assert len(calls) == 1
+    assert elevate.read_result(h.result).deadline_hit
+
+
+def test_guard_answers_every_non_hklm_hive_as_absent(fake_registry):
+    guard = elevated._MachineOnlyBackend(fake_registry)
+    for hive in ("HKCU", "HKU", "HKCR", "HKEY_USERS", "hklm", ""):
+        assert guard.key_exists(hive, RUN) is False
+        assert guard.can_delete(hive, RUN, "x") is False
+        for call in (lambda: guard.values(hive, RUN), lambda: guard.subkeys(hive, RUN),
+                     lambda: guard.is_link(hive, RUN)):
+            with pytest.raises(KeyMissing):
+                call()
+    assert fake_registry.calls == []
+
+
+def test_hklm_item_not_needing_admin_is_never_deleted(h):
+    item = dataclasses.replace(reg_item(h.reg, "Foo"), requires_root=False)
+    run = gui_backup(h, [item])
+    h.cleaners.append(FakeCleaner("win_reg_startup", [item]))
+    assert run_helper(h, selection(h, [item_key(item)], run)) == 0
+    assert present(h, "Foo")
+    assert elevate.read_result(h.result).refused == 1
+    assert not elevated._registry_eligible(item, elevated.admin_registry_cleaner_ids())
+
+
+def test_file_part_refuses_registry_items_even_if_eligibility_says_yes(h, monkeypatch):
+    """Defence in depth: the file path never hands a REGISTRY item to
+    service.clean (it has no backup verification)."""
+    item = dataclasses.replace(reg_item(h.reg, "Foo"), cleaner_id="logs")
+    h.cleaners.append(FakeCleaner("logs", [item]))
+    monkeypatch.setattr(elevated, "_eligible", lambda *a, **k: True)
+    sel = elevate.Selection(invoking_user="alice", only=["logs"], keys=[item_key(item)],
+                            use_quarantine=False)
+    req = elevate.write_request(h.reqdir, sel)
+    assert elevated.run(req, h.result, None, expected_uid=UID) == 0
+    assert present(h, "Foo")
+    assert elevate.read_result(h.result).refused == 1
+
+
+def test_command_item_of_a_registry_detector_never_offered(monkeypatch):
+    monkeypatch.setattr(elevated, "_registry_supported", lambda: True)
+    cmd = CleanableItem(cleaner_id="win_reg_startup", description="c", size=1,
+                        kind=ItemKind.COMMAND, command=["tool"], requires_root=True)
+    allow = frozenset({"win_reg_startup"})     # even a (wrong) file allowlist naming it
+    assert elevated.static_admin_problem(cmd, allow)
+    assert not elevated._eligible(cmd, allow)
+
+
+# --------------------------------------------------------------------------
+# manifest reading (the helper reads it in a user-writable folder)
+# --------------------------------------------------------------------------
+def test_manifest_read_is_capped(tmp_path, monkeypatch):
+    run = tmp_path / "r"
+    run.mkdir()
+    (run / "manifest.json").write_text(json.dumps({"items": ["x" * 100]}), encoding="utf-8")
+    assert quarantine._read_manifest(run) is not None
+    monkeypatch.setattr(quarantine, "MAX_MANIFEST_BYTES", 50)
+    assert quarantine._read_manifest(run) is None
+
+
+def test_manifest_that_is_a_link_is_not_read(tmp_path, monkeypatch):
+    run = tmp_path / "r"
+    run.mkdir()
+    mf = run / "manifest.json"
+    mf.write_text(json.dumps({"items": []}), encoding="utf-8")
+    real = os.lstat
+
+    def lstat(p, *a, **k):
+        st = real(p, *a, **k)
+        if _norm(p) == _norm(mf):
+            return SimpleNamespace(st_mode=st.st_mode, st_size=st.st_size,
+                                   st_file_attributes=0x400)
+        return st
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    assert quarantine._read_manifest(run) is None
+
+
+def test_backup_registry_folder_that_is_a_link_refused(h, monkeypatch):
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    real = os.lstat
+    target = _norm(h.qroot / run / "registry")
+
+    def lstat(p, *a, **k):
+        st = real(p, *a, **k)
+        if _norm(p) == target:
+            return SimpleNamespace(st_mode=st.st_mode, st_file_attributes=0x400)
+        return st
+
+    monkeypatch.setattr(elevated, "_lstat", lstat)
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)))
+
+
+# --------------------------------------------------------------------------
+# GUI minors: purge refused runs, preparation failures, changed entries
+# --------------------------------------------------------------------------
+def test_gui_purges_the_run_when_the_helper_refuses(h, gui, monkeypatch):
+    from cleanix.gui import elevation
+
+    h.cleaners.append(startup_cleaner(h))
+    monkeypatch.setattr(winenv, "is_admin", lambda: False)   # helper exits 1
+    out = elevation.run_elevated_part([reg_item(h.reg, "Foo")], launcher=gui.launcher)
+    assert out.status == elevation.FAILED and out.helper_exit == 1
+    assert out.registry_backup_run is None and quarantine.list_runs() == []
+    assert present(h, "Foo")
+
+
+def test_gui_purges_the_run_when_the_helper_removed_nothing(h, gui):
+    from cleanix.gui import elevation
+
+    item = reg_item(h.reg, "Foo")
+    h.cleaners.append(FakeCleaner("win_reg_startup", []))   # entry gone from the scan
+    out = elevation.run_elevated_part([item], launcher=gui.launcher)
+    assert out.status == elevation.DONE and out.result.removed == 0
+    assert out.result.unmatched == 1 and out.result.errors == []
+    assert out.registry_backup_run is None and quarantine.list_runs() == []
+
+
+def test_gui_keeps_the_run_when_a_delete_reported_an_error(h, gui):
+    from cleanix.gui import elevation
+
+    foo = reg_item(h.reg, "Foo")
+    h.cleaners.append(startup_cleaner(h))
+    h.reg.fail_next("delete_value", winregistry.RegistryError("locked"))
+    out = elevation.run_elevated_part([foo], launcher=gui.launcher)
+    assert out.status == elevation.DONE and out.result.errors
+    assert out.registry_backup_run and len(quarantine.list_runs()) == 1
+
+
+def test_gui_new_run_failure_still_cleans_files(h, gui, monkeypatch):
+    from cleanix.gui import elevation
+
+    junk = h.tmp / "junk"
+    junk.mkdir()
+    f = junk / "a.log"
+    f.write_bytes(b"x" * 10)
+    fitem = CleanableItem(cleaner_id="logs", description="a", size=10, path=str(f),
+                          requires_root=True)
+    h.cleaners.append(FakeCleaner("logs", [fitem]))
+
+    def broken():
+        raise OSError("no quarantine")
+
+    monkeypatch.setattr(quarantine, "new_run", broken)
+    out = elevation.run_elevated_part([fitem, reg_item(h.reg, "Foo")],
+                                      launcher=gui.launcher)
+    assert out.status == elevation.DONE and not f.exists() and present(h, "Foo")
+    assert gui.calls[0].sel.registry is None
+    assert out.registry_backup_error == elevation.BACKUP_NOT_PREPARED
+    assert any("could not be prepared" in line
+               for line in elevation.admin_outcome_lines(_summary(out)))
+
+
+def test_gui_new_run_failure_registry_only(h, gui, monkeypatch):
+    from cleanix.gui import elevation
+
+    def broken():
+        raise OSError("no quarantine")
+
+    monkeypatch.setattr(quarantine, "new_run", broken)
+    out = elevation.run_elevated_part([reg_item(h.reg, "Foo")], launcher=gui.launcher)
+    assert out.status == elevation.FAILED and gui.calls == []
+    assert out.message == "Registry backup could not be prepared; nothing was removed."
+
+
+def test_gui_entry_changed_at_backup_time_is_worded_as_changed(h, gui):
+    from cleanix.gui import elevation
+
+    item = reg_item(h.reg, "Foo")
+    h.reg.set_value("HKLM", RUN, winregistry.RegValue("Foo", REG_SZ, r"C:\Gone\other.exe"))
+    out = elevation.run_elevated_part([item], launcher=gui.launcher)
+    assert out.status == elevation.FAILED and gui.calls == []
+    assert out.registry_changed == 1 and out.registry_backup_failed == 0
+    assert "changed since the scan" in out.message
+
+
+def test_gui_never_sends_a_non_local_root(h, gui, monkeypatch):
+    from cleanix.gui import elevation
+
+    unc = r"\\server\share\cleanix\quarantine"
+    monkeypatch.setattr(quarantine, "quarantine_root", lambda: unc)
+    monkeypatch.setattr(os.path, "realpath", lambda p, *a, **k: str(p))
+    stored = []
+    monkeypatch.setattr(quarantine.Quarantine, "store_registry",
+                        lambda self, item, backend: stored.append(item))
+    out = elevation.run_elevated_part([reg_item(h.reg, "Foo")], launcher=gui.launcher)
+    assert out.status == elevation.FAILED and gui.calls == [] and stored == []
+    assert out.registry_backup_error == elevation.BACKUP_NOT_LOCAL
+
+
+def test_gui_sends_the_resolved_root(h, gui, monkeypatch):
+    """The GUI resolves its quarantine root (the helper refuses anything not
+    normalised and equal to its realpath)."""
+    from cleanix.gui import elevation
+
+    (h.home / "AppData" / "Local" / "x").mkdir(parents=True)
+    odd = str(h.home / "AppData" / "Local" / "x") + os.sep + ".." + os.sep + \
+        "cleanix" + os.sep + "quarantine"
+    monkeypatch.setattr(quarantine, "quarantine_root", lambda: Path(odd))
+    h.cleaners.append(startup_cleaner(h))
+    out = elevation.run_elevated_part([reg_item(h.reg, "Foo")], launcher=gui.launcher)
+    assert out.status == elevation.DONE, (out.message, out.detail)
+    assert gui.calls[0].sel.registry.quarantine_root == os.path.realpath(odd)
+    assert ".." not in gui.calls[0].sel.registry.quarantine_root
+    assert not present(h, "Foo")

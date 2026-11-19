@@ -16,9 +16,10 @@ from PySide6.QtWidgets import (
 )
 
 from cleanix.core.curation import Group, Safety, display_label, shorten_path
-from cleanix.core.models import CleanableItem, ItemKind, item_key
+from cleanix.core.models import CleanableItem, ItemKind, item_key, item_target
 from cleanix.core.utils import human_size
 from cleanix.gui import elevation, reveal
+from cleanix.gui.models import size_text
 
 COLUMNS = ["Item", "What it is", "Safety", "Items", "Size"]
 _ROLE = Qt.ItemDataRole.UserRole
@@ -230,13 +231,21 @@ class GroupedResults(QTreeWidget):
             self.expandItem(self._group_rows[gi])
 
     def copy_path(self, item: CleanableItem) -> None:
-        text = (" ".join(item.command or []) if item.kind is ItemKind.COMMAND
-                else item.path or "")
+        text = item_target(item)
         if text:
             QApplication.clipboard().setText(text)
 
+    @staticmethod
+    def menu_labels(item: CleanableItem) -> List[str]:
+        """Context-menu entries for an item: registry keys and commands have no
+        folder to open."""
+        labels = ["Copy path"]
+        if item.kind is ItemKind.PATH:
+            labels.append("Open location")
+        return labels
+
     def open_location(self, item: CleanableItem) -> bool:
-        if item.kind is ItemKind.COMMAND or not item.path:
+        if item.kind is not ItemKind.PATH or not item.path:
             return False
         return reveal.reveal_in_file_manager(item.path)
 
@@ -257,7 +266,7 @@ class GroupedResults(QTreeWidget):
         row.setData(0, _ROLE, _Row("group", gi))
         row.setText(0, g.title)
         row.setText(3, str(g.item_count))
-        row.setText(4, human_size(g.total_size))
+        row.setText(4, size_text(g.items))
         row.setTextAlignment(3, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         row.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._badge(row, g.safety)
@@ -278,7 +287,7 @@ class GroupedResults(QTreeWidget):
             if (g.shown or g.rest or g.zero) else
             QTreeWidgetItem.ChildIndicatorPolicy.DontShowIndicator)
         text = (f"{g.title}, {g.safety.value}, {g.item_count} items, "
-                f"{human_size(g.total_size)}")
+                f"{size_text(g.items)}")
         for c in range(len(COLUMNS)):
             row.setData(c, _ACCESSIBLE, text if c == 0 else row.text(c))
         return row
@@ -294,11 +303,12 @@ class GroupedResults(QTreeWidget):
         row.setData(0, _ROLE, _Row("item", gi, item))
         label = display_label(item, self._home)
         row.setText(0, label)
+        full = item_target(item)
         if item.kind is ItemKind.COMMAND:
-            full = " ".join(item.command or [])
             row.setText(1, item.hint or "Runs a command")
+        elif item.kind is ItemKind.REGISTRY:
+            row.setText(1, full)
         else:
-            full = item.path or ""
             row.setText(1, shorten_path(full, self._home))
         reason = self.refusal_reason(item)
         tip = chr(10).join(t for t in (full, reason, item.hint) if t)
@@ -307,7 +317,7 @@ class GroupedResults(QTreeWidget):
         safety = self._item_safety(g, item)
         self._badge(row, safety)
         row.setText(3, "")
-        row.setText(4, human_size(item.size))
+        row.setText(4, size_text([item]))
         row.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
         if reason is None:
@@ -319,7 +329,7 @@ class GroupedResults(QTreeWidget):
             row.setFlags(flags)
             row.setText(1, f"{reason} {item.hint}" if item.hint else reason)
         row.setData(0, _ACCESSIBLE,
-                    f"{label}, {safety.value}, {human_size(item.size)}")
+                    f"{label}, {safety.value}, {size_text([item])}")
         return row
 
     def _make_rest_row(self, gi: int) -> QTreeWidgetItem:
@@ -463,8 +473,9 @@ class GroupedResults(QTreeWidget):
             menu.addAction("Show all", lambda: self.show_all(self._group_rows[p.gi]))
         elif p.kind == "item" and p.item is not None:
             item = p.item
-            menu.addAction("Copy path", lambda: self.copy_path(item))
-            if item.kind is not ItemKind.COMMAND:
+            labels = self.menu_labels(item)
+            menu.addAction(labels[0], lambda: self.copy_path(item))
+            if "Open location" in labels:
                 menu.addAction("Open location", lambda: self.open_location(item))
         if menu.isEmpty():
             return

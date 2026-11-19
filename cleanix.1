@@ -1,4 +1,4 @@
-.TH CLEANIX 1 "2026-11-17" "cleanix 1.4.0" "User Commands"
+.TH CLEANIX 1 "2026-11-19" "cleanix 1.4.0" "User Commands"
 .SH NAME
 cleanix \- safe, thorough cross-platform system cleaner
 .SH SYNOPSIS
@@ -28,6 +28,9 @@ comma\-separated cleaner ids to include exclusively
 .TP
 .B \-\-exclude IDS
 comma\-separated cleaner ids to skip
+.TP
+.B \-\-registry
+Windows only: select the five opt\-in registry cleaners (alone: only those; with \-\-only: added to it)
 .TP
 .B \-\-all\-users
 scan every user's home + the whole system (default when root)
@@ -75,6 +78,9 @@ comma\-separated cleaner ids to include exclusively
 .TP
 .B \-\-exclude IDS
 comma\-separated cleaner ids to skip
+.TP
+.B \-\-registry
+Windows only: select the five opt\-in registry cleaners (alone: only those; with \-\-only: added to it)
 .TP
 .B \-\-all\-users
 scan every user's home + the whole system (default when root)
@@ -175,6 +181,9 @@ show this help message and exit
 .TP
 .B RUN_ID
 run id (default: latest)
+.TP
+.B \-\-yes
+skip the typed confirmation for machine\-wide registry entries (only together with an explicit run id)
 .SS quarantine
 manage the quarantine store
 .TP

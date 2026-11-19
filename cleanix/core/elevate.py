@@ -2,7 +2,10 @@
 
 The unprivileged GUI writes a *request* naming only cleaner ids and item keys
 (never anything to execute); the helper, running as root/Administrator,
-re-scans and deletes only items that match. Because the request lives in a
+re-scans and deletes only items that match. An optional ``registry`` part
+(Windows) names registry detector ids, HKLM item keys, the id of the
+quarantine run holding the GUI's backups and the user's quarantine root
+(see ``RegistryRequest``). Because the request lives in a
 user-writable place, everything read here is validated strictly and treated
 as untrusted:
 
@@ -42,6 +45,10 @@ _NONCE_RE = re.compile(r"[0-9a-f]{32}")
 _CLEANER_ID_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _REQUEST_FIELDS = {"version", "invoking_user", "only", "keys", "use_quarantine", "nonce"}
+# The optional registry action (HKLM registry deletions, Windows only).
+REGISTRY_FIELD = "registry"
+_REGISTRY_FIELDS = {"only", "keys", "backup_run", "quarantine_root"}
+MAX_ROOT_LEN = 1024
 
 _POSIX = os.name != "nt"
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -50,6 +57,23 @@ _lstat = os.lstat
 
 def new_nonce() -> str:
     return uuid.uuid4().hex
+
+
+@dataclass
+class RegistryRequest:
+    """The registry action: delete machine-wide (HKLM) registry entries.
+
+    Identifiers only: registry detector ids, the item keys the user ticked
+    (each embeds hive, key, value and fingerprint), the id of the quarantine
+    run in which the GUI, as the user, already backed the entries up, and
+    the invoking user's quarantine root (validated by the helper against the
+    profile of the account that owns the request directory).
+    """
+
+    only: List[str]
+    keys: List[str]
+    backup_run: str
+    quarantine_root: str
 
 
 @dataclass
@@ -62,6 +86,7 @@ class Selection:
     # the user's home would be a root file-placement primitive).
     use_quarantine: bool
     nonce: str = field(default_factory=new_nonce)
+    registry: Optional[RegistryRequest] = None
 
 
 @dataclass
@@ -251,6 +276,14 @@ def write_request(directory: Path, selection: Selection) -> Path:
         "use_quarantine": bool(selection.use_quarantine),
         "nonce": selection.nonce,
     }
+    reg = selection.registry
+    if reg is not None:
+        payload[REGISTRY_FIELD] = {
+            "only": list(reg.only),
+            "keys": list(reg.keys),
+            "backup_run": reg.backup_run,
+            "quarantine_root": reg.quarantine_root,
+        }
     path = Path(directory) / REQUEST_NAME
     _atomic_write(path, json.dumps(payload).encode("utf-8"), 0o600)
     return path
@@ -269,12 +302,108 @@ def _str_list(value, name: str, pattern=None, max_len: int = MAX_KEY_LEN) -> Lis
     return list(value)
 
 
+_WIN_DRIVE_ROOT = re.compile(r"[A-Za-z]:\\")
+_WIN_RESERVED = frozenset(
+    {"con", "prn", "aux", "nul", "conin$", "conout$"}
+    | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+    # Windows also maps the superscript digits (COM¹-³, LPT¹-³) to devices.
+    | {f"{d}{s}" for d in ("com", "lpt") for s in ("¹", "²", "³")}
+)
+
+
+def is_local_absolute_path(path) -> bool:
+    """Purely LEXICAL test (never touches the filesystem): is ``path`` an
+    absolute path on a local drive?
+
+    Windows: ``X:\\...`` only -- no UNC (``\\\\server\\share``, WebDAV
+    ``\\\\host@80\\...``), no ``\\\\?\\`` / ``\\\\.\\`` device or GLOBALROOT
+    paths, no forward slashes, no second ``:`` (alternate data streams),
+    no empty components, no component ending in a dot or a space (Win32
+    strips them, so they alias other names) and no reserved device names
+    (``CON``, ``NUL``, ``COM1``, ``COM¹`` ...), judged on the part before the
+    first dot -- so a profile such as ``C:\\Users\\con.CORP`` is refused
+    (fail closed). Opening any of those as an
+    administrator could reach the network (and leak the administrator's
+    NTLM credentials) or a device. POSIX: a ``/`` path that does not start
+    with ``//``."""
+    if not isinstance(path, str) or not path or "\x00" in path:
+        return False
+    if _POSIX:
+        return path.startswith("/") and not path.startswith("//")
+    if not _WIN_DRIVE_ROOT.match(path) or "/" in path:
+        return False
+    rest = path[3:]
+    if not rest:
+        return True
+    if ":" in rest:
+        return False
+    for comp in rest.split("\\"):
+        if not comp or comp.endswith((".", " ")):
+            return False
+        if comp.split(".", 1)[0].rstrip(" ").casefold() in _WIN_RESERVED:
+            return False
+    return True
+
+
+def registry_key_parts(key: str):
+    """``(cleaner_id, hive, key, value, fingerprint)`` of a REGISTRY item key
+    (``models.item_key``). Raises ValueError for anything else."""
+    if not isinstance(key, str):
+        raise ValueError("not a registry item key")
+    parts = key.split("|", 2)
+    if len(parts) != 3 or parts[1] != "reg" or not _CLEANER_ID_RE.fullmatch(parts[0]):
+        raise ValueError("not a registry item key")
+    try:
+        fields = json.loads(parts[2])
+    except ValueError:
+        raise ValueError("not a registry item key") from None
+    if not isinstance(fields, list) or len(fields) != 4:
+        raise ValueError("not a registry item key")
+    hive, reg_key, value, fingerprint = fields
+    if (not isinstance(hive, str) or not isinstance(reg_key, str) or not reg_key
+            or not (value is None or isinstance(value, str))
+            or not isinstance(fingerprint, str) or not fingerprint):
+        raise ValueError("not a registry item key")
+    return parts[0], hive, reg_key, value, fingerprint
+
+
+def _parse_registry(obj) -> RegistryRequest:
+    """The registry action. HKLM only: a key naming any other hive (or any
+    malformed part) refuses the WHOLE request, so nothing is deleted."""
+    from cleanix.core.regclean import _RUN_ID
+
+    if not isinstance(obj, dict) or set(obj) != _REGISTRY_FIELDS:
+        raise ValueError("request field 'registry' has missing or unexpected fields")
+    only = _str_list(obj["only"], "registry.only", _CLEANER_ID_RE, 64)
+    keys = _str_list(obj["keys"], "registry.keys")
+    if not only:
+        raise ValueError("request field 'registry.only' is invalid")
+    for key in keys:
+        try:
+            cid, hive, _k, _v, _fp = registry_key_parts(key)
+        except ValueError:
+            raise ValueError("request field 'registry.keys' is invalid") from None
+        if hive != "HKLM":
+            raise ValueError("request field 'registry.keys' names a non-HKLM entry")
+        if cid not in only:
+            raise ValueError("request field 'registry.keys' is invalid")
+    run = obj["backup_run"]
+    if not isinstance(run, str) or not _RUN_ID.match(run) or run in (".", ".."):
+        raise ValueError("request field 'registry.backup_run' is invalid")
+    root = obj["quarantine_root"]
+    if (not isinstance(root, str) or not root or len(root) > MAX_ROOT_LEN
+            or _CONTROL_RE.search(root) or not is_local_absolute_path(root)):
+        raise ValueError("request field 'registry.quarantine_root' is invalid")
+    return RegistryRequest(only=only, keys=keys, backup_run=run, quarantine_root=root)
+
+
 def parse_request(data: bytes) -> Selection:
     try:
         obj = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise ValueError("request is not valid JSON") from None
-    if not isinstance(obj, dict) or set(obj) != _REQUEST_FIELDS:
+    if not isinstance(obj, dict) or (set(obj) != _REQUEST_FIELDS
+                                     and set(obj) != _REQUEST_FIELDS | {REGISTRY_FIELD}):
         raise ValueError("request has missing or unexpected fields")
     if obj["version"] != FORMAT_VERSION or isinstance(obj["version"], bool):
         raise ValueError("request version is not supported")
@@ -293,6 +422,8 @@ def parse_request(data: bytes) -> Selection:
         keys=_str_list(obj["keys"], "keys"),
         use_quarantine=obj["use_quarantine"],
         nonce=nonce,
+        registry=(_parse_registry(obj[REGISTRY_FIELD])
+                  if REGISTRY_FIELD in obj else None),
     )
 
 

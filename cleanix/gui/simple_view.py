@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from cleanix.config import Config
 from cleanix.core import catalog, curation, quarantine
 from cleanix.core.models import CleanableItem, ItemKind, ScanResult
+from cleanix.core.platform import WINDOWS, current_os
 from cleanix.core.utils import human_size
 from cleanix.gui import elevation, workers
 from cleanix.gui.grouped_results import GroupedResults
@@ -54,6 +55,9 @@ def _default_scan_factory(config: Config, deep: bool = False):
 
 
 _OPT_IN = ("trash", "system")
+
+
+REGISTRY_NOTE = "Registry leftovers are checked only in Power mode."
 
 
 class SimpleState(Enum):
@@ -293,8 +297,12 @@ class SimpleView(QWidget):
         self.scan_button.clicked.connect(self.start_scan)
         self.deep_scan_check = QCheckBox(DEEP_SCAN_TEXT)
         self.deep_scan_check.setChecked(False)
+        self.registry_note = QLabel(REGISTRY_NOTE)
+        self.registry_note.setWordWrap(True)
+        self.registry_note.setAccessibleName("Registry leftovers note")
+        self.registry_note.setVisible(current_os() == WINDOWS)
         for w in (self.headline_label, self.reassurance_label, self.error_label,
-                  self.scan_button, self.deep_scan_check):
+                  self.scan_button, self.deep_scan_check, self.registry_note):
             lay.addWidget(w)
         lay.addStretch(1)
 
@@ -609,7 +617,7 @@ class SimpleView(QWidget):
             return
         admin = sum(1 for i in items if i.requires_root)
         irreversible = sum(1 for i in items
-                           if i.kind is not ItemKind.PATH and not i.requires_root)
+                           if i.kind is ItemKind.COMMAND and not i.requires_root)
         accepted, keep_copy = self._confirm(ConfirmInfo(
             len(items), sum(i.size for i in items), True, irreversible,
             sum(1 for i in items if catalog.category_of(i.cleaner_id) == "trash"),
@@ -627,7 +635,7 @@ class SimpleView(QWidget):
             return
         self._cancel_requested = False
         self._kept_copy = keep_copy
-        self._all_irreversible = all(i.kind is not ItemKind.PATH or i.requires_root
+        self._all_irreversible = all(i.kind is ItemKind.COMMAND or i.requires_root
                                      for i in items)
         self._start_clean_ui_reset()
         worker = self._clean_factory(

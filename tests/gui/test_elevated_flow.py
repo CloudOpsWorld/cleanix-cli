@@ -71,7 +71,7 @@ def isolation(tmp_path, monkeypatch):
     monkeypatch.setattr(elevate, "make_request_dir", make_request_dir)
     recorded = []
     monkeypatch.setattr(history, "record",
-                        lambda freed, items, *, mode: recorded.append((freed, items, mode)))
+                        lambda freed, items, *, mode, registry=0: recorded.append((freed, items, mode)))
     return SimpleNamespace(made=made, history=recorded, tmp=tmp_path)
 
 
@@ -280,6 +280,28 @@ def test_dry_run_of_a_mix_reports_no_errors_for_admin_items(monkeypatch, isolati
     lines = elevation.admin_outcome_lines(s)
     assert lines == ["2 administrator item(s) (1.5 KiB) would be removed after one "
                      "administrator prompt; they cannot be undone"]
+
+
+def test_dry_run_previews_hklm_registry_items_without_elevation(monkeypatch, isolation):
+    """HKLM registry items are previewed (counted separately) and never
+    elevated or backed up in a dry run."""
+    from cleanix.core import regpromises
+    from cleanix.core.models import RegTarget
+
+    backups = []
+    monkeypatch.setattr(quarantine.Quarantine, "store_registry",
+                        lambda self, item, backend: backups.append(item))
+    reg = CleanableItem("win_reg_startup", "Startup entry: Foo", size=0,
+                        kind=ItemKind.REGISTRY, requires_root=True,
+                        reg=RegTarget("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                                      "Foo", "f" * 64))
+    s = run_sync([reg, it("r", root=True, size=9)], dry_run=True).summary
+    assert isolation.made == [] and backups == []
+    assert s.admin_preview_count == 2 and s.admin_preview_registry == 1
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", True)
+    assert "1 registry entry is backed up first" in elevation.admin_outcome_lines(s)[0]
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", False)
+    assert elevation.admin_outcome_lines(s)[0].endswith("they cannot be undone")
 
 
 def test_dry_run_with_only_admin_items_is_still_a_dry_run(monkeypatch, isolation):

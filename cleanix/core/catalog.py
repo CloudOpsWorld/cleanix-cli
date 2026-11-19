@@ -7,7 +7,7 @@ to decide which items Simple mode may pre-select.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.config import Config
@@ -23,6 +23,7 @@ CATEGORIES: Dict[str, str] = {
     "system": "System files (administrator)",
     "review": "Needs your review",
     "backups": "Backups & leftovers",
+    "registry": "Registry leftovers",
     "other": "Other",
 }
 
@@ -30,7 +31,33 @@ CATEGORIES: Dict[str, str] = {
 SLOW_SCAN_IDS = ("duplicates", "big_files", "downloads")
 
 # Categories whose items are never pre-selected, whatever the cleaner says.
-_NEVER_PRESELECT = frozenset({"trash", "system", "review", "backups", "other"})
+_NEVER_PRESELECT = frozenset(
+    {"trash", "system", "review", "backups", "registry", "other"}
+)
+
+# Windows registry detectors: the single definition used by the CLI and helper.
+REGISTRY_IDS: Tuple[str, ...] = (
+    "win_reg_uninstall",
+    "win_reg_app_paths",
+    "win_reg_file_assoc",
+    "win_reg_startup",
+    "win_reg_shared_dlls",
+)
+
+
+def admin_registry_cleaner_ids() -> frozenset:
+    """Registry detectors whose machine-wide (HKLM) entries the elevated
+    helper may delete: the ``REGISTRY_IDS`` that have at least one HKLM
+    container in ``regsafety``. Pure; the platform gate lives in
+    ``cleanix.elevated.admin_registry_cleaner_ids``. Deliberately separate
+    from the file-cleaner allowlist (``elevated.admin_cleaner_ids``)."""
+    from cleanix.core.regsafety import containers_for
+
+    return frozenset(
+        cid for cid in REGISTRY_IDS
+        if any(c.hive == "HKLM" for c in containers_for(cid))
+    )
+
 
 _CATEGORY_BY_ID: Dict[str, str] = {}
 
@@ -91,6 +118,7 @@ _assign(
     "offline_updates old_kernels localepurge macos_system_cache "
     "win_system_temp win_update_cache win_system_dumps win_component_store",
 )
+_assign("registry", " ".join(REGISTRY_IDS))
 
 
 def category_of(cleaner_id: str) -> str:
