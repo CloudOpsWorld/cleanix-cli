@@ -33,6 +33,11 @@ def _rename(src: str, dst: str) -> None:
     os.rename(src, dst)
 
 
+def _replace(src: str, dst: str) -> None:
+    """os.replace indirection (tests simulate a failing manifest save)."""
+    os.replace(src, dst)
+
+
 def _is_cross_volume(exc: OSError) -> bool:
     import errno
 
@@ -250,14 +255,28 @@ class Quarantine:
     after_delete = mark_registry
 
     def save(self) -> None:
+        """Write the manifest atomically (temp file, fsync, replace): a
+        failed save leaves the previous manifest intact, so entries already
+        recorded (e.g. deleted registry entries) stay restorable."""
         self.dir.mkdir(parents=True, exist_ok=True)
-        (self.dir / "manifest.json").write_text(
-            json.dumps(
-                {"run_id": self.run_id, "created": time.time(), "items": self.items},
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        data = json.dumps(
+            {"run_id": self.run_id, "created": time.time(), "items": self.items},
+            indent=2,
+        ).encode("utf-8")
+        target = self.dir / "manifest.json"
+        tmp = self.dir / f".manifest.{os.getpid()}.{time.time_ns()}.tmp"
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            _replace(str(tmp), str(target))
+        except BaseException:
+            try:
+                os.unlink(str(tmp))
+            except OSError:
+                pass
+            raise
 
     @property
     def size(self) -> int:

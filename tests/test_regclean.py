@@ -240,6 +240,34 @@ def test_manifest_save_failure_vetoes_and_rolls_back(state, fake_registry, monke
     assert not list((run.dir / "registry").glob("*__registry.*"))
 
 
+def test_failed_manifest_save_keeps_earlier_entries_restorable(
+    state, fake_registry, monkeypatch
+):
+    reg = fake_registry
+    _foo_tree(reg)
+    reg.add_key("HKCU", UNINST + r"\Bar", {"DisplayName": (REG_SZ, "Bar")})
+    first, second = _item(reg), _item(reg, key=UNINST + r"\Bar")
+    run = quarantine.new_run()
+    assert Engine([]).clean([first], dry_run=False, registry_backup=run).outcomes[0].removed
+
+    def disk_full(src, dst):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(quarantine, "_replace", disk_full)
+    o = Engine([]).clean([second], dry_run=False, registry_backup=run).outcomes[0]
+    assert o.removed is False and o.error.startswith("backup failed, nothing deleted")
+    assert reg.key_exists("HKCU", UNINST + r"\Bar")
+    assert not list(run.dir.glob(".manifest.*"))
+    monkeypatch.undo()
+    monkeypatch.setattr(quarantine, "quarantine_root", lambda: state / "q")
+    monkeypatch.setattr(winenv, "is_admin", lambda: False)
+    row, = quarantine.list_runs()
+    assert row["registry"] == 1
+    res = quarantine.restore(run.run_id)
+    assert res == {"restored": [first.reg.display], "failed": []}
+    assert reg.key_exists("HKCU", FOO + r"\Sub\Deeper")
+
+
 # -- preflight ---------------------------------------------------------------------------
 def test_preflight_denied_nothing_deleted(state, fake_registry):
     reg = fake_registry
