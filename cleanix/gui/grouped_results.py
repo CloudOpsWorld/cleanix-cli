@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from cleanix.core.curation import Group, Safety, display_label, shorten_path
-from cleanix.core.models import CleanableItem, ItemKind, item_key
+from cleanix.core.models import CleanableItem, ItemKind, item_key, item_target
 from cleanix.core.utils import human_size
 from cleanix.gui import elevation, reveal
 
@@ -230,13 +230,21 @@ class GroupedResults(QTreeWidget):
             self.expandItem(self._group_rows[gi])
 
     def copy_path(self, item: CleanableItem) -> None:
-        text = (" ".join(item.command or []) if item.kind is ItemKind.COMMAND
-                else item.path or "")
+        text = item_target(item)
         if text:
             QApplication.clipboard().setText(text)
 
+    @staticmethod
+    def menu_labels(item: CleanableItem) -> List[str]:
+        """Context-menu entries for an item: registry keys and commands have no
+        folder to open."""
+        labels = ["Copy path"]
+        if item.kind is ItemKind.PATH:
+            labels.append("Open location")
+        return labels
+
     def open_location(self, item: CleanableItem) -> bool:
-        if item.kind is ItemKind.COMMAND or not item.path:
+        if item.kind is not ItemKind.PATH or not item.path:
             return False
         return reveal.reveal_in_file_manager(item.path)
 
@@ -294,11 +302,12 @@ class GroupedResults(QTreeWidget):
         row.setData(0, _ROLE, _Row("item", gi, item))
         label = display_label(item, self._home)
         row.setText(0, label)
+        full = item_target(item)
         if item.kind is ItemKind.COMMAND:
-            full = " ".join(item.command or [])
             row.setText(1, item.hint or "Runs a command")
+        elif item.kind is ItemKind.REGISTRY:
+            row.setText(1, full)
         else:
-            full = item.path or ""
             row.setText(1, shorten_path(full, self._home))
         reason = self.refusal_reason(item)
         tip = chr(10).join(t for t in (full, reason, item.hint) if t)
@@ -463,8 +472,9 @@ class GroupedResults(QTreeWidget):
             menu.addAction("Show all", lambda: self.show_all(self._group_rows[p.gi]))
         elif p.kind == "item" and p.item is not None:
             item = p.item
-            menu.addAction("Copy path", lambda: self.copy_path(item))
-            if item.kind is not ItemKind.COMMAND:
+            labels = self.menu_labels(item)
+            menu.addAction(labels[0], lambda: self.copy_path(item))
+            if "Open location" in labels:
                 menu.addAction("Open location", lambda: self.open_location(item))
         if menu.isEmpty():
             return

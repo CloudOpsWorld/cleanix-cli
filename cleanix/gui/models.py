@@ -8,7 +8,7 @@ from PySide6.QtCore import QAbstractListModel, QAbstractTableModel, QModelIndex,
 
 from cleanix.config import Config
 from cleanix.core import catalog
-from cleanix.core.models import CleanableItem, ItemKind, ScanResult, item_key
+from cleanix.core.models import CleanableItem, ItemKind, ScanResult, item_key, item_target
 from cleanix.core.utils import human_size
 from cleanix.gui import elevation
 
@@ -91,13 +91,13 @@ class CleanerListModel(QAbstractListModel):
 def _type_label(item: CleanableItem) -> str:
     if item.report_only:
         return "Review"
-    return "Command" if item.kind is ItemKind.COMMAND else "Path"
+    if item.kind is ItemKind.COMMAND:
+        return "Command"
+    return "Registry" if item.kind is ItemKind.REGISTRY else "Path"
 
 
 def _target_text(item: CleanableItem) -> str:
-    if item.kind is ItemKind.COMMAND:
-        return " ".join(item.command or [])
-    return item.path or ""
+    return item_target(item)
 
 
 class ItemTableModel(QAbstractTableModel):
