@@ -12,7 +12,7 @@ import dataclasses
 import hashlib
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from cleanix.core.curation import copy_for
 from cleanix.core.models import CleanableItem, ScanResult
@@ -214,21 +214,63 @@ _HEX = frozenset("0123456789abcdef")
 _CHUNK = 1024 * 1024
 
 
-def content_matches_group(path: str, group: str) -> Optional[str]:
+_HASH_CACHE_MAX = 64
+# (path key, full fingerprint) -> SHA-256 hex of a kept copy: a dry run
+# followed by a real act hashes the kept copy once. The fingerprint is
+# re-verified by the caller right before every use, so a changed file never
+# matches a stale entry.
+_hash_cache: Dict[Tuple[str, Tuple[int, ...]], str] = {}
+
+CANCELLED = "cancelled while checking the copy to keep; nothing removed"
+
+
+def _sha256_of(path: str, cancel: Optional[Callable[[], bool]]) -> Optional[str]:
+    """SHA-256 of ``path``, polling ``cancel`` between chunks (None when
+    cancelled). Raises OSError/ValueError when unreadable."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            if cancel is not None and cancel():
+                return None
+            chunk = fh.read(_CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def content_matches_group(path: str, group: str, *,
+                          fingerprint: Optional[Sequence[int]] = None,
+                          cancel: Optional[Callable[[], bool]] = None
+                          ) -> Optional[str]:
     """Why ``path``'s content is not proven to be the group's (None when it
     is). A duplicate group id is the full SHA-256 of the content (see
     cleaners/duplicates.py); the file is streamed and hashed. Anything else
-    (not a SHA-256 id, unreadable file) fails closed."""
+    (not a SHA-256 id, unreadable file, cancelled) fails closed.
+
+    ``cancel`` is polled between read chunks. With ``fingerprint`` (the file's
+    lstat identity), the digest is cached under (path, fingerprint)."""
     if len(group) != 64 or not set(group) <= _HEX:
         return "cannot confirm the copy to keep has the same content; nothing removed"
-    h = hashlib.sha256()
-    try:
-        with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(_CHUNK), b""):
-                h.update(chunk)
-    except (OSError, ValueError):
-        return "the copy to keep could not be read; nothing removed"
-    if h.hexdigest() != group:
+    key = None
+    if fingerprint is not None:
+        try:
+            key = (path_key(path), tuple(int(x) for x in fingerprint))
+        except (TypeError, ValueError):
+            key = None
+    digest = _hash_cache.get(key) if key is not None else None
+    if digest is None:
+        try:
+            digest = _sha256_of(path, cancel)
+        except (OSError, ValueError):
+            return "the copy to keep could not be read; nothing removed"
+        if digest is None:
+            return CANCELLED
+        if key is not None:
+            if len(_hash_cache) >= _HASH_CACHE_MAX:
+                _hash_cache.clear()
+            _hash_cache[key] = digest
+    if digest != group:
         return "the copy to keep no longer has the same content; nothing removed"
     return None
 

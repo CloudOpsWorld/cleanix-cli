@@ -109,6 +109,15 @@ write the exact list of paths/commands that \-\-execute would act on to a file, 
 .B \-\-interactive
 pick individual items to remove from a checklist before cleaning
 .TP
+.B \-\-act\-on SCENARIOS
+act on report\-only findings: comma\-separated finding ids (e.g. big_files,duplicates) or category names; preview unless \-\-execute; quarantined unless \-\-permanent
+.TP
+.B \-\-keep
+with \-\-act\-on duplicates: which copy of each group stays
+.TP
+.B \-\-permanent
+with \-\-act\-on: delete instead of quarantining (no undo)
+.TP
 .B \-\-profile
 preset bundle of opt\-in settings: 'safe' disables aggressive cleaners, 'aggressive' enables offline\-repo/backup/locale/all\-image pruning (never volumes)
 .SS explain

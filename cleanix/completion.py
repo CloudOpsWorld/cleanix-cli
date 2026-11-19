@@ -17,6 +17,7 @@ SCAN_CLEAN_OPTS = [
     "--only", "--exclude", "--json", "--output", "--quiet", "--summary",
     "--sort", "--top", "--all-users", "--current-user", "--min-uid",
     "--execute", "--yes", "--quarantine", "--registry",
+    "--act-on", "--keep", "--permanent",
 ]
 
 
@@ -46,6 +47,7 @@ _cleanix() {{
         --only|--exclude)
             COMPREPLY=( $(compgen -W "$cleaners" -- "$cur") ); return;;
         --sort) COMPREPLY=( $(compgen -W "none size name" -- "$cur") ); return;;
+        --keep) COMPREPLY=( $(compgen -W "oldest newest shortest-path" -- "$cur") ); return;;
     esac
     case "${{COMP_WORDS[1]}}" in
         scan|clean)
@@ -89,6 +91,7 @@ _cleanix() {{
             case "$words[CURRENT-1]" in
                 --only|--exclude) _values 'cleaner' $cleaners; return;;
                 --sort) _values 'sort' none size name; return;;
+                --keep) _values 'keep' oldest newest shortest-path; return;;
             esac
             _values 'option' {' '.join(SCAN_CLEAN_OPTS)};;
         config)
@@ -119,6 +122,10 @@ def fish_script() -> str:
             f'complete -c cleanix -n "__fish_seen_subcommand_from scan clean" '
             f'-l {opt.lstrip("-")} -a "{_ids()}"'
         )
+    lines.append(
+        'complete -c cleanix -n "__fish_seen_subcommand_from clean" '
+        '-l keep -a "oldest newest shortest-path"'
+    )
     lines.append(
         'complete -c cleanix -n "__fish_seen_subcommand_from config" '
         f'-a "list get set unset path {_keys()}"'

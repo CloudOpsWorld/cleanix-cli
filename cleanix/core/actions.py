@@ -110,7 +110,8 @@ def _recheck(item: CleanableItem) -> Optional[str]:
 
 
 def _verify(item: CleanableItem, batch: Set[str],
-            hashed: Dict[Tuple[str, Tuple[int, ...]], Optional[str]]) -> Optional[str]:
+            hashed: Dict[Tuple[str, Tuple[int, ...]], Optional[str]],
+            cancel: Optional[Callable[[], bool]] = None) -> Optional[str]:
     """Why ``item`` must be skipped, or None when it may be acted on now.
 
     ``batch`` holds the path keys of every supplied item (a duplicate's
@@ -143,7 +144,8 @@ def _verify(item: CleanableItem, batch: Set[str],
         assert kept is not None  # _survivor_reason passed
         cache_key = (path_key(kept.path), tuple(kept.fingerprint))
         if cache_key not in hashed:
-            hashed[cache_key] = content_matches_group(kept.path, remedy.group)
+            hashed[cache_key] = content_matches_group(
+                kept.path, remedy.group, fingerprint=kept.fingerprint, cancel=cancel)
         why = hashed[cache_key]
         if why is not None:
             return why
@@ -233,7 +235,7 @@ def act(
             reason = KEEPS_COPY
         else:
             try:
-                reason = _verify(item, batch, hashed)
+                reason = _verify(item, batch, hashed, cancel)
             except Exception as exc:  # noqa: BLE001 - fail closed, never abort the batch
                 reason = f"could not be verified ({str(exc) or type(exc).__name__})"
         if key is not None:

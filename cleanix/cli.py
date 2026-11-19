@@ -15,7 +15,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
@@ -477,7 +477,238 @@ def cmd_explain(args: argparse.Namespace, console: Console) -> int:
     return 0
 
 
+# Selections that make no sense together with --act-on (it names its own
+# scenarios and always scans exactly those).
+_ACT_ON_CONFLICTS = (
+    ("only", "--only"), ("exclude", "--exclude"), ("registry", "--registry"),
+    ("profile", "--profile"), ("simulate", "--simulate"),
+    ("interactive", "--interactive"), ("quarantine", "--quarantine"),
+    ("min_size", "--min-size"),
+)
+_BLANKET_WORDS = ("all", "*", "everything")
+RESTORE_CMD = "cleanix restore"
+
+
+def _resolve_act_scenarios(raw: str, config: Config):
+    """Turn the --act-on value into cleaner ids: (ids, None) or (None, error).
+
+    Accepts finding cleaner ids and finding category names (case-insensitive;
+    a category expands to its scenarios that apply to this system). Never a
+    blanket word."""
+    from cleanix.core import findings
+
+    tokens = [t.strip() for t in raw.split(",")]
+    if not raw.strip() or any(not t for t in tokens):
+        return None, ("--act-on needs scenario ids or category names "
+                      "(empty entries are not allowed)")
+    categories = {c.lower(): c for c in findings.CATEGORY_ORDER}
+    finding_ids = {k.lower(): k for k in findings.FINDING_CATEGORIES}
+    applicable = None
+    ids: List[str] = []
+    for tok in tokens:
+        low = tok.lower()
+        if low in _BLANKET_WORDS:
+            return None, (f"--act-on does not accept {tok!r}: name the scenarios "
+                          "or categories explicitly (see `cleanix list`)")
+        cat = categories.get(low)
+        if cat is not None:
+            if applicable is None:
+                applicable = {cid for cid, c in describe_all(config).items()
+                              if c.supported()}
+            new = [cid for cid, c in findings.FINDING_CATEGORIES.items()
+                   if c == cat and cid in applicable]
+            if not new:
+                return None, (f"no scenario in category {cat!r} applies to "
+                              "this system")
+        elif low in finding_ids:
+            new = [finding_ids[low]]
+        elif unknown_ids([tok]):
+            return None, (f"unknown scenario {tok!r}. Use a findings cleaner id "
+                          "or one of the categories: "
+                          + ", ".join(findings.CATEGORY_ORDER[:-1]))
+        else:
+            return None, (f"{tok!r} is not a findings scenario: it is an "
+                          "ordinary cleaner (use --only without --act-on)")
+        for cid in new:
+            if cid not in ids:
+                ids.append(cid)
+    return ids, None
+
+
+def _act_error(console: Console, message: str) -> int:
+    console.print(f"[red]{safe(message)}[/red]")
+    return 2
+
+
+def _act_line(console: Console, item, action: str) -> None:
+    """One finding: size and label, then what will happen (``action`` must
+    already be markup-safe)."""
+    console.print(f"  {human_size(item.size):>10}  {safe(item.description)}")
+    console.print(f"              [dim]-> {action}[/dim]")
+
+
+def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
+    """`clean --act-on`: act on report-only findings the user named.
+
+    Preview by default; --execute acts (one confirmation unless --yes).
+    Quarantine unless --permanent. Scans only the named scenarios."""
+    from cleanix.core import findings, service
+
+    for attr, flag in _ACT_ON_CONFLICTS:
+        val = getattr(args, attr, None)
+        used = (val is not None) if attr in ("only", "exclude", "profile") else bool(val)
+        if used:
+            return _act_error(
+                console, f"--act-on cannot be combined with {flag}: it names "
+                "its own scenarios")
+    config = _load_config()
+    ids, err = _resolve_act_scenarios(args.act_on, config)
+    if err:
+        return _act_error(console, err)
+    keep = getattr(args, "keep", None)
+    keep_help = "|".join(findings.KEEP_POLICIES)
+    if "duplicates" in ids and not keep:
+        return _act_error(
+            console, f"the duplicates scenario needs --keep ({keep_help}) "
+            "to choose which copy stays")
+    permanent = bool(getattr(args, "permanent", False))
+
+    _configure_scope(args)
+    engine = _make_engine(config, ids, None)
+    _scope_note(console)
+    scan = _scan(engine, console)
+    groups = findings.group_findings(scan)
+    all_items = [i for g in groups for i in g.items]
+    if not all_items:
+        console.print("[green]Nothing found for the named scenarios.[/green]")
+        return 0
+
+    root_items = [i for i in all_items if i.requires_root]
+    rest = [i for i in all_items if not i.requires_root]
+    dups = [i for i in rest if i.remedy is not None and i.remedy.group]
+    dup_ids = {id(i) for i in dups}
+    to_act = [i for i in rest if id(i) not in dup_ids]
+    plan_skipped: List[Tuple[object, str]] = []
+    if dups:
+        if not keep:
+            return _act_error(
+                console, f"duplicate findings need --keep ({keep_help})")
+        plan = findings.plan_duplicates(dups, keep)
+        to_act += plan.items
+        plan_skipped = list(plan.skipped)
+
+    # Dry-run pass: the real verdict (and reason) for every item.
+    pre = service.act(to_act, config, dry_run=True, permanent=permanent,
+                      record_history=False)
+    key = findings.path_key
+    skip_by_path: Dict[str, str] = {
+        key(i.path): why for i, why in plan_skipped + list(pre.skipped)
+        if getattr(i, "path", None)}
+    stamped = {key(i.path): i for i in to_act if i.path}
+    eligible = [i for i in to_act if key(i.path) not in skip_by_path]
+
+    undo = ("permanent, no undo" if permanent else
+            f"kept in quarantine; undo with `{RESTORE_CMD}`")
+    verb = "delete" if permanent else "quarantine"
+    for category in findings.CATEGORY_ORDER:
+        shown = []
+        for g in groups:
+            if g.category != category:
+                continue
+            its = [i for i in g.items if not i.requires_root]
+            if its:
+                shown.append((g, its))
+        if not shown:
+            continue
+        console.print(f"\n[bold cyan]{safe(category)}[/bold cyan]")
+        for g, its in shown:
+            console.print(f"[bold]{safe(g.title)}[/bold]")
+            for i in its:
+                k = key(i.path) if i.path else ""
+                why = skip_by_path.get(k)
+                if why is not None:
+                    label = why if why.startswith("kept") else f"skipped: {why}"
+                    _act_line(console, i, safe(label))
+                    continue
+                action = f"{verb}: {undo}"
+                kept = findings.survivor_of(stamped[k]) if k in stamped else None
+                if kept is not None:
+                    action += f" (keeps {safe(kept.path)})"
+                _act_line(console, i, action)
+    if root_items:
+        console.print("\n[yellow]Needs an elevated run (not done here)[/yellow]")
+        for i in root_items:
+            _act_line(console, i, "not done here: needs an elevated run")
+
+    total = sum(i.size for i in eligible)
+    if not eligible:
+        console.print("\nNothing can be acted on right now.")
+        return 0
+    if not args.execute:
+        console.print(
+            f"\n[yellow]Preview: {len(eligible)} item(s), up to "
+            f"{human_size(total)}, would be "
+            f"{'deleted' if permanent else 'quarantined'}.[/yellow]")
+        console.print("[dim]This was a dry run. Add [bold]--execute[/bold] to "
+                      "act on these items.[/dim]")
+        return 0
+
+    if not args.yes:
+        console.print()
+        if not _stdin_is_tty():
+            console.print(
+                "[red]Refusing to act without a terminal to confirm in; pass "
+                "--yes to proceed. Nothing was changed.[/red]")
+            return 2
+        try:
+            confirmed = Confirm.ask(
+                f"{'Permanently delete' if permanent else 'Quarantine'} "
+                f"{len(eligible)} item(s), up to {human_size(total)}?",
+                default=False)
+        except (EOFError, OSError):
+            console.print(
+                "[red]Cannot ask for confirmation without a terminal; pass "
+                "--yes to proceed. Nothing was changed.[/red]")
+            return 2
+        if not confirmed:
+            console.print("Aborted. Nothing was changed.")
+            return 1
+
+    with console.status("Working..."):
+        summary = service.act(to_act, config, dry_run=False, permanent=permanent)
+    console.print()
+    console.print(
+        f"[green]Freed {human_size(summary.freed)} across {summary.removed} "
+        f"item(s).[/green]")
+    if summary.quarantine_run:
+        run = safe(summary.quarantine_run)
+        console.print(
+            f"[cyan]Quarantine run '{run}':[/cyan] undo with "
+            f"[bold]{RESTORE_CMD} {run}[/bold]; space is reclaimed once you run "
+            f"[bold]cleanix quarantine empty[/bold].")
+    elif permanent and summary.removed:
+        console.print("[dim]Deleted permanently; there is no undo.[/dim]")
+    skipped = [(i, w) for i, w in plan_skipped if not w.startswith("kept")]
+    skipped += list(summary.skipped)
+    skipped += [(i, "needs an elevated run (not done here)") for i in root_items]
+    if skipped:
+        console.print(f"\n[yellow]Skipped {len(skipped)} item(s):[/yellow]")
+        for i, why in skipped:
+            console.print(f"  {safe(getattr(i, 'description', ''))}: {safe(why)}")
+    if summary.undo_record_error:
+        console.print(f"[red]{safe(summary.undo_record_error)}[/red]")
+    for o in summary.errors:
+        console.print(
+            f"  [red]![/red] {safe(o.item.description)}: {safe(o.error)}")
+    return 1 if summary.errors or summary.undo_record_error else 0
+
+
 def cmd_clean(args: argparse.Namespace, console: Console) -> int:
+    if getattr(args, "act_on", None) is not None:
+        return cmd_clean_act_on(args, console)
+    for attr, flag in (("keep", "--keep"), ("permanent", "--permanent")):
+        if getattr(args, attr, None):
+            return _act_error(console, f"{flag} only applies with --act-on")
     _require_nonempty_selection(args)
     _configure_scope(args)
     config = _apply_profile(_load_config(), getattr(args, "profile", None))
@@ -1343,6 +1574,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--interactive",
         action="store_true",
         help="pick individual items to remove from a checklist before cleaning",
+    )
+    p_clean.add_argument(
+        "--act-on",
+        metavar="SCENARIOS",
+        default=None,
+        help="act on report-only findings: comma-separated finding ids "
+        "(e.g. big_files,duplicates) or category names; preview unless "
+        "--execute; quarantined unless --permanent",
+    )
+    p_clean.add_argument(
+        "--keep",
+        choices=["oldest", "newest", "shortest-path"],
+        default=None,
+        help="with --act-on duplicates: which copy of each group stays",
+    )
+    p_clean.add_argument(
+        "--permanent",
+        action="store_true",
+        help="with --act-on: delete instead of quarantining (no undo)",
     )
     _add_profile(p_clean)
     p_clean.set_defaults(func=cmd_clean)
