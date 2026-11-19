@@ -447,6 +447,32 @@ def target_state(
     )
 
 
+def describe_target(
+    raw: str, *, command: bool, ctx: DetectorContext, machine: bool
+) -> str:
+    """Short evidence text: each expanded candidate that :func:`target_state`
+    weighs, with its state. Informational only; never decides anything."""
+    allowed = MACHINE_VARS if (machine or not ctx.owner_matches) else None
+    variants = _expand_variants(raw, ctx.env, allowed)
+    if not variants:
+        return f"{raw}: unknown (cannot expand)"
+    parts: List[str] = []
+    for v in variants:
+        if command:
+            cands = list(parse_command(v).candidates)
+        else:
+            cands = [v.strip().strip('"')]
+        for c in cands:
+            try:
+                state = _combine([ctx.prober.probe(x) for x in _with_pathext([c])])
+            except Exception:
+                state = Existence.UNKNOWN
+            item = f"{c}: {state.value}"
+            if item not in parts:
+                parts.append(item)
+    return "; ".join(parts) if parts else f"{raw}: unknown (unparseable)"
+
+
 def _profiles_root(env: Mapping[str, str], system_drive: str) -> str:
     public = {str(k).casefold(): str(v) for k, v in env.items()}.get("public")
     profiles = ntpath.dirname(ntpath.normpath(public)) if public else ""

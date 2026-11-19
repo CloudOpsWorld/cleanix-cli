@@ -72,7 +72,11 @@ def test_expand_sz_and_unicode_names(fake_registry):
 
 def test_value_name_with_backslash_never_aborts(fake_registry):
     fake_registry.add_key("HKLM", CV + r"\Run", {r"Back\Slash": (REG_SZ, r"C:\Gone\b.exe")})
-    assert len(items(detector())) <= 1  # listed or skipped, never an error
+    # A backslash is legal in a value name: the guard (_bad_text) and
+    # backup_problem do not refuse it and the target is a RegTarget.value,
+    # never a path, so the dead entry is listed with the exact name.
+    (it,) = items(detector())
+    assert it.reg.value == r"Back\Slash"
 
 
 def test_present_kept(fake_registry):
@@ -139,12 +143,109 @@ def test_winreg_startup_never_touches_unlisted_containers(fake_registry):
         "HKCU", CV + r"\Explorer\StartupApproved\Run", {"A": (REG_BINARY, b"\x03")}
     )
     fake_registry.add_key("HKCU", CV + r"\Policies\Explorer\Run", {"A": (REG_SZ, "x")})
+    fake_registry.add_key("HKLM", CV + r"\Run", {"B": (REG_SZ, r"C:\Gone\y.exe")})
     fake_registry.calls.clear()
-    items(detector())
-    allowed = {CV + r"\Run", CV + r"\RunOnce", CVW + r"\Run", CVW + r"\RunOnce"}
+    assert len(items(detector())) == 2
+    allowed = {("HKCU", CV + r"\Run"), ("HKCU", CV + r"\RunOnce")} | {
+        ("HKLM", k)
+        for k in (CV + r"\Run", CV + r"\RunOnce", CVW + r"\Run", CVW + r"\RunOnce")
+    }
+    ops = {c[0] for c in fake_registry.calls}
+    assert ops <= {"values", "key_exists", "is_link", "subkeys"}
+    assert "can_delete" not in ops
     for call in fake_registry.calls:
-        assert call[0] in ("values", "key_exists", "is_link", "subkeys", "can_delete")
+        pair = (call[1], call[2])
         if call[0] == "values":  # content is only ever read from the containers
-            assert call[2] in allowed
+            assert pair in allowed
         else:  # the base's link checks may look at ancestors of a container
-            assert any(a == call[2] or a.startswith(call[2] + "\\") for a in allowed)
+            assert any(
+                h == pair[0] and (k == pair[1] or k.startswith(pair[1] + "\\"))
+                for h, k in allowed
+            )
+
+
+def _direct(fake_registry, hive="HKCU", key=CV + r"\Run", **kw):
+    from cleanix.core.regsafety import Container
+
+    det = detector(**kw)
+    return list(det.entries(Container(hive, key, "value"), fake_registry, det.context()))
+
+
+def test_default_value_not_yielded_by_detector(fake_registry):
+    fake_registry.add_key("HKCU", CV + r"\Run", {"": (REG_SZ, r"C:\Gone\x.exe")})
+    assert _direct(fake_registry) == []
+
+
+def test_backup_problem_skip_is_consulted(fake_registry, monkeypatch):
+    from cleanix.core import regbackup
+
+    seen = []
+
+    def refuse(cid, target, snap):
+        seen.append(target.value)
+        return "refused"
+
+    monkeypatch.setattr(regbackup, "backup_problem", refuse)
+    fake_registry.add_key("HKCU", CV + r"\Run", {"A": (REG_SZ, r"C:\Gone\x.exe")})
+    assert _direct(fake_registry) == []
+    assert seen == ["A"]
+
+
+def test_crlf_value_name_not_listed(fake_registry):
+    fake_registry.add_key("HKCU", CV + r"\Run", {"A\r\nB": (REG_SZ, r"C:\Gone\x.exe")})
+    assert items(detector()) == []
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        "",
+        "   ",
+        "C:\\Gone\\x.exe\x00junk",
+        "C:\\Gone\\x.exe " + "a" * 2000,
+        "C:\\Gone\\" + "d" * 1100 + ".exe",
+    ],
+)
+def test_guards_are_sole_defence(fake_registry, data):
+    # every probe says MISSING, so only the detector's own guards keep these
+    fake_registry.add_key("HKCU", CV + r"\Run", {"A": (REG_SZ, data)})
+    assert _direct(fake_registry) == []
+
+
+def test_evidence_strips_control_chars_and_truncates(fake_registry):
+    cmd = "C:\\Gone\\x.exe a\rb\nc\td\x1be\x7f " + "z" * 400
+    fake_registry.add_key("HKCU", CV + r"\Run", {"A": (REG_SZ, cmd)})
+    (f,) = _direct(fake_registry)
+    assert not any(ord(c) < 32 or 127 <= ord(c) < 160 for c in f.evidence)
+    assert "a b c d e" in f.evidence
+    assert "..." in f.evidence
+
+
+def test_evidence_lists_checked_targets_and_states(fake_registry):
+    fake_registry.add_key(
+        "HKLM", CVW + r"\Run", {"A": (REG_EXPAND_SZ, r'"%ProgramFiles%\Gone\x.exe" -s')}
+    )
+    (it,) = items(detector())
+    assert r"C:\Program Files\Gone\x.exe: missing" in it.hint
+
+
+def test_wow64_program_files_x86_variant_present_keeps_entry(fake_registry):
+    fake_registry.add_key(
+        "HKLM", CVW + r"\Run", {"A": (REG_EXPAND_SZ, r"%ProgramFiles%\Vendor\x.exe")}
+    )
+    env = dict(ENV, **{"ProgramFiles(x86)": r"C:\Program Files (x86)"})
+    prober = FakeProber({r"C:\Program Files (x86)\Vendor\x.exe": P}, M)
+    ctx = DetectorContext(env, prober, r"C:\Users", r"C:\Windows", True)
+
+    class Det(WinRegStartup):
+        def context(self):
+            return ctx
+
+    assert items(Det(Config())) == []
+
+
+@pytest.mark.parametrize("typ", [REG_SZ, REG_EXPAND_SZ])
+def test_program_files_variable_expands_for_both_types(fake_registry, typ):
+    fake_registry.add_key("HKLM", CV + r"\Run", {"A": (typ, r"%ProgramFiles%\V\x.exe")})
+    assert items(detector({r"C:\Program Files\V\x.exe": P})) == []
+    assert len(items(detector())) == 1

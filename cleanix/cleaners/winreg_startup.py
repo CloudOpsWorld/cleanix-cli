@@ -16,7 +16,12 @@ from cleanix.cleaners.winreg_base import Finding, RegistryDetector
 from cleanix.core import regbackup, regsnap
 from cleanix.core.models import RegTarget
 from cleanix.core.regsafety import Container
-from cleanix.core.regtargets import DetectorContext, Existence, target_state
+from cleanix.core.regtargets import (
+    DetectorContext,
+    Existence,
+    describe_target,
+    target_state,
+)
 from cleanix.core.winregistry import (
     REG_EXPAND_SZ,
     REG_SZ,
@@ -29,7 +34,7 @@ _MAX_SHOWN = 200
 
 
 def _shown(text: str) -> str:
-    text = text.replace("\r", " ").replace("\n", " ")
+    text = "".join(" " if (ord(c) < 32 or 127 <= ord(c) < 160) else c for c in text)
     return text if len(text) <= _MAX_SHOWN else text[: _MAX_SHOWN - 3] + "..."
 
 
@@ -67,5 +72,10 @@ class WinRegStartup(RegistryDetector):
             yield Finding(
                 target,
                 f"Startup entry: {value.name}",
-                f"Command {_shown(command)}: missing",
+                "Command "
+                + _shown(command)
+                + " -> "
+                + _shown(
+                    describe_target(command, command=True, ctx=ctx, machine=machine)
+                ),
             )
