@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import pytest
 
+from types import SimpleNamespace
+
 from _fakereg import FakeProber
 from cleanix.cleaners import winreg_uninstall as wu
 from cleanix.config import Config
 from cleanix.cleaners.winreg_uninstall import WinRegUninstall
-from cleanix.core.regtargets import DetectorContext, Existence
+from cleanix.core.regtargets import (
+    DetectorContext,
+    Existence,
+    WinProber,
+    microsoft_roots,
+)
 
 P, M, U = Existence.PRESENT, Existence.MISSING, Existence.UNKNOWN
 
@@ -40,13 +47,18 @@ def _dead(**over):
 
 @pytest.fixture
 def run(fake_registry, monkeypatch):
-    def go(states=None, *, owner=True, env=ENV, default=M):
-        prober = FakeProber(states or {}, default=default)
-        ctx = DetectorContext(env, prober, r"C:\Users", r"C:\Windows")
+    def go(states=None, *, owner=True, ctx_owner=True, env=ENV, default=M, ctx=None):
+        if ctx is None:
+            prober = FakeProber(states or {}, default=default)
+            ctx = DetectorContext(
+                env, prober, r"C:\Users", r"C:\Windows", owner_matches=ctx_owner
+            )
         det = WinRegUninstall(Config())
         monkeypatch.setattr(det, "context", lambda: ctx)
         monkeypatch.setattr(wu, "_scan_owner_matches", lambda: owner)
-        return list(det.find_items())
+        report = det.scan()
+        assert report.skipped_reason is None
+        return list(report.items)
 
     return go
 
@@ -61,7 +73,7 @@ def test_dead_entry_listed(fake_registry, run):
     assert item.description == "Uninstall entry: Foo Tool (Foo Inc)"
     assert item.reg.hive == "HKCU" and item.reg.key == f"{CV}\\Foo"
     assert item.requires_root is False
-    assert f"InstallLocation {LOC}: missing" in item.hint
+    assert f"InstallLocation -> {LOC}: missing" in item.hint
     assert "UninstallString" in item.hint and "missing" in item.hint
 
 
@@ -146,6 +158,14 @@ def test_per_user_install_owner_matches(fake_registry, run):
         "icon_dword",
         "publisher_binary",
         "location_unc",
+        "microsoft_upper",
+        "kb_lower",
+        "guid_key",
+        "bundle_cache",
+        "bundle_provider",
+        "bundle_tag",
+        "product_code",
+        "inno_present",
     ],
 )
 def test_entry_kept(fake_registry, run, case):
@@ -206,6 +226,24 @@ def test_entry_kept(fake_registry, run, case):
         v["DisplayIcon"] = (DW, 3)
     elif case == "publisher_binary":
         v["Publisher"] = (BIN, b"x")
+    elif case == "microsoft_upper":
+        v["Publisher"] = (SZ, "MICROSOFT CORPORATION")
+    elif case == "kb_lower":
+        name = "kb5034441"
+    elif case == "guid_key":
+        name = "{11111111-2222-3333-4444-555555555555}"
+        v["UninstallString"] = (SZ, r"C:\Program Files\InstallShield\setup.exe /x")
+    elif case == "bundle_cache":
+        v["BundleCachePath"] = (SZ, r"C:\ProgramData\Package Cache\x\setup.exe")
+    elif case == "bundle_provider":
+        v["BundleProviderKey"] = (SZ, "x")
+    elif case == "bundle_tag":
+        v["BundleTag"] = (SZ, "x")
+    elif case == "product_code":
+        v["ProductCode"] = (SZ, "{11111111-2222-3333-4444-555555555555}")
+    elif case == "inno_present":
+        v["Inno Setup: App Path"] = (SZ, r"C:\Apps\FooApp")
+        states[r"C:\Apps\FooApp"] = P
     elif case == "location_unc":
         v["InstallLocation"] = (SZ, r"\\srv\share\Foo")
         states[r"\\srv\share\Foo"] = U
@@ -226,6 +264,16 @@ def test_hklm_per_user_variable_kept(fake_registry, run):
         "HKLM",
     )
     assert run() == []
+
+
+def test_per_user_install_ctx_owner_false_not_listed(fake_registry, run):
+    vals = _dead(
+        InstallLocation=(XSZ, r"%LOCALAPPDATA%\Programs\Foo"),
+        UninstallString=(XSZ, r'"%LOCALAPPDATA%\Programs\Foo\unins000.exe"'),
+    )
+    _add(fake_registry, "Foo", vals)
+    assert run(owner=True, ctx_owner=False) == []
+    assert len(run(owner=True, ctx_owner=True)) == 1
 
 
 def test_machine_paths_still_judged_when_owner_differs(fake_registry, run):
@@ -277,3 +325,75 @@ def test_owner_default_is_conservative_when_elevated(monkeypatch):
     assert wu._scan_owner_matches() is False
     monkeypatch.setattr(context, "is_effective_root", lambda: False)
     assert wu._scan_owner_matches() is True
+
+
+class _FS:
+    def __init__(self, present):
+        self.present = {p.casefold() for p in present} | {"c:\\"}
+
+    def lstat(self, path):
+        if path.casefold() in self.present:
+            return SimpleNamespace(st_file_attributes=0x10)
+        err = OSError("nf")
+        err.winerror = 3
+        raise err
+
+
+def _real_ctx(present):
+    fs = _FS(present)
+    prober = WinProber(
+        system_root=r"C:\Windows",
+        program_files=microsoft_roots(ENV, "C:"),
+        program_data=r"C:\ProgramData",
+        local_appdata=r"C:\Users\me\AppData\Local",
+        drive_type=lambda root: 3,
+        lstat=fs.lstat,
+    )
+    return DetectorContext(ENV, prober, r"C:\Users", r"C:\Windows")
+
+
+@pytest.mark.parametrize("value", ["ModifyPath", "QuietUninstallString"])
+def test_command_values_with_arguments_are_judged_as_commands(
+    fake_registry, run, value
+):
+    _add(
+        fake_registry,
+        "Foo",
+        _dead(**{value: (SZ, r"C:\Apps\Foo\mod.exe /modify")}),
+    )
+    assert run(ctx=_real_ctx([r"C:\Apps\Foo\mod.exe"])) == []
+    # sanity: with the program really gone the same entry is listed
+    assert len(run(ctx=_real_ctx([]))) == 1
+
+
+def test_inno_app_path_missing_still_listed(fake_registry, run):
+    _add(fake_registry, "Foo", _dead(**{"Inno Setup: App Path": (SZ, r"C:\Apps\FooApp")}))
+    (item,) = run()
+    assert "Inno Setup: App Path" in item.hint
+
+
+def test_inno_app_path_unknown_keeps(fake_registry, run):
+    _add(fake_registry, "Foo", _dead(**{"Inno Setup: App Path": (SZ, r"D:\Apps\FooApp")}))
+    assert run({r"D:\Apps\FooApp": U}) == []
+
+
+def test_install_source_and_non_path_values_ignored(fake_registry, run):
+    _add(
+        fake_registry,
+        "Foo",
+        _dead(InstallSource=(SZ, r"C:\Users\me\Downloads"), URLInfoAbout=(SZ, "http://x")),
+    )
+    assert len(run({r"C:\Users\me\Downloads": P})) == 1
+
+
+def test_description_sanitised_truncated_and_view_marker(fake_registry, run):
+    _add(fake_registry, "Foo", _dead(DisplayName=(SZ, "Fo\x00o\n" + "x" * 500)))
+    _add(fake_registry, "Bar", _dead(DisplayName=(SZ, "Foo")), "HKLM", CV)
+    _add(fake_registry, "Bar", _dead(DisplayName=(SZ, "Foo")), "HKLM", CVW)
+    descs = sorted(i.description for i in run())
+    assert "Uninstall entry: Foo" in descs
+    assert "Uninstall entry: Foo [32-bit]" in descs
+    long = [d for d in descs if d.startswith("Uninstall entry: Foox")]
+    assert len(long) == 1
+    assert "\n" not in long[0] and "\x00" not in long[0]
+    assert len(long[0]) == len("Uninstall entry: ") + 200
