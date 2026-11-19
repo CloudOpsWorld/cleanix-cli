@@ -17,6 +17,7 @@ from cleanix.core.utils import home, iter_children, path_size
 
 class BrowserCacheCleaner(Cleaner):
     id = "browsers"
+    safe_default = True
     name = "Browser caches"
     description = "Firefox/Chrome/Chromium on-disk HTTP caches"
     requires_root = False

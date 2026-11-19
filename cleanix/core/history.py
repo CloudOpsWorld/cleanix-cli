@@ -11,6 +11,11 @@ from cleanix.core.context import invoking_user
 
 
 def state_dir() -> Path:
+    from cleanix.core import platform as plat
+    from cleanix.core import winenv
+
+    if plat.is_windows():
+        return winenv.local_appdata() / "cleanix"
     return invoking_user().home / ".local" / "state" / "cleanix"
 
 
@@ -34,13 +39,17 @@ def write_manifest(result) -> str:
     path = runs / f"{stamp}.jsonl"
     try:
         runs.mkdir(parents=True, exist_ok=True)
-        with path.open("w") as fh:
+        with path.open("w", encoding="utf-8") as fh:
             for o in removed:
                 fh.write(json.dumps({
                     "time": time.time(),
                     "cleaner_id": o.item.cleaner_id,
                     "description": o.item.description,
                     "path": o.item.path,
+                    # Registry runs: the target's display only, never values.
+                    "registry": (o.item.reg.display
+                                 if getattr(o.item, "reg", None) is not None
+                                 else None),
                     "command": list(o.item.command) if o.item.command else None,
                     "bytes": o.freed,
                 }) + "\n")
@@ -49,14 +58,16 @@ def write_manifest(result) -> str:
         return ""
 
 
-def record(freed: int, items: int, *, mode: str) -> None:
+def record(freed: int, items: int, *, mode: str, registry: int = 0) -> None:
     """Append a completed clean run to the history log. ``mode`` is one of
-    'delete', 'quarantine'."""
+    'delete', 'quarantine'. ``registry`` counts removed registry entries."""
     path = _history_file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         entry = {"time": time.time(), "freed": freed, "items": items, "mode": mode}
-        with path.open("a") as fh:
+        if registry:
+            entry["registry"] = int(registry)
+        with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
     except OSError:
         pass  # history is best-effort; never fail a clean over it
@@ -68,7 +79,7 @@ def load() -> List[Dict]:
         return []
     entries: List[Dict] = []
     try:
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
             line = line.strip()
             if line:
                 entries.append(json.loads(line))

@@ -23,6 +23,7 @@ from typing import Iterable, List
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
+from cleanix.core.platform import ALL, WINDOWS
 from cleanix.core.utils import data_dir
 from cleanix.core.utils import (
     home,
@@ -30,6 +31,7 @@ from cleanix.core.utils import (
     modified_within,
     older_than,
     surplus_after_keeping,
+    walk_no_reparse,
 )
 
 
@@ -37,6 +39,8 @@ class _AgentCleaner(Cleaner):
     """Shared helpers for AI-CLI cleaners."""
 
     requires_root = False
+    # Home-relative state dirs (~/.claude, ~/.codex, ...) work on Windows too.
+    platforms = (ALL, WINDOWS)
 
     def _ephemeral_children(
         self, directory: Path, label: str, guard_minutes: float | None = None
@@ -145,7 +149,7 @@ class CodexCleaner(_AgentCleaner):
         sessions = root / "sessions"
         if sessions.is_dir():
             age = self.config.ai_history_max_age_days
-            for dirpath, _dirs, files in os.walk(sessions, onerror=lambda e: None):
+            for dirpath, _dirs, files in walk_no_reparse(sessions):
                 for name in files:
                     p = Path(dirpath, name)
                     if older_than(p, age):

@@ -6,9 +6,18 @@ import json
 from typing import Any, Dict
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
-from cleanix.core.models import CleanResult, ScanResult
+from cleanix.core import regpromises
+from cleanix.core.catalog import REGISTRY_IDS
+from cleanix.core.models import (
+    CleanResult,
+    ItemKind,
+    ScanResult,
+    _visible,
+    item_target,
+)
 from cleanix.core.utils import human_size
 
 
@@ -34,17 +43,19 @@ def render_scan_table(
 
     for report in reports:
         if not report.ran:
-            table.add_row(report.name, "-", "-", report.skipped_reason or "skipped")
+            table.add_row(safe(report.name), "-", "-", safe(report.skipped_reason or "skipped"))
             continue
         if report.count == 0:
-            table.add_row(report.name, "0", "-", "clean")
+            table.add_row(safe(report.name), "0", "-", "clean")
             continue
-        note = report.description
+        note = safe(report.description)
+        if report.incomplete:
+            note = f"[yellow]incomplete: {safe(report.incomplete)}[/yellow]"
         size_cell = human_size(report.total_size)
         if report.report_only:
             note = "[yellow]report only — review manually[/yellow]"
             size_cell = f"[yellow]{size_cell}[/yellow]"
-        table.add_row(report.name, str(report.count), size_cell, note)
+        table.add_row(safe(report.name), str(report.count), size_cell, note)
 
     table.add_section()
     table.add_row(
@@ -63,6 +74,50 @@ def render_scan_table(
     console.print(table)
 
 
+def safe(text) -> str:
+    """Make any externally derived string (item descriptions, targets, errors,
+    hints, run ids) safe to embed in rich markup: control, format and bidi
+    characters are shown as escapes and markup brackets are escaped. The single
+    output layer for everything that may come from the registry."""
+    return escape(_visible(str(text)))
+
+
+def registry_notice() -> str:
+    """What may truthfully be promised about registry removal right now; read
+    from ``regpromises`` so every UI changes in one place."""
+    if not regpromises.registry_undo_shipped():
+        return regpromises.PERMANENT_LINE
+    return (
+        "Registry entries are backed up before removal. HKCU entries can be "
+        "restored with `cleanix restore <run>`; HKLM entries are backed up "
+        "too, but restoring them needs an Administrator terminal."
+    )
+
+
+def registry_items(items) -> list:
+    return [i for i in items if i.kind is ItemKind.REGISTRY]
+
+
+def render_registry_items(items: list, console: Console) -> None:
+    """List registry findings with their exact (escaped) targets and evidence."""
+    if not items:
+        return
+    table = Table(title="Registry entries", title_style="cyan")
+    table.add_column("Hive", style="magenta")
+    table.add_column("Target", style="cyan", overflow="fold")
+    table.add_column("What", overflow="fold")
+    table.add_column("Evidence", style="dim", overflow="fold")
+    for i in items:
+        table.add_row(
+            i.reg.hive if i.reg else "",
+            safe(item_target(i)),
+            safe(i.description),
+            safe(i.hint or ""),  # the detectors put their evidence in the hint
+        )
+    console.print(table)
+    console.print(f"[yellow]{safe(registry_notice())}[/yellow]")
+
+
 def render_report_only(result: ScanResult, console: Console) -> None:
     """List report-only findings with manual-removal hints."""
     items = result.report_only_items()
@@ -76,7 +131,7 @@ def render_report_only(result: ScanResult, console: Console) -> None:
     table.add_column("What", style="cyan")
     table.add_column("How to remove", style="dim")
     for i in sorted(items, key=lambda x: x.size, reverse=True):
-        table.add_row(human_size(i.size), i.description, i.hint or "")
+        table.add_row(human_size(i.size), safe(i.description), safe(i.hint or ""))
     console.print(table)
 
 
@@ -90,7 +145,7 @@ def render_clean_summary(result: CleanResult, console: Console) -> None:
     )
     for outcome in result.errors:
         console.print(
-            f"  [red]![/red] {outcome.item.description}: {outcome.error}"
+            f"  [red]![/red] {safe(outcome.item.description)}: {safe(outcome.error)}"
         )
 
 
@@ -128,6 +183,8 @@ def scan_to_dict(result: ScanResult) -> Dict[str, Any]:
                 "name": r.name,
                 "ran": r.ran,
                 "skipped_reason": r.skipped_reason,
+                "incomplete": r.incomplete,
+                "registry": r.cleaner_id in REGISTRY_IDS,
                 "count": r.count,
                 "bytes": r.total_size,
                 "human": human_size(r.total_size),
@@ -140,6 +197,14 @@ def scan_to_dict(result: ScanResult) -> Dict[str, Any]:
                         "requires_root": i.requires_root,
                         "report_only": i.report_only,
                         "hint": i.hint,
+                        # Additive: registry findings carry their target here.
+                        "kind": i.kind.value,
+                        "target": item_target(i),
+                        "registry": (
+                            {"hive": i.reg.hive, "key": i.reg.key,
+                             "value": i.reg.value}
+                            if i.reg is not None else None
+                        ),
                     }
                     for i in r.items
                 ],

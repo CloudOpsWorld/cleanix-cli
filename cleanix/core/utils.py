@@ -5,9 +5,45 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Iterator, Optional, Sequence
+
+
+# macOS: these top-level names are standard symlinks into /private.
+_MACOS_PRIVATE_LINKS = ("/tmp", "/var", "/etc")
+
+
+def canonical_system_path(path: str) -> str:
+    """On macOS map ``/tmp``, ``/var`` and ``/etc`` (standard symlinks into
+    ``/private``) to their real location; unchanged elsewhere."""
+    if sys.platform != "darwin":
+        return path
+    for top in _MACOS_PRIVATE_LINKS:
+        if path == top or path.startswith(top + "/"):
+            return "/private" + path
+    return path
+
+
+def is_trusted_system_dir(path: str | os.PathLike) -> bool:
+    """True if ``path`` is a real directory (not a symlink) owned by root.
+
+    System cleaners call this before listing a base directory that lives in a
+    world-writable tree (``/tmp``, ``/var/tmp``, ``/var/crash`` ...): there an
+    unprivileged user could have created the base as a symlink to, say,
+    ``/etc``, and listing it as root would offer ``/etc/*`` for deletion.
+    """
+    if os.name == "nt":
+        return Path(path).is_dir()
+    import stat as _stat
+
+    p = canonical_system_path(os.path.abspath(str(path)))
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    return _stat.S_ISDIR(st.st_mode) and st.st_uid == 0
 
 
 def human_size(num_bytes: int) -> str:
@@ -39,6 +75,13 @@ def _allocated_bytes(st: os.stat_result) -> int:
 def path_size(path: str | os.PathLike) -> int:
     """Actual on-disk size of a file or directory tree in bytes (best effort)."""
     p = Path(path)
+    win = sys.platform == "win32"
+    if win:
+        # Junctions are not symlinks: never size (or walk into) their target.
+        from cleanix.core import safety as _safety
+
+        if _safety.is_reparse_point(p):
+            return 0
     try:
         if p.is_symlink():
             return 0
@@ -51,6 +94,11 @@ def path_size(path: str | os.PathLike) -> int:
     for root, dirs, files in os.walk(p, onerror=lambda e: None):
         # Do not follow symlinked directories.
         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        if win:
+            dirs[:] = [
+                d for d in dirs
+                if not _safety.is_reparse_point(os.path.join(root, d))
+            ]
         for name in files:
             fp = os.path.join(root, name)
             try:
@@ -126,11 +174,127 @@ def exists(path: str | os.PathLike) -> bool:
 
 
 def which(cmd: str) -> Optional[str]:
+    if sys.platform == "win32":
+        return resolve_executable(cmd)
     return shutil.which(cmd)
 
 
 def has_any(*cmds: str) -> bool:
+    if sys.platform == "win32":
+        return any(resolve_executable(c) for c in cmds)
     return any(shutil.which(c) for c in cmds)
+
+
+# -- Windows executable resolution -------------------------------------------
+# CreateProcess and shutil.which search the *current directory* before
+# System32/PATH, so a bare "Dism.exe" run from an untrusted folder would execute
+# a planted .\Dism.exe (elevated, during a clean). On Windows every command is
+# therefore resolved to an absolute path before it is spawned: the built-in
+# system tools come from GetSystemDirectoryW, everything else from the PATH
+# entries only (never the cwd, never a relative entry).
+
+# Bare name (casefolded, without .exe) -> path relative to the system directory.
+_WIN_SYSTEM_TOOLS = {
+    "powershell": "WindowsPowerShell\\v1.0\\powershell.exe",
+    "dism": "Dism.exe",
+    "schtasks": "schtasks.exe",
+}
+
+_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+
+
+def windows_system_dir() -> str:
+    """The real System32 directory (GetSystemDirectoryW; never the env)."""
+    try:
+        import ctypes
+
+        fn = ctypes.windll.kernel32.GetSystemDirectoryW  # type: ignore[attr-defined]
+        buf = ctypes.create_unicode_buffer(1024)
+        n = fn(buf, 1024)
+        if 0 < n < 1024 and buf.value:
+            return buf.value
+    except Exception:  # noqa: BLE001
+        pass
+    return "C:\\Windows\\System32"
+
+
+def windows_system_tool(name: str, system_dir: Optional[str] = None) -> Optional[str]:
+    """Absolute path of a built-in Windows tool (powershell/Dism/schtasks)."""
+    key = name.lower()
+    if key.endswith(".exe"):
+        key = key[:-4]
+    rel = _WIN_SYSTEM_TOOLS.get(key)
+    if rel is None:
+        return None
+    import ntpath
+
+    return ntpath.join(system_dir or windows_system_dir(), rel)
+
+
+def safe_which(
+    cmd: str,
+    path_entries: Optional[Sequence[str]] = None,
+    pathext: Optional[str] = None,
+    cwd: Optional[str] = None,
+    isfile=os.path.isfile,
+) -> Optional[str]:
+    """``which`` that never searches the current directory.
+
+    Only absolute PATH entries are searched (``''``, ``'.'``, relative entries
+    and the cwd itself are skipped); ``PATHEXT`` is honoured. A ``cmd`` that
+    contains a directory separator is returned as an absolute path only if it is
+    already absolute. Pure apart from ``isfile``; all inputs are injectable.
+    Path rules are the host's (``os.path``); on Windows an absolute entry must
+    also carry a drive (a rooted ``\\dir`` is drive-relative).
+    """
+    pth = os.path
+
+    def _absolute(p: str) -> bool:
+        return pth.isabs(p) and (os.name != "nt" or bool(pth.splitdrive(p)[0]))
+
+    if not cmd:
+        return None
+    if "\\" in cmd or "/" in cmd:
+        if _absolute(cmd) and isfile(cmd):
+            return cmd
+        return None
+    if path_entries is None:
+        path_entries = (os.environ.get("PATH") or "").split(os.pathsep)
+    if pathext is None:
+        pathext = os.environ.get("PATHEXT") or _DEFAULT_PATHEXT
+    if cwd is None:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = ""
+    exts = [e for e in pathext.split(";") if e]
+    if any(cmd.lower().endswith(e.lower()) for e in exts):
+        names = [cmd]
+    else:
+        names = [cmd + e for e in exts]
+    cwd_norm = pth.normcase(pth.normpath(cwd)) if cwd else None
+    for entry in path_entries:
+        entry = entry.strip().strip('"')
+        if not entry or entry == ".":
+            continue
+        # Relative entries resolve against the cwd: skip them too.
+        if not _absolute(entry):
+            continue
+        if cwd_norm and pth.normcase(pth.normpath(entry)) == cwd_norm:
+            continue
+        for name in names:
+            cand = pth.join(entry, name)
+            if isfile(cand):
+                return pth.normpath(cand)
+    return None
+
+
+def resolve_executable(cmd: str) -> Optional[str]:
+    """Absolute path for ``cmd`` on Windows, or ``None`` if not found safely."""
+    tool = windows_system_tool(cmd)
+    if tool is not None:
+        return tool if os.path.isfile(tool) else None
+    return safe_which(cmd)
 
 
 def is_broken_symlink(path: str | os.PathLike) -> bool:
@@ -146,10 +310,43 @@ _PRUNE_DIRS = {
 }
 
 
+def walk_no_reparse(root: str | os.PathLike):
+    """``os.walk`` (errors ignored) that on Windows never descends into a
+    junction or other reparse point. Identical to ``os.walk`` elsewhere."""
+    win = sys.platform == "win32"
+    if win:
+        from cleanix.core import safety as _safety
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+        if win:
+            dirnames[:] = [
+                d for d in dirnames
+                if not _safety.is_reparse_point(os.path.join(dirpath, d))
+            ]
+        yield dirpath, dirnames, filenames
+
+
 def walk_pruned(root: str | os.PathLike, prune: Optional[set] = None):
     """os.walk a tree, skipping large/irrelevant subdirectories and errors."""
+    default_prune = prune is None
     prune = prune if prune is not None else _PRUNE_DIRS
+    # On Windows junctions are not symlinks, so os.path.islink misses them;
+    # skip every reparse point to avoid loops such as ``Application Data``.
+    from cleanix.core import platform as _plat
+
+    win = _plat.is_windows()
+    if win:
+        from cleanix.core import safety as _safety
+
+        if default_prune:
+            # Windows-only: AppData holds app state, not user files. Kept out
+            # of _PRUNE_DIRS so POSIX walks (e.g. a Wine prefix) are unchanged.
+            prune = prune | {"AppData"}
     for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+        if win:
+            dirnames[:] = [
+                d for d in dirnames
+                if not _safety.is_reparse_point(os.path.join(dirpath, d))
+            ]
         dirnames[:] = [
             d
             for d in dirnames
@@ -159,6 +356,10 @@ def walk_pruned(root: str | os.PathLike, prune: Optional[set] = None):
 
 
 def is_root() -> bool:
+    if sys.platform == "win32":
+        from cleanix.core import winenv
+
+        return winenv.is_admin()
     return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
@@ -228,7 +429,14 @@ def run_command(
     """Run a command, returning ``(returncode, stdout, stderr)``.
 
     Never raises on a non-zero exit; callers inspect the return code.
+    On Windows ``command[0]`` is resolved to an absolute path first (see
+    :func:`resolve_executable`) so the current directory is never searched.
     """
+    if sys.platform == "win32" and command:
+        exe = resolve_executable(str(command[0]))
+        if exe is None:
+            return 127, "", f"command not found: {command[0]}"
+        command = [exe, *list(command)[1:]]
     try:
         proc = subprocess.run(
             list(command),

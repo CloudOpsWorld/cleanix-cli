@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import shutil
 
-from cleanix.core.platform import is_bsd, is_macos
+from cleanix.core.platform import is_bsd, is_macos, is_windows
 
 
 def backend():
     """Return the scheduling backend module for the current OS."""
+    if is_windows():
+        from cleanix.scheduler import schtasks
+
+        return schtasks
     if is_macos():
         from cleanix.scheduler import launchd
 

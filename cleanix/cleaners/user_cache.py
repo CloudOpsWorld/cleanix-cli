@@ -42,6 +42,7 @@ _SKIP = {
 
 class UserCacheCleaner(Cleaner):
     id = "user_cache"
+    safe_default = True
     name = "User cache (~/.cache)"
     description = "Assorted application caches under ~/.cache"
     requires_root = False

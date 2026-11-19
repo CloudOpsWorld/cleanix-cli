@@ -32,6 +32,15 @@ from cleanix.cleaners.big_files import BigFileReporter
 from cleanix.cleaners.downloads import DownloadsReporter
 from cleanix.cleaners.browser_profiles import BrowserProfileReporter
 from cleanix.cleaners.duplicates import DuplicateFileReporter
+from cleanix.cleaners.orphan_app_data import OrphanAppDataReporter
+from cleanix.cleaners.orphan_files import UnownedSystemFilesReporter
+from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
+from cleanix.cleaners.stale_launchers import (
+    BrokenAlternativesReporter,
+    StaleDesktopEntryReporter,
+)
+from cleanix.cleaners.stale_receipts import StaleReceiptReporter
+from cleanix.cleaners.stale_services import StaleSystemdUnitReporter
 
 # Logs / crashes
 from cleanix.cleaners.logs import JournalCleaner, RotatedLogCleaner
@@ -163,6 +172,36 @@ from cleanix.cleaners.bsd import (
     PkginCleaner,
 )
 
+# Windows
+from cleanix.cleaners.windows_core import (
+    WinErrorReportingCleaner,
+    WinRecycleBinCleaner,
+    WinTempCleaner,
+    WinThumbnailCleaner,
+)
+from cleanix.cleaners.windows_system import (
+    WinComponentStoreCleaner,
+    WinPrefetchReporter,
+    WinSystemDumpsCleaner,
+    WinSystemTempCleaner,
+    WinUpdateCacheCleaner,
+    WindowsOldReporter,
+)
+from cleanix.cleaners.windows_wsl import WslDiskReporter
+from cleanix.cleaners.windows_apps import (
+    WinBrowserCacheCleaner,
+    WinPackageCacheCleaner,
+    WinShaderCacheCleaner,
+    WinVisualStudioCleaner,
+)
+
+# Windows registry detectors (opt-in)
+from cleanix.cleaners.winreg_uninstall import WinRegUninstall
+from cleanix.cleaners.winreg_app_paths import WinRegAppPaths
+from cleanix.cleaners.winreg_file_assoc import WinRegFileAssoc
+from cleanix.cleaners.winreg_startup import WinRegStartup
+from cleanix.cleaners.winreg_shared_dlls import WinRegSharedDlls
+
 ALL_CLEANERS: List[Type[Cleaner]] = [
     # Cross-platform user junk
     TrashCleaner,
@@ -263,6 +302,14 @@ ALL_CLEANERS: List[Type[Cleaner]] = [
     DownloadsReporter,
     BrowserProfileReporter,
     DuplicateFileReporter,
+    # System-wide orphan reports (report-only)
+    UnownedSystemFilesReporter,
+    StaleSystemdUnitReporter,
+    StaleDesktopEntryReporter,
+    BrokenAlternativesReporter,
+    OrphanLaunchJobReporter,
+    OrphanAppDataReporter,
+    StaleReceiptReporter,
     # macOS extras
     MacExtraCachesCleaner,
     MacContainerCacheCleaner,
@@ -276,6 +323,28 @@ ALL_CLEANERS: List[Type[Cleaner]] = [
     HomebrewCleaner,
     MacPortsCleaner,
     XcodeCleaner,
+    # Windows
+    WinTempCleaner,
+    WinThumbnailCleaner,
+    WinErrorReportingCleaner,
+    WinRecycleBinCleaner,
+    WinSystemTempCleaner,
+    WinUpdateCacheCleaner,
+    WinSystemDumpsCleaner,
+    WinPrefetchReporter,
+    WindowsOldReporter,
+    WinComponentStoreCleaner,
+    WinBrowserCacheCleaner,
+    WinShaderCacheCleaner,
+    WinPackageCacheCleaner,
+    WinVisualStudioCleaner,
+    WslDiskReporter,
+    # Windows registry (opt-in; always backed up first)
+    WinRegUninstall,
+    WinRegAppPaths,
+    WinRegFileAssoc,
+    WinRegStartup,
+    WinRegSharedDlls,
     # BSD
     FreeBsdPkgCleaner,
     BsdDistfilesCleaner,

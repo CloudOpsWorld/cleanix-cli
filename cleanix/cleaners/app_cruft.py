@@ -14,7 +14,8 @@ from typing import Iterable
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
-from cleanix.core.platform import LINUX, MACOS, XDG_PLATFORMS
+from cleanix.core import platform, winenv
+from cleanix.core.platform import LINUX, MACOS, WINDOWS, XDG_PLATFORMS
 from cleanix.core.utils import config_dir
 from cleanix.core.utils import home, iter_children, path_size
 
@@ -43,15 +44,38 @@ _SKIP_APPS = {
     "microsoft-edge", "opera", "google-chrome-beta", "chromium-dev",
 }
 
+# Windows Roaming dirs owned by browsers (compared case-insensitively).
+_WIN_SKIP_APPS = {"bravesoftware", "opera software", "mozilla", "microsoft"}
+
 
 class ElectronCacheCleaner(Cleaner):
     id = "electron_cache"
+    safe_default = True
     name = "Electron/Chromium app caches"
     description = "Rebuildable Cache/GPUCache/Code Cache from Electron apps"
     requires_root = False
-    platforms = XDG_PLATFORMS
+    platforms = (*XDG_PLATFORMS, WINDOWS)
 
     def _config_roots(self) -> Iterable[Path]:
+        if platform.is_windows():
+            roaming = winenv.roaming_appdata()
+            if roaming.is_dir():
+                for app in iter_children(roaming):
+                    low = app.name.lower()
+                    if low == "microsoft":
+                        # Roaming\Microsoft holds Office/Windows state (and
+                        # Edge); only classic Teams is an Electron app here.
+                        for sub in iter_children(app):
+                            if sub.name.lower() == "teams" and sub.is_dir():
+                                yield sub
+                        continue
+                    if (
+                        app.is_dir()
+                        and low not in _WIN_SKIP_APPS
+                        and low not in {n.lower() for n in _SKIP_APPS}
+                    ):
+                        yield app
+            return
         cfg = config_dir()
         if cfg.is_dir():
             for app in iter_children(cfg):
@@ -103,6 +127,7 @@ class FlatpakAppCacheCleaner(Cleaner):
 
 class GpuShaderCacheCleaner(Cleaner):
     id = "gpu_shader_cache"
+    safe_default = True
     name = "GPU shader caches"
     description = "Mesa/NVIDIA/RADV shader caches (rebuilt after driver changes)"
     requires_root = False
@@ -172,12 +197,16 @@ class SteamCleaner(Cleaner):
 
 class JetBrainsCleaner(Cleaner):
     id = "jetbrains"
+    safe_default = True
     name = "JetBrains IDE caches"
     description = "Caches, logs, and indexes for IntelliJ/PyCharm/etc."
     requires_root = False
-    platforms = (LINUX, MACOS, *XDG_PLATFORMS)
+    platforms = (LINUX, MACOS, *XDG_PLATFORMS, WINDOWS)
 
     def _roots(self) -> Iterable[Path]:
+        if platform.is_windows():
+            yield winenv.local_appdata() / "JetBrains"
+            return
         # Linux/BSD: ~/.cache/JetBrains/<Product>/{caches,log,index,...}
         yield home() / ".cache" / "JetBrains"
         # macOS: ~/Library/Caches/JetBrains and ~/Library/Logs/JetBrains

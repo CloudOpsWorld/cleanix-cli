@@ -60,6 +60,12 @@ class Cleaner(abc.ABC):
     # when explicitly requested via ``--only`` (e.g. the memory cleaners, whose
     # effect is transient and shouldn't happen on every run).
     default_enabled: bool = True
+    # Set by the registry when ``--only`` forces a cleaner on Windows that does
+    # not support Windows: scan() then skips it instead of running POSIX logic.
+    unsupported_platform: bool = False
+    # True only for cleaners reviewed as safe to pre-select in a GUI's Simple
+    # mode. Default False so unreviewed cleaners are never pre-selected.
+    safe_default: bool = False
 
     def __init__(self, config: Config):
         self.config = config
@@ -136,8 +142,9 @@ class Cleaner(abc.ABC):
         *,
         size: int = 0,
         requires_root: Optional[bool] = None,
+        timeout: Optional[int] = None,
     ) -> CleanableItem:
-        """Build a COMMAND item."""
+        """Build a COMMAND item (``timeout`` in seconds; None = default)."""
         return CleanableItem(
             cleaner_id=self.id,
             description=description,
@@ -147,6 +154,7 @@ class Cleaner(abc.ABC):
             requires_root=self.requires_root
             if requires_root is None
             else requires_root,
+            timeout=timeout,
         )
 
     # -- engine entry point --------------------------------------------------
@@ -156,6 +164,9 @@ class Cleaner(abc.ABC):
         report = CleanerReport(
             cleaner_id=self.id, name=self.name, description=self.description
         )
+        if self.unsupported_platform:
+            report.skipped_reason = "not supported on this platform"
+            return report
         reason = self.available()
         if reason:
             report.skipped_reason = reason

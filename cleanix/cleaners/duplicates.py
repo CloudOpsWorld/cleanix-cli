@@ -30,7 +30,7 @@ from typing import Dict, Iterable, List
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
-from cleanix.core.platform import ALL
+from cleanix.core.platform import ALL, WINDOWS
 from cleanix.core.utils import home, human_size, modified_within, walk_pruned
 
 # A file touched within the last few minutes may still be growing (a download in
@@ -80,7 +80,7 @@ class DuplicateFileReporter(Cleaner):
     name = "Duplicate files"
     description = "Identical large files in your home directory (report only)"
     requires_root = False
-    platforms = (ALL,)
+    platforms = (ALL, WINDOWS)
 
     def find_items(self) -> Iterable[CleanableItem]:
         min_bytes = int(

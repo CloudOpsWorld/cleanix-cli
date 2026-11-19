@@ -14,6 +14,11 @@ from typing import List
 
 
 def _config_path() -> Path:
+    from cleanix.core import platform as plat
+    from cleanix.core import winenv
+
+    if plat.is_windows():
+        return winenv.roaming_appdata() / "cleanix" / "config.yaml"
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     return Path(base) / "cleanix" / "config.yaml"
 
@@ -132,6 +137,12 @@ class Config:
     dup_min_size_mb: float = 10.0
     dup_top_n: int = 50
 
+    # Report-only orphan scans (Linux/macOS): per-cleaner caps on findings and
+    # wall-clock time, and how long Mac app data must sit untouched.
+    orphan_max_items: int = 200
+    orphan_max_seconds: float = 60.0
+    orphan_min_age_days: float = 30.0
+
     @classmethod
     def load(cls, path: str | os.PathLike | None = None) -> "Config":
         """Load config, layering a YAML file over the defaults if present."""
@@ -146,7 +157,7 @@ class Config:
             return cfg
 
         try:
-            data = yaml.safe_load(cfg_path.read_text()) or {}
+            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig")) or {}
         except (OSError, yaml.YAMLError):
             return cfg
 
@@ -190,6 +201,9 @@ FIELD_HELP = {
     "browser_profile_stale_days": "Report browser profiles idle N+ days (report only)",
     "dup_min_size_mb": "Only compare files in $HOME at least this large (MiB)",
     "dup_top_n": "Report at most the N largest duplicate groups",
+    "orphan_max_items": "Report at most N orphan findings per cleaner",
+    "orphan_max_seconds": "Stop an orphan scan after N seconds",
+    "orphan_min_age_days": "Orphan data (Mac app data, unowned files) must be untouched N days to be reported",
 }
 
 
@@ -239,7 +253,7 @@ def read_user_overrides(path: str | os.PathLike | None = None) -> dict:
     try:
         import yaml
 
-        return yaml.safe_load(cfg_path.read_text()) or {}
+        return yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig")) or {}
     except Exception:  # noqa: BLE001
         return {}
 
@@ -254,7 +268,10 @@ def write_user_override(key: str, value, path: str | os.PathLike | None = None) 
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     data = read_user_overrides(cfg_path)
     data[key] = value
-    cfg_path.write_text(yaml.safe_dump(data, default_flow_style=False, sort_keys=True))
+    cfg_path.write_text(
+        yaml.safe_dump(data, default_flow_style=False, sort_keys=True),
+        encoding="utf-8",
+    )
     return cfg_path
 
 
@@ -267,7 +284,10 @@ def remove_user_override(key: str, path: str | os.PathLike | None = None) -> boo
     if key not in data:
         return False
     del data[key]
-    cfg_path.write_text(yaml.safe_dump(data, default_flow_style=False, sort_keys=True))
+    cfg_path.write_text(
+        yaml.safe_dump(data, default_flow_style=False, sort_keys=True),
+        encoding="utf-8",
+    )
     return True
 
 

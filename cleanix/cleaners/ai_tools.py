@@ -19,6 +19,8 @@ from typing import Iterable, Set
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.context import current_user
 from cleanix.core.models import CleanableItem
+from cleanix.core import platform as _plat
+from cleanix.core.platform import ALL, WINDOWS
 from cleanix.core.utils import (
     home,
     iter_children,
@@ -34,6 +36,7 @@ class OllamaCleaner(Cleaner):
     name = "Ollama dangling blobs"
     description = "Orphaned model blobs from interrupted pulls, plus logs"
     requires_root = False
+    platforms = (ALL, WINDOWS)
 
     def _models_dir(self) -> Path:
         # Honor the env override only for the user who launched cleanix; when
@@ -99,6 +102,7 @@ class HuggingFaceCleaner(Cleaner):
     name = "Hugging Face cache junk"
     description = "Incomplete downloads and stale lock files (keeps models)"
     requires_root = False
+    platforms = (ALL, WINDOWS)
 
     def _roots(self) -> Iterable[Path]:
         base = os.environ.get("HF_HOME")
@@ -136,6 +140,7 @@ class AICompileCacheCleaner(Cleaner):
     name = "AI compile/kernel caches"
     description = "Triton, torch.compile/inductor, vLLM, CUDA JIT kernel caches"
     requires_root = False
+    platforms = (ALL, WINDOWS)
 
     def _candidates(self):
         h = home()
@@ -147,7 +152,8 @@ class AICompileCacheCleaner(Cleaner):
         yield h / ".nv" / "ComputeCache", "CUDA compute (PTX JIT) cache"
         yield cache / "flashinfer", "FlashInfer JIT cache"
         yield cache / "tfhub_modules", "TensorFlow Hub module cache"
-        if user:
+        # /tmp is drive-relative on Windows (and not where these live there).
+        if user and not _plat.is_windows():
             yield Path("/tmp") / f"torchinductor_{user}", "TorchInductor cache (/tmp)"
             yield Path("/tmp") / f"triton_{user}", "Triton cache (/tmp)"
 
@@ -167,6 +173,7 @@ class AIClientCleaner(Cleaner):
     name = "AI client leftovers"
     description = "Logs & rebuildable indexes for LM Studio, Jan, Continue, Claude"
     requires_root = False
+    platforms = (ALL, WINDOWS)
 
     def _candidates(self):
         h = home()
@@ -198,6 +205,7 @@ class AiderLitterCleaner(Cleaner):
     name = "Aider project litter"
     description = "Stray .aider.* history/cache files left in project folders"
     requires_root = False
+    platforms = (ALL, WINDOWS)
 
     _NAMES = (
         ".aider.chat.history.md",

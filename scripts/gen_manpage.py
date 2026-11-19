@@ -48,17 +48,25 @@ def main() -> int:
         f'.TH CLEANIX 1 "{date}" "cleanix {__version__}" "User Commands"'
     )
     out.append(".SH NAME")
-    out.append("cleanix \\- safe, thorough cross-platform *nix system cleaner")
+    out.append("cleanix \\- safe, thorough cross-platform system cleaner")
     out.append(".SH SYNOPSIS")
     out.append(".B cleanix")
     out.append("[\\fICOMMAND\\fR] [\\fIOPTIONS\\fR]")
     out.append(".SH DESCRIPTION")
     out.append(
-        "cleanix analyzes and reclaims disk space across Linux, macOS and the "
-        "BSDs. It scans read\\-only, previews every removal, funnels all "
+        "cleanix analyzes and reclaims disk space across Linux, macOS, the "
+        "BSDs and Windows. It scans read\\-only, previews every removal, funnels all "
         "deletions through a protected\\-path safety guard, and only deletes "
         "after confirmation. Report\\-only findings are surfaced but never "
         "auto\\-deleted."
+    )
+    out.append(
+        ".PP\nAn optional desktop interface is started with \\fBcleanix gui\\fR "
+        "(or \\fBcleanix\\-gui\\fR). It needs the \\fIgui\\fR extra "
+        "(\\fBpip install \"cleanix\\-cli[gui]\"\\fR); without it, \\fBcleanix gui\\fR "
+        "prints that hint and exits with status 1. Items that need administrator "
+        "rights are removed by a separate helper after one operating\\-system "
+        "prompt (UAC, pkexec or the macOS password dialog), permanently."
     )
     out.append(".SH COMMANDS")
 

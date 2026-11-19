@@ -17,7 +17,7 @@ from typing import Iterable
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
-from cleanix.core.platform import ALL
+from cleanix.core.platform import ALL, WINDOWS
 from cleanix.core.utils import home, human_size, iter_children, older_than, path_size
 
 # Extensions that are almost always disposable downloads once stale: OS/app
@@ -48,7 +48,7 @@ class DownloadsReporter(Cleaner):
     name = "Stale downloads"
     description = "Old, large files in ~/Downloads (report only — never deleted)"
     requires_root = False
-    platforms = (ALL,)
+    platforms = (ALL, WINDOWS)
 
     def find_items(self) -> Iterable[CleanableItem]:
         downloads = home() / "Downloads"

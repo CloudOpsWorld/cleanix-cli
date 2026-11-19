@@ -11,12 +11,12 @@ from cleanix.core.registry import known_ids
 
 SUBCOMMANDS = [
     "list", "scan", "clean", "info", "stats", "restore", "quarantine",
-    "config", "schedule", "factory-reset", "completion",
+    "config", "schedule", "factory-reset", "completion", "gui",
 ]
 SCAN_CLEAN_OPTS = [
     "--only", "--exclude", "--json", "--output", "--quiet", "--summary",
     "--sort", "--top", "--all-users", "--current-user", "--min-uid",
-    "--execute", "--yes", "--quarantine",
+    "--execute", "--yes", "--quarantine", "--registry",
 ]
 
 
@@ -58,6 +58,8 @@ _cleanix() {{
             fi;;
         quarantine)
             COMPREPLY=( $(compgen -W "list empty" -- "$cur") );;
+        restore)
+            COMPREPLY=( $(compgen -W "--yes" -- "$cur") );;
         schedule)
             COMPREPLY=( $(compgen -W "install uninstall status --frequency" -- "$cur") );;
         factory-reset)
@@ -93,6 +95,7 @@ _cleanix() {{
             if (( CURRENT == 3 )); then _values 'action' list get set unset path
             else _values 'key' $cfgkeys; fi;;
         quarantine) _values 'action' list empty;;
+        restore) _values 'option' --yes;;
         schedule) _values 'action' install uninstall status;;
         completion) _values 'shell' bash zsh fish;;
     esac
@@ -119,6 +122,9 @@ def fish_script() -> str:
     lines.append(
         'complete -c cleanix -n "__fish_seen_subcommand_from config" '
         f'-a "list get set unset path {_keys()}"'
+    )
+    lines.append(
+        'complete -c cleanix -n "__fish_seen_subcommand_from restore" -l yes'
     )
     lines.append(
         'complete -c cleanix -n "__fish_seen_subcommand_from completion" '

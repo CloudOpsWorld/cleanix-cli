@@ -21,9 +21,10 @@ OPENBSD = "openbsd"
 NETBSD = "netbsd"
 DRAGONFLY = "dragonfly"
 SUNOS = "sunos"      # Solaris / illumos
+WINDOWS = "windows"
 UNKNOWN = "unknown"
 
-ALL = "*"            # sentinel: cleaner applies to every platform
+ALL = "*"            # every POSIX platform; Windows must opt in
 
 BSD: Set[str] = {FREEBSD, OPENBSD, NETBSD, DRAGONFLY}
 
@@ -49,6 +50,8 @@ def current_os() -> str:
         return DRAGONFLY
     if system == "sunos":
         return SUNOS
+    if system == "windows":
+        return WINDOWS
     return UNKNOWN
 
 
@@ -102,9 +105,15 @@ def is_macos() -> bool:
     return current_os() == MACOS
 
 
+def is_windows() -> bool:
+    return current_os() == WINDOWS
+
+
 def supports(platforms: Iterable[str]) -> bool:
     """True if a cleaner declaring ``platforms`` applies to this machine."""
     plats = set(platforms)
+    if current_os() == WINDOWS:
+        return WINDOWS in plats
     return ALL in plats or current_os() in plats
 
 
