@@ -183,6 +183,7 @@ def test_table_type_and_target_columns_registry():
 
 
 def test_quarantine_panel_shows_registry_count_and_reasons(qtbot, monkeypatch):
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", True)
     runs = [{"run_id": "r1", "created": 1700000000, "count": 5, "size": 10,
              "registry": 2, "registry_admin": 1},
             {"run_id": "r2", "created": 1700000001, "count": 3, "size": 0}]
@@ -205,8 +206,8 @@ def test_quarantine_panel_shows_registry_count_and_reasons(qtbot, monkeypatch):
 
 def test_unshipped_undo_says_registry_is_permanent():
     assert regpromises.registry_undo_shipped() is False
-    line = ("Registry entries are removed permanently: no backup or restore is "
-            "available in this version.")
+    line = regpromises.PERMANENT_LINE
+    assert "restoring registry entries is not supported in this version yet" in line
     u, h = reg_item("HKCU", "A"), reg_item("HKLM", "B")
     files = CleanableItem("temp", "x", size=5, path="/tmp/x")
     for items in ([u], [h], [u, h], [files, u, h]):
@@ -294,3 +295,21 @@ def test_power_tree_registry_group_badge_category_and_size(mixed_view):
     assert g.category == "registry" and g.safety is curation.Safety.REVIEW
     tree.expandItem(reg)
     assert reg.child(0).text(4) == "-"
+
+
+def test_quarantine_panel_notes_disabled_registry_restore(qtbot, monkeypatch):
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", False)
+    runs = [{"run_id": "r1", "created": 1700000000, "count": 5, "size": 10,
+             "registry": 2, "registry_admin": 0}]
+    monkeypatch.setattr(quarantine, "list_runs", lambda: list(runs))
+    monkeypatch.setattr(quarantine, "restore", lambda rid: {
+        "restored": ["a"], "failed": [],
+        "not_restored": [("HKCU\\x","not restored: registry restore is not enabled in this version (backup files are in d)")]})
+    p = QuarantinePanel(confirm=lambda m: True)
+    qtbot.addWidget(p)
+    p.refresh()
+    assert "registry restore not enabled" in p.table.item(0, 2).text()
+    p.table.selectRow(0)
+    p._on_restore()
+    t = p.status_label.text()
+    assert "1 restored, 0 failed" in t and "registry restore is not enabled" in t

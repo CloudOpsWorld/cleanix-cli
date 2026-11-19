@@ -38,11 +38,12 @@ to see every platform's cleaners.
 ## Windows notes
 
 - Config is `%APPDATA%\cleanix\config.yaml`; state, history and quarantine live
-  under `%LOCALAPPDATA%\cleanix`. Cleanix touches the registry only through
-  the five opt-in registry cleaners (see
+  under `%LOCALAPPDATA%\cleanix`. Cleanix deletes registry entries only
+  through the five opt-in registry cleaners (see
   [Windows registry cleaners](#windows-registry-cleaners-opt-in)): they are
-  never part of a normal scan or clean, never run from the scheduled scan, and
-  every other cleaner leaves the registry alone.
+  never part of a normal scan or clean and never run from the scheduled scan.
+  (It also stores its GUI settings under `HKCU\Software\Cleanix` and reads the
+  profile list; no other cleaner touches the registry.)
 - Items that need admin rights (`win_system_temp`, `win_update_cache`,
   `win_system_dumps`, DISM) require an **elevated terminal** (Run as
   administrator); otherwise they are skipped with a note.
@@ -449,9 +450,9 @@ These are always permanent and cannot be undone:
 Registry entries (Windows, Power mode only; Simple mode never cleans them) are
 backed up in every case, but the Undo promise for them is **gated**: until the
 checks in [docs/registry-cleanup-verification.md](docs/registry-cleanup-verification.md)
-have been run on a real Windows machine, the GUI and the CLI say that registry
-entries are removed permanently and that no backup or restore is available in
-this version. Once the promise is switched on, per-user (`HKCU`) entries can be
+have been run on a real Windows machine, the GUI and the CLI say that restoring
+registry entries is not supported yet (the backup files are kept), and Restore
+does not touch the registry. Once the promise is switched on, per-user (`HKCU`) entries can be
 restored from the Quarantine tab or with `cleanix restore <run>`, and
 machine-wide (`HKLM`) entries only from an Administrator terminal (never from
 the GUI).
@@ -681,7 +682,7 @@ to type `yes` (`--yes` is accepted only together with an explicit run id).
 
 What the CLI promises about backups follows what this version ships (see
 "Undo status" below). While registry undo is not shipped, the CLI says registry
-entries are removed permanently and no backup or restore is available. Once
+entries have a backup written but that restoring them is not supported yet. Once
 shipped, `HKCU` entries are backed up before removal and can be restored with
 `cleanix restore <run>`; `HKLM` entries are backed up too, but restoring them
 needs an Administrator terminal.
@@ -740,9 +741,13 @@ that pin the `KEY_WOW64_64KEY` flag. Until the manual
 verification in
 [docs/registry-cleanup-verification.md](docs/registry-cleanup-verification.md)
 has passed, the switch `UNDO_SHIPPED` in `cleanix/core/regpromises.py` stays
-`False` and every user-visible message says: "Registry entries are removed
-permanently: no backup or restore is available in this version." The files are
-still written and kept in the quarantine run; they are simply not promised.
+`False`. Every user-visible message then says: "A backup of each removed
+registry entry is written to the quarantine folder, but restoring registry
+entries is not supported in this version yet; to restore one manually, inspect
+the .reg file and import it with reg import ... /reg:64." `cleanix restore` and
+the GUI Quarantine tab restore file entries as usual but do **not** run the
+registry restore: they report "not restored: registry restore is not enabled in
+this version (backup files are in ...)" and keep the run.
 
 **Restoring.** `HKCU` entries: `cleanix restore <run>`, or Restore in the GUI's
 Quarantine tab. `HKLM` entries only from an **Administrator terminal**, never

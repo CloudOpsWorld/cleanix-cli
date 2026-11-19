@@ -490,7 +490,10 @@ def restore(run_id: str, *, allow_machine_restore: bool = False) -> Dict:
     if not data:
         raise FileNotFoundError(f"no quarantine run '{run_id}'")
 
+    from cleanix.core import regpromises
+
     restored, failed = [], []
+    not_restored = []
     skipped = 0
     for item in _items_of(data):
         if not isinstance(item, dict):
@@ -500,6 +503,16 @@ def restore(run_id: str, *, allow_machine_restore: bool = False) -> Dict:
         if kind == "registry":
             if item.get("deleted") is False:
                 skipped += 1  # never deleted: nothing to restore, keep its backup
+                continue
+            if not regpromises.registry_undo_shipped():
+                # The registry write path is unverified on real Windows: never
+                # run it. Not a failure; file entries restore as before and
+                # the run (with its backup files) is kept.
+                skipped += 1
+                not_restored.append((
+                    item.get("original", "?"),
+                    regpromises.restore_disabled_text(run_dir / "registry"),
+                ))
                 continue
             ok, text = _restore_registry(run_dir, run_id, item, allow_machine_restore)
             if ok:
@@ -529,7 +542,10 @@ def restore(run_id: str, *, allow_machine_restore: bool = False) -> Dict:
     # nothing failed, and no entry with a kept backup was skipped.
     if restored and not failed and not skipped:
         shutil.rmtree(run_dir, ignore_errors=True)
-    return {"restored": restored, "failed": failed}
+    out = {"restored": restored, "failed": failed}
+    if not_restored:  # only while the registry restore gate is closed
+        out["not_restored"] = not_restored
+    return out
 
 
 def _backup_json(run_dir: Path, item: Dict) -> Path:

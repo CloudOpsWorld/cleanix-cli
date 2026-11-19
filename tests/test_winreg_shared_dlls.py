@@ -140,6 +140,7 @@ def test_huge_container_is_bounded(fake_registry, monkeypatch):
     fake_registry.add_key("HKLM", CV, vals)
     det, prober = make({})
     report = det.scan()
+    assert report.skipped_reason is None, report.skipped_reason
     names = [i.reg.value for i in report.items]
     # the first ten in sorted order, and the cut is announced
     assert names == [rf"C:\Gone\f{i:03}.dll" for i in range(10)]
@@ -153,6 +154,7 @@ def test_complete_scan_has_no_incomplete_note(fake_registry):
     fake_registry.add_key("HKLM", CV, {GONE: (REG_DWORD, 1)})
     det, _ = make({})
     report = det.scan()
+    assert report.skipped_reason is None, report.skipped_reason
     assert len(report.items) == 1 and report.incomplete is None
 
 
@@ -163,6 +165,7 @@ def test_checked_cap_announced(fake_registry, monkeypatch):
     )
     det, _ = make({}, default=P)
     report = det.scan()
+    assert report.skipped_reason is None, report.skipped_reason
     assert report.items == [] and report.incomplete
 
 
@@ -184,6 +187,7 @@ def test_deadline_stops_and_announces(fake_registry, monkeypatch):
     )
     det, _ = make({})
     report = det.scan()
+    assert report.skipped_reason is None, report.skipped_reason
     assert 0 < len(report.items) < 100
     assert report.incomplete and "time" in report.incomplete
 

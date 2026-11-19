@@ -668,3 +668,14 @@ def test_stub_detectors_use_the_base_context():
     for cls in ALL_CLEANERS:
         if cls.id in catalog.REGISTRY_IDS:
             assert cls.context is RegistryDetector.context, cls.__name__
+
+
+def test_no_registry_copy_promises_a_backup_or_restore_while_undo_is_off():
+    from cleanix.core import catalog, curation, regpromises
+
+    assert regpromises.registry_undo_shipped() is False
+    for cid in catalog.REGISTRY_IDS:
+        c = curation.COPY[cid]
+        text = " ".join(str(getattr(c, f, "")) for f in c.__dataclass_fields__).casefold()
+        for word in ("backup", "restore", "undo", "back up"):
+            assert word not in text, (cid, word)

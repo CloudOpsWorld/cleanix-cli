@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from cleanix.core import history, quarantine
+from cleanix.core import history, quarantine, regpromises
 from cleanix.core.utils import human_size
 
 _MAX_ERRORS_SHOWN = 3
@@ -123,6 +123,8 @@ class QuarantinePanel(QWidget):
             items = str(r.get("count", 0))
             if r.get("registry", 0) > 0:
                 items += f" ({r['registry']} registry)"
+                if not regpromises.registry_undo_shipped():
+                    items += " - registry restore not enabled"
             self.table.setItem(row, 2, _item(items, True))
             self.table.setItem(row, 3, _item(human_size(r.get("size", 0)), True))
         total = sum(r.get("size", 0) for r in runs)
@@ -174,6 +176,11 @@ class QuarantinePanel(QWidget):
             return
         restored, failed = len(result.get("restored", [])), result.get("failed", [])
         text = f"{restored} restored, {len(failed)} failed."
+        held = result.get("not_restored", [])
+        if held:
+            text += (f" {len(held)} registry entr{'y' if len(held) == 1 else 'ies'} "
+                     "not restored: registry restore is not enabled in this "
+                     "version (the backup files stay in the run).")
         if failed:
             text += " " + self._errors_text([f"{p} ({why})" for p, why in failed])
         self.status_label.setText(text)

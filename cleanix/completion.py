@@ -124,6 +124,9 @@ def fish_script() -> str:
         f'-a "list get set unset path {_keys()}"'
     )
     lines.append(
+        'complete -c cleanix -n "__fish_seen_subcommand_from restore" -l yes'
+    )
+    lines.append(
         'complete -c cleanix -n "__fish_seen_subcommand_from completion" '
         '-a "bash zsh fish"'
     )

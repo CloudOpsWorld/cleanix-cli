@@ -1075,8 +1075,11 @@ def cmd_restore(args: argparse.Namespace, console: Console) -> int:
     # Machine-wide (HKLM) registry entries: show exactly what would be
     # written and get an explicit confirmation before allowing it.
     allow_machine = False
+    from cleanix.core import regpromises
+
     info = next((r for r in quarantine.list_runs() if r["run_id"] == run_id), None)
-    if info and info.get("registry_admin"):
+    if (info and info.get("registry_admin")
+            and regpromises.registry_undo_shipped()):
         if not _is_elevated():
             console.print(
                 "[yellow]This run contains machine-wide (HKLM) registry "
@@ -1131,6 +1134,8 @@ def cmd_restore(args: argparse.Namespace, console: Console) -> int:
     )
     for path, why in res["failed"]:
         console.print(f"  [red]![/red] {safe(path)}: {safe(why)}")
+    for path, why in res.get("not_restored", []):
+        console.print(f"  [yellow]-[/yellow] {safe(path)}: {safe(why)}")
     return 0 if not res["failed"] else 2
 
 

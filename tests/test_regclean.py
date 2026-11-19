@@ -18,6 +18,7 @@ from cleanix.core import (
     history,
     quarantine,
     regclean,
+    regpromises,
     regsnap,
     safety,
     service,
@@ -56,6 +57,9 @@ def state(tmp_path, monkeypatch):
     # On Windows is_root() is winenv.is_admin(); keep that on every OS so the
     # tests that fake an elevated Windows process behave the same on Linux.
     monkeypatch.setattr(engine_mod, "is_root", lambda: winenv.is_admin())
+    # These tests exercise the registry restore path itself, which only runs
+    # once the Undo promise is switched on (see the gate tests below).
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", True)
     return tmp_path
 
 
@@ -266,6 +270,7 @@ def test_failed_manifest_save_keeps_earlier_entries_restorable(
     monkeypatch.undo()
     monkeypatch.setattr(quarantine, "quarantine_root", lambda: state / "q")
     monkeypatch.setattr(winenv, "is_admin", lambda: False)
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", True)  # undo() reverted the fixture's
     row, = quarantine.list_runs()
     assert row["registry"] == 1
     res = quarantine.restore(run.run_id)
@@ -926,7 +931,10 @@ def test_elsewhere_partial_names_backup_location(state, fake_registry, monkeypat
                       record_history=False, registry_backup_elsewhere=True,
                       registry_backup_run=run.run_id)
     err = s.errors[0].error
-    assert err.startswith("partially deleted") and f"cleanix restore {run.run_id}" in err
+    assert err.startswith("partially deleted") and run.run_id in err
+    # machine-wide entries (helper runs): never "cleanix restore <run>"
+    assert f"cleanix restore {run.run_id}" not in err
+    assert "Administrator terminal" in err and "reg import" in err and "/reg:64" in err
 
 
 # == fix round 2 ====================================================================
@@ -1189,7 +1197,7 @@ def test_final_save_failure_is_reported_not_raised(state, fake_registry, monkeyp
     if mode == "conflict":
         assert "still safe" not in note and "the backup files are in" in note
     else:
-        assert "cleanix restore is still safe" in note
+        assert "restore with cleanix restore" in note
 
 
 # -- I2: machine restore needs confirmation, ownership ---------------------------------------
@@ -1463,7 +1471,7 @@ def test_mark_save_failure_is_reported_and_consistent(state, fake_registry, monk
     o = Engine([]).clean([item], dry_run=False, registry_backup=run).outcomes[0]
     assert o.removed is True
     assert o.error.startswith("deleted, but the undo record could not be updated")
-    assert "cleanix restore is still safe" in o.error
+    assert "restore with cleanix restore" in o.error
     assert n[0] == 3  # the result save was tried twice
     assert run.items[0]["deleted"] is None
     assert _manifest(run.dir)["items"][0]["deleted"] is None
@@ -1500,3 +1508,89 @@ def test_list_runs_removed_count(state, fake_registry):
     run.mark_registry(b, False)
     row, = quarantine.list_runs()
     assert row["registry"] == 2 and row["removed_count"] == 1
+
+
+# -- I3: registry restore is gated on regpromises -------------------------------------------
+def test_restore_does_not_run_the_registry_write_path_while_undo_is_off(state, fake_registry, monkeypatch, tmp_path):
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    p, path_item = _path_item(tmp_path)
+    summary = service.clean([item, path_item], Config(), dry_run=False, use_quarantine=True)
+    run_id = summary.quarantine_run
+    assert not reg.key_exists("HKCU", FOO)
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", False)
+    reg.calls.clear()
+    res = quarantine.restore(run_id)
+    assert not any(c[0] in ("create_key", "set_value") for c in reg.calls)
+    assert not reg.key_exists("HKCU", FOO)
+    assert res["failed"] == [] and res["restored"] == [str(p)]  # the file came back
+    (orig, why), = res["not_restored"]
+    assert orig == item.reg.display
+    assert why.startswith("not restored: registry restore is not enabled in this version (backup files are in ")
+    assert (state / "q" / run_id).exists()  # the run, with its backups, is kept
+    # switch on: the same run restores the registry entry
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", True)
+    res = quarantine.restore(run_id)
+    assert res["restored"] == [item.reg.display]  # (the file was already restored)
+    assert "not_restored" not in res
+    assert reg.key_exists("HKCU", FOO)
+
+
+# -- I2: restore hints follow the switch and the hive ----------------------------------------
+def _partial_delete_error(reg, hive, monkeypatch):
+    _foo_tree(reg, hive=hive)
+    item = _item(reg, hive=hive)
+    run = quarantine.new_run()
+    real_delete, n = reg.delete_key, [0]
+
+    def flaky(h, k):
+        n[0] += 1
+        if n[0] == 2:
+            raise RegistryError("in use")
+        return real_delete(h, k)
+
+    reg.delete_key = flaky
+    o = Engine([]).clean([item], dry_run=False, registry_backup=run).outcomes[0]
+    return run, o.error
+
+
+@pytest.mark.parametrize("hive", ["HKCU", "HKLM"])
+def test_partial_delete_hint_is_off_while_undo_is_off(state, fake_registry, monkeypatch, hive):
+    monkeypatch.setattr(winenv, "is_admin", lambda: True)
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", False)
+    run, err = _partial_delete_error(fake_registry, hive, monkeypatch)
+    assert run.run_id in err and "restore" not in err.casefold().replace("restored", "")
+
+
+def test_partial_delete_hint_per_hive_when_shipped(state, fake_registry, monkeypatch):
+    monkeypatch.setattr(winenv, "is_admin", lambda: True)
+    run, err = _partial_delete_error(fake_registry, "HKCU", monkeypatch)
+    assert f"restore with cleanix restore {run.run_id}" in err
+    reg2 = type(fake_registry)()
+    from cleanix.core import winregistry
+    winregistry.set_backend(reg2)
+    run, err = _partial_delete_error(reg2, "HKLM", monkeypatch)
+    assert f"cleanix restore {run.run_id}" not in err
+    assert "Administrator terminal" in err and "reg import" in err
+
+
+def test_record_save_notes_follow_the_switch(state, fake_registry, monkeypatch):
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", False)
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    run = quarantine.new_run()
+    real_save, n = run.save, [0]
+
+    def save():
+        n[0] += 1
+        if n[0] >= 2:
+            raise OSError("disk full")
+        return real_save()
+
+    monkeypatch.setattr(run, "save", save)
+    monkeypatch.setattr(quarantine.time, "sleep", lambda s: None)
+    o = Engine([]).clean([item], dry_run=False, registry_backup=run).outcomes[0]
+    assert "the backup files are in" in o.error and "cleanix restore" not in o.error
+    assert "undo" not in o.error

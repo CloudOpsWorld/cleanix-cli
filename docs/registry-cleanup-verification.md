@@ -10,12 +10,20 @@ registry entries stays off**: `UNDO_SHIPPED = False` in
 ## What the user sees while the promise is off
 
 - CLI (`cleanix clean --registry --execute`) and GUI (Power mode confirm dialog
-  and result): "Registry entries are removed permanently: no backup or restore
-  is available in this version."
+  and result): "A backup of each removed registry entry is written to the
+  quarantine folder, but restoring registry entries is not supported in this
+  version yet; to restore one manually, inspect the .reg file and import it
+  with reg import ... /reg:64."
+- `quarantine.restore` (CLI `cleanix restore`, GUI Quarantine tab Restore and
+  Simple-mode Undo) does **not** run the registry write path while the switch is
+  off: registry entries are reported as "not restored: registry restore is not
+  enabled in this version (backup files are in <dir>)", file entries restore as
+  usual, and the run is kept. Error messages after a partial delete or a failed
+  record save say where the backup files are, never how to restore.
 - The backups are still written before every registry delete (a delete is
-  refused without one) and kept in a quarantine run, so nothing is lost; they
-  are just not promised. `cleanix restore <run>` and `reg import` exist and are
-  covered by unit tests only.
+  refused without one) and kept in a quarantine run, so nothing is lost. The
+  manual `reg import` route exists; the in-app restore is covered by unit tests
+  only.
 - The release is **not releasable** with registry cleaners enabled in a
   packaged build until the checklist has passed (plan, Risks:
   "Undocumented `winreg` behaviour").
@@ -131,6 +139,34 @@ Use a normal (non-admin) account first, then an Administrator terminal.
       manual look in Notepad is optional.)
 - [ ] Elevated helper path: unit tests only. Do not clean real `HKLM` entries
       on the verification machine.
+
+## Known issues that must be resolved before the flip (F1 to F5, I2, I3)
+
+All of F1 to F5, and the review items I2 (restore hints follow the switch and
+the hive) and I3 (restore gated on the switch), must be resolved and re-verified
+before `UNDO_SHIPPED` is flipped. I2 and I3 are implemented (and unit-tested in
+both switch states); F1 to F5 are open and are verification items, not code
+done.
+
+- **F1 Restore after an elevated clean is likely refused.** A backup file
+  created by an elevated process is probably owned by `BUILTIN\Administrators`,
+  and `restore_entry(require_owner=True)` then answers "the backup file is not
+  owned by the current user" from a normal terminal or the GUI Quarantine tab.
+  Check: an elevated clean followed by a normal-terminal restore, and an HKCU
+  restore from the GUI tab. Fix ideas: accept the Administrators owner for HKCU
+  entries, or tell the user to restore from an elevated terminal.
+- **F2 GUI HKLM cleaning breaks silently if the quarantine folder was first
+  created elevated.** The folder is then owned by Administrators and
+  `_prepare_registry` refuses it (documented fail-closed). Check what the user
+  sees and decide whether the message needs to be explicit.
+- **F3 The GUI never shows `CleanSummary.undo_record_error` or `quarantine_run`
+  after a Power clean.** Decide where the run id and a save error are shown.
+- **F4 The owed real-Windows probes:** `REG_MULTI_SZ` lossy reads, the R17
+  `DeleteKeyEx` measurement for a final-component link, `OPEN_LINK` handling
+  (all in the script above).
+- **F5 The Quarantine panel shows `count` instead of `removed_count`, and an
+  elevated GUI's HKLM restore wording promises a confirmation the GUI does not
+  have.** Fix both wordings, then re-check.
 
 ## The one-line flip
 
