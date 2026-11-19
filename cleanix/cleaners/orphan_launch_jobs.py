@@ -110,6 +110,7 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
                     f"Broken job link: {logical}",
                     self._hint(logical, "", system),
                     requires_root=system,
+                    **self._job_remedy(plist.stem),
                 )
             try:
                 if os.readlink(plist) == "/dev/null":
@@ -144,7 +145,18 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
             f"Background job for a missing program: {label} (runs {program})",
             self._hint(logical, label, system),
             requires_root=system,
+            **self._job_remedy(label),
         )
+
+    @staticmethod
+    def _job_remedy(label: str) -> dict:
+        """Finding kwargs for a LAUNCH_JOB remedy (only for a plain label)."""
+        if not oc.valid_ident(label):
+            return {}
+        return {
+            "remedy_kind": oc.RemedyKind.LAUNCH_JOB,
+            "remedy_extra": (("label", label),),
+        }
 
     def _load(self, plist: Path):
         """dict on success, None to skip silently, str reason when unreadable."""

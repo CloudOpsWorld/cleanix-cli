@@ -21,11 +21,12 @@ import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence, Tuple
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core import platform as _platform
 from cleanix.core.models import CleanableItem, ItemKind
+from cleanix.core.remedy import Remedy, RemedyKind, fingerprint_of
 from cleanix.core.utils import _allocated_bytes, run_command, which
 
 READ_ONLY_COMMANDS: frozenset = frozenset(
@@ -105,6 +106,10 @@ class Finding:
     hint: str
     requires_root: bool = True
     note: bool = False  # notes are never sized (size 0)
+    # Optional remedy kind. Only honoured for user-space (requires_root False),
+    # non-note findings; system-wide findings get no remedy yet.
+    remedy_kind: Optional[RemedyKind] = None
+    remedy_extra: Tuple[Tuple[str, str], ...] = ()
 
 
 class ScanBudget:
@@ -289,6 +294,15 @@ def safe_label(text: str) -> str:
         "?" if (ord(c) < 32 or 127 <= ord(c) < 160) else c for c in text
     )
     return out[:200]
+
+
+_IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@:+-]{0,254}")
+
+
+def valid_ident(name: str) -> bool:
+    """True for a plain launchd label / systemd unit name (no path or shell
+    metacharacters, no leading dash). Remedies carry only validated names."""
+    return bool(_IDENT.fullmatch(name)) and ".." not in name
 
 
 def bad_name(name: str) -> bool:
@@ -564,4 +578,17 @@ class OrphanReporter(Cleaner):
             requires_root=f.requires_root,
             report_only=True,
             hint=f.hint,
+            remedy=self._remedy(f),
         )
+
+    @staticmethod
+    def _remedy(f: Finding) -> Optional[Remedy]:
+        """The remedy for a user-space, non-note finding that asks for one."""
+        if f.remedy_kind is None or f.note or f.requires_root:
+            return None
+        fp = fingerprint_of(str(f.path))
+        if f.remedy_kind is RemedyKind.PATH:
+            if fp is None:
+                return None
+            return Remedy(RemedyKind.PATH, fp)
+        return Remedy(f.remedy_kind, fp or (0, 0, 0, 0), extra=f.remedy_extra)

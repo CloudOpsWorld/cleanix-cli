@@ -252,6 +252,7 @@ class StaleDesktopEntryReporter(oc.OrphanReporter):
             f"Menu entry for a missing program: {name} ({logical})",
             hint,
             requires_root=system,
+            remedy_kind=oc.RemedyKind.PATH,
         )
 
     # ---- parts

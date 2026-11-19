@@ -18,6 +18,7 @@ from typing import Iterable
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
 from cleanix.core.platform import ALL, WINDOWS
+from cleanix.core.remedy import path_remedy
 from cleanix.core.utils import home, human_size, iter_children, older_than, path_size
 
 # Extensions that are almost always disposable downloads once stale: OS/app
@@ -86,6 +87,7 @@ class DownloadsReporter(Cleaner):
                 child,
                 f"{label}: {name} ({human_size(size)}, {age} days old)",
                 hint="review and remove manually if no longer needed",
+                remedy=path_remedy(str(child)),
             )
             if item:
                 yield item

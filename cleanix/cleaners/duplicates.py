@@ -31,6 +31,7 @@ from typing import Dict, Iterable, List
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
 from cleanix.core.platform import ALL, WINDOWS
+from cleanix.core.remedy import path_remedy
 from cleanix.core.utils import home, human_size, modified_within, walk_pruned
 
 # A file touched within the last few minutes may still be growing (a download in
@@ -112,7 +113,7 @@ class DuplicateFileReporter(Cleaner):
 
         # -- 2/3. hash only within multi-file size buckets ------------------
         # Each emitted group is (reclaimable, size, [paths]).
-        groups: List[tuple[int, int, List[str]]] = []
+        groups: List[tuple[int, int, List[str], str]] = []
         for size, paths in by_size.items():
             if len(paths) < 2 or len(paths) > _MAX_BUCKET:
                 continue
@@ -133,32 +134,37 @@ class DuplicateFileReporter(Cleaner):
                     fh = _full_hash(p)
                     if fh is not None:
                         by_full[fh].append(p)
-                for matches in by_full.values():
+                for fh_key, matches in by_full.items():
                     if len(matches) < 2:
                         continue
                     n = len(matches)
                     reclaimable = size * (n - 1)
-                    groups.append((reclaimable, size, sorted(matches)))
+                    groups.append((reclaimable, size, sorted(matches), fh_key))
 
         # -- 4/5. rank by reclaimable space, cap, and emit ------------------
         groups.sort(key=lambda g: g[0], reverse=True)
-        for reclaimable, size, matches in groups[:top_n]:
+        for reclaimable, size, matches, group_id in groups[:top_n]:
             n = len(matches)
-            representative = matches[0]
-            others = matches[1:]
-            shown = others[:_HINT_PATHS]
-            more = len(others) - len(shown)
-            peers = "; ".join(shown)
-            if more > 0:
-                peers += f"; (+{more} more)"
-            item = self.report_item(
-                representative,
-                f"{n} copies of a {human_size(size)} file — "
-                f"{human_size(reclaimable)} reclaimable",
-                hint=(
-                    f"identical copies: {peers} — remove all but one "
-                    f"if these are redundant"
-                ),
-            )
-            if item:
-                yield item
+            # Every copy is its own item (so a later action can pick which
+            # one survives); all share ``Remedy.group`` = the full SHA-256 of
+            # the content, a stable id for the hash group. The first copy's
+            # description and hint are exactly what the group item used to be.
+            for copy in matches:
+                others = [m for m in matches if m != copy]
+                shown = others[:_HINT_PATHS]
+                more = len(others) - len(shown)
+                peers = "; ".join(shown)
+                if more > 0:
+                    peers += f"; (+{more} more)"
+                item = self.report_item(
+                    copy,
+                    f"{n} copies of a {human_size(size)} file — "
+                    f"{human_size(reclaimable)} reclaimable",
+                    hint=(
+                        f"identical copies: {peers} — remove all but one "
+                        f"if these are redundant"
+                    ),
+                    remedy=path_remedy(copy, group=group_id),
+                )
+                if item:
+                    yield item

@@ -439,6 +439,7 @@ class OrphanAppDataReporter(oc.OrphanReporter):
                 f"Left by a removed app: {bid} ({real_logical})",
                 self._hint(bid, real_logical),
                 requires_root=system,
+                remedy_kind=oc.RemedyKind.PATH,
             )
 
     def _newest_child_mtime(self, directory: Path) -> float:

@@ -15,6 +15,7 @@ from cleanix.config import Config
 from cleanix.core.context import get_target_users, use_user
 from cleanix.core.models import CleanableItem, CleanerReport, ItemKind
 from cleanix.core.platform import ALL, supports
+from cleanix.core.remedy import Remedy
 from cleanix.core.utils import path_size
 
 # Cleaner scope:
@@ -117,6 +118,7 @@ class Cleaner(abc.ABC):
         *,
         hint: str,
         requires_root: Optional[bool] = None,
+        remedy: Optional[Remedy] = None,
     ) -> Optional[CleanableItem]:
         """Build a *report-only* PATH item (surfaced with size, never deleted)."""
         p = Path(path)
@@ -133,6 +135,7 @@ class Cleaner(abc.ABC):
             else requires_root,
             report_only=True,
             hint=hint,
+            remedy=remedy,
         )
 
     def command_item(

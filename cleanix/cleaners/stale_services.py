@@ -24,6 +24,7 @@ from cleanix.cleaners.base import SCOPE_USER
 from cleanix.cleaners.orphan_common import Finding, OrphanReporter
 from cleanix.core import utils
 from cleanix.core.platform import LINUX
+from cleanix.core.remedy import RemedyKind
 
 _SYSTEM_SCAN = (
     "/etc/systemd/system",
@@ -156,6 +157,7 @@ class StaleSystemdUnitReporter(OrphanReporter):
             f"Broken unit link: {logical} -> {target}",
             self._hint(link.name, logical, user),
             requires_root=not user,
+            remedy_kind=RemedyKind.PATH,
         )
 
     # ------------------------------------------------------ (c) drop-in
@@ -178,6 +180,7 @@ class StaleSystemdUnitReporter(OrphanReporter):
             f"Settings for a removed service: {logical}",
             self._hint(unit, logical, user),
             requires_root=not user,
+            remedy_kind=RemedyKind.PATH,
         )
 
     # ------------------------------------------------------ (a) unit file
@@ -220,7 +223,18 @@ class StaleSystemdUnitReporter(OrphanReporter):
             f"Service for a missing program: {path.name} (runs {binaries[0]})",
             self._hint(path.name, logical, user),
             requires_root=not user,
+            **self._unit_remedy(path.name),
         )
+
+    @staticmethod
+    def _unit_remedy(unit: str) -> dict:
+        """Finding kwargs for a SYSTEMD_UNIT remedy (only for a plain name)."""
+        if not unit.endswith(".service") or not oc.valid_ident(unit):
+            return {}
+        return {
+            "remedy_kind": RemedyKind.SYSTEMD_UNIT,
+            "remedy_extra": (("unit", unit),),
+        }
 
     def _binary_present(self, binary: str) -> Optional[bool]:
         """True/False, or None when it cannot be judged."""

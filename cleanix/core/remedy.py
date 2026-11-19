@@ -50,6 +50,18 @@ def fingerprint_of(path: str) -> Optional[Fingerprint]:
     return (st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev)
 
 
+def path_remedy(path: str, group: Optional[str] = None) -> Optional[Remedy]:
+    """A PATH remedy pinned to ``path``'s current lstat identity.
+
+    None when the path cannot be fingerprinted (missing/unreadable): no
+    fingerprint, no remedy.
+    """
+    fp = fingerprint_of(path)
+    if fp is None:
+        return None
+    return Remedy(RemedyKind.PATH, fp, group=group)
+
+
 def unchanged(item: "CleanableItem") -> bool:
     """True when the item's path still has the fingerprint stored in its remedy.
 

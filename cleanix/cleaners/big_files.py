@@ -17,6 +17,7 @@ from typing import Iterable, List, Tuple
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
 from cleanix.core.platform import ALL, WINDOWS
+from cleanix.core.remedy import path_remedy
 from cleanix.core.utils import (
     _allocated_bytes,
     home,
@@ -78,6 +79,7 @@ class BigFileReporter(Cleaner):
                 fpath,
                 f"Large file: {os.path.basename(fpath)} ({human_size(size)})",
                 hint="review and remove manually if no longer needed: rm <path>",
+                remedy=path_remedy(fpath),
             )
             if item:
                 yield item
