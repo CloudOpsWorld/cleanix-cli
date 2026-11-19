@@ -51,11 +51,11 @@ def run(fake_registry, monkeypatch):
         if ctx is None:
             prober = FakeProber(states or {}, default=default)
             ctx = DetectorContext(
-                env, prober, r"C:\Users", r"C:\Windows", owner_matches=ctx_owner
+                env, prober, r"C:\Users", r"C:\Windows",
+                owner_matches=ctx_owner and owner,
             )
         det = WinRegUninstall(Config())
         monkeypatch.setattr(det, "context", lambda: ctx)
-        monkeypatch.setattr(wu, "_scan_owner_matches", lambda: owner)
         report = det.scan()
         assert report.skipped_reason is None
         return list(report.items)
@@ -316,15 +316,6 @@ def test_uninstall_never_touches_unlisted_containers(fake_registry, run):
         assert op in {"subkeys", "values", "key_exists", "is_link"}, call
         if op in ("subkeys", "values"):
             assert any(call[2].casefold().startswith(r) for r in roots), call
-
-
-def test_owner_default_is_conservative_when_elevated(monkeypatch):
-    from cleanix.core import context
-
-    monkeypatch.setattr(context, "is_effective_root", lambda: True)
-    assert wu._scan_owner_matches() is False
-    monkeypatch.setattr(context, "is_effective_root", lambda: False)
-    assert wu._scan_owner_matches() is True
 
 
 class _FS:

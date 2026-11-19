@@ -19,6 +19,7 @@ from cleanix.core import regsnap, winregistry
 from cleanix.core.models import CleanableItem, CleanerReport, ItemKind, RegTarget
 from cleanix.core.platform import WINDOWS
 from cleanix.core.regsafety import Container, check_target, containers_for
+from cleanix.core import regtargets
 from cleanix.core.regtargets import DetectorContext, default_context
 from cleanix.core.winregistry import RegistryBackend, RegistryError, RegValue
 
@@ -62,7 +63,8 @@ class RegistryDetector(Cleaner):
         return None
 
     def context(self) -> DetectorContext:
-        return default_context()
+        # The one owner_matches policy, evaluated now (at scan time).
+        return default_context(owner_matches=regtargets.scan_owner_matches())
 
     @abc.abstractmethod
     def entries(
