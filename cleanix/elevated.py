@@ -77,6 +77,29 @@ nothing in it beyond *identifiers*, and nothing in its environment:
     same file), and verified in memory; after validation nothing of the
     run is opened or resolved by path (the helper's own %LOCALAPPDATA%
     quarantine is never consulted either).
+11. Findings action (POSIX only; the optional ``findings`` part, never
+    combined with other items: scenario ids, item keys with their remedy
+    fingerprints and kinds, ``permanent``). Validated from its text alone
+    BEFORE the user is bound or any file is read (else exit 1, nothing
+    deleted): every scenario on ``admin_finding_ids`` (system-wide finding
+    detectors, separate from both other allowlists), every key a clean,
+    normalised absolute path strictly inside a root its own detector scans
+    (``finding_path_roots``), never a protected folder, an ancestor of one
+    or the helper's own quarantine; the process is root. Items of a remedy
+    kind other than PATH are refused individually. The helper then
+    re-scans with exactly those scenarios in helper scan mode (the
+    detectors skip their per-user candidates) and acts only on items of
+    its OWN scan whose key AND remedy fingerprint equal the request's:
+    report-only, requires_root, PATH remedy, no duplicate group. Anything
+    else is reported (not found / changed / refused) and skipped. One
+    ``actions.act`` batch with ``allow_root``: fingerprint and type
+    re-checked and the parent chain (point 7) re-checked right before each
+    removal, the deletion guard in force. Unless ``permanent``, items are
+    moved into ONE run of a root-owned quarantine the helper creates 0700
+    (``/var/lib/cleanix/quarantine``; macOS ``/Library/Application
+    Support/Cleanix/quarantine``) and validates without following links;
+    if it is not usable nothing is removed. No history; nothing under the
+    user's home. Per-item outcomes and the run id go into the result.
 
 What the design does and does not protect:
 * The nonce only detects stale or mixed-up result files; it provides no
@@ -1037,6 +1060,344 @@ def _user_glob(glob: str, home: Path) -> str:
 
 
 # --------------------------------------------------------------------------
+# findings action (POSIX only)
+# --------------------------------------------------------------------------
+FINDINGS_NOT_SUPPORTED = ("acting on findings with administrator rights is not "
+                          "supported on Windows")
+KIND_NOT_SUPPORTED = ("this kind of finding is not handled by the administrator "
+                      "helper yet; nothing was done")
+NOT_FOUND = "not found by the administrator scan; nothing was done"
+CHANGED_SINCE_SCAN = "changed since the scan; nothing was done"
+NO_ACTION = "the administrator scan offers no action for this item; nothing was done"
+NOT_SYSTEM_WIDE = ("not a system-wide finding (it is acted on without administrator "
+                   "rights); nothing was done")
+NO_DUPLICATES = "duplicates are not handled by the administrator helper; nothing was done"
+# Remedy kinds (RemedyKind values) the helper acts on. Every other kind is
+# refused per item; Task 9 registers the others with their own checks.
+_HELPER_FINDING_KINDS = frozenset({"path"})
+# The uid that must own the root quarantine (0; a seam for hermetic tests).
+_ROOT_UID = 0
+_mkdir = os.mkdir
+
+
+def _findings_supported() -> bool:
+    """The one platform gate of the findings action."""
+    return _is_posix()
+
+
+def _is_elevated() -> bool:
+    from cleanix.core import utils
+
+    return utils.is_root()
+
+
+def admin_finding_ids() -> FrozenSet[str]:
+    """Scenarios the findings action may act on (see
+    ``elevate.admin_finding_ids``); separate from ``admin_cleaner_ids`` and
+    ``admin_registry_cleaner_ids``."""
+    return elevate.admin_finding_ids()
+
+
+def finding_path_roots():
+    """Per-scenario allowed roots (see ``elevate.finding_path_roots``)."""
+    return elevate.finding_path_roots()
+
+
+def _root_quarantine_location():
+    """``(existing system parent, the helper's own folders below it)`` of
+    the root-owned quarantine: ``/var/lib/cleanix/quarantine``, on macOS
+    ``/Library/Application Support/Cleanix/quarantine``."""
+    from cleanix.core.platform import MACOS, current_os
+
+    if current_os() == MACOS:
+        return "/Library/Application Support", ("Cleanix", "quarantine")
+    return "/var/lib", ("cleanix", "quarantine")
+
+
+def root_quarantine_never():
+    """The helper's own folder and its quarantine: never a finding (a
+    request naming them, a folder inside or one containing them refuses)."""
+    import posixpath
+
+    parent, own = _root_quarantine_location()
+    return (posixpath.join(parent, own[0]), posixpath.join(parent, *own))
+
+
+@dataclasses.dataclass(frozen=True)
+class _FindingsPlan:
+    only: List[str]
+    items: List[elevate.FindingSelection]
+    # key -> reason: items refused up front (kind not handled); never scanned for.
+    refused: dict
+    permanent: bool
+
+
+def _prepare_findings(req: elevate.FindingsRequest) -> _FindingsPlan:
+    """Validate the findings action from its text alone, BEFORE any
+    filesystem access (Refused on any problem; nothing is scanned or
+    deleted): POSIX, every scenario on ``admin_finding_ids()``, every key a
+    lexically clean path strictly inside one of its scenario's roots
+    (``finding_path_roots``) that is neither a protected folder, an
+    ancestor of one, nor the helper's own quarantine; and the process runs
+    as root. Items of a remedy kind the helper does not handle are refused
+    individually (``KIND_NOT_SUPPORTED``)."""
+    if not _findings_supported():
+        raise Refused(FINDINGS_NOT_SUPPORTED)
+    allowed = admin_finding_ids()
+    if not req.only or any(c not in allowed for c in req.only):
+        raise Refused("the findings part names a scenario the helper does not act on")
+    if not req.items:
+        raise Refused("the findings part names no item")
+    roots = finding_path_roots()
+    never = root_quarantine_never()
+    refused = {}
+    seen = set()
+    for sel in req.items:
+        try:
+            cid, path = elevate.finding_key_parts(sel.key)
+        except ValueError:
+            raise Refused("the findings part names an invalid item") from None
+        if cid not in req.only or sel.key in seen:
+            raise Refused("the findings part names an invalid item")
+        seen.add(sel.key)
+        problem = elevate.finding_path_problem(cid, path, roots, never)
+        if problem:
+            raise Refused(f"the findings part names a path the helper never acts on ({problem})")
+        if sel.kind not in _HELPER_FINDING_KINDS:
+            refused[sel.key] = KIND_NOT_SUPPORTED
+    if not _is_elevated():
+        raise Refused("the helper is not running as root; nothing was removed")
+    return _FindingsPlan(list(req.only), list(req.items), refused, bool(req.permanent))
+
+
+def _finding_problem(item, sel: elevate.FindingSelection, allowed, roots, never):
+    """``(status, reason)`` when the helper must not act on its own scan's
+    ``item`` (already matched to ``sel`` by key), else None."""
+    remedy = item.remedy
+    if (not item.report_only or remedy is None or item.kind is not ItemKind.PATH
+            or not item.path):
+        return "refused", NO_ACTION
+    if item.cleaner_id not in allowed:
+        return "refused", _FIXED_LIST_REASON
+    if not item.requires_root:
+        return "refused", NOT_SYSTEM_WIDE
+    if remedy.group:
+        return "refused", NO_DUPLICATES
+    kind = getattr(remedy.kind, "value", None)
+    if kind not in _HELPER_FINDING_KINDS or kind != sel.kind:
+        return "refused", KIND_NOT_SUPPORTED
+    try:
+        fp = tuple(int(x) for x in remedy.fingerprint)
+    except (TypeError, ValueError):
+        return "refused", NO_ACTION
+    if fp != tuple(sel.fingerprint):
+        return "skipped", CHANGED_SINCE_SCAN
+    problem = elevate.finding_path_problem(item.cleaner_id, item.path, roots, never)
+    if problem:
+        return "refused", f"the helper never acts on this path ({problem})"
+    return None
+
+
+def _own_dir_problem(st, private: bool) -> Optional[str]:
+    if _stat_mod.S_ISLNK(st.st_mode):
+        return "is a symbolic link"
+    if not _stat_mod.S_ISDIR(st.st_mode):
+        return "is not a directory"
+    if st.st_uid != _ROOT_UID:
+        return "is not owned by root"
+    if st.st_mode & (0o077 if private else 0o022):
+        return "is accessible by other users" if private else "is writable by other users"
+    return None
+
+
+def _prepare_root_quarantine(expected_uid: Optional[int],
+                             group_ids: Optional[FrozenSet[int]]) -> Path:
+    """Create (if needed) and validate the helper's root-owned quarantine
+    directory; Refused on any doubt (then nothing is removed).
+
+    Every component of the system parent (``/var/lib`` or
+    ``/Library/Application Support``) must pass the parent-chain rule
+    (lstat, no link, modifiable only by root/system accounts). The
+    helper's own folders are created ``0700`` if missing and must be real
+    directories (never followed), owned by root, the outer one not
+    writable and the quarantine itself not accessible by anyone else. The
+    quarantine is then opened ``O_DIRECTORY|O_NOFOLLOW`` and the opened
+    directory must be the one just checked."""
+    import posixpath
+    from pathlib import PurePosixPath
+
+    parent, own = _root_quarantine_location()
+    parts = PurePosixPath(parent).parts
+    for i in range(1, len(parts) + 1):
+        comp = str(PurePosixPath(*parts[:i]))
+        try:
+            st = _lstat(comp)
+        except OSError:
+            raise Refused(f"{comp} cannot be inspected") from None
+        problem = _component_problem(st, expected_uid, group_ids)
+        if problem:
+            raise Refused(f"{comp} {problem}")
+    current = parent
+    st = None
+    for idx, name in enumerate(own):
+        current = posixpath.join(current, name)
+        private = idx == len(own) - 1
+        try:
+            st = _lstat(current)
+        except FileNotFoundError:
+            try:
+                _mkdir(current, 0o700)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise Refused(f"{current} could not be created") from None
+            try:
+                st = _lstat(current)
+            except OSError:
+                raise Refused(f"{current} cannot be inspected") from None
+        except OSError:
+            raise Refused(f"{current} cannot be inspected") from None
+        problem = _own_dir_problem(st, private)
+        if problem:
+            raise Refused(f"{current} {problem}")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(current, flags)
+    except OSError:
+        raise Refused(f"{current} could not be opened") from None
+    try:
+        fst = _fstat(fd)
+    finally:
+        os.close(fd)
+    problem = _own_dir_problem(fst, True)
+    if problem or (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+        raise Refused(f"{current} changed while it was being checked")
+    return Path(current)
+
+
+def _execute_findings(session: _Session, plan: _FindingsPlan, config, cancel,
+                      expected_uid: Optional[int],
+                      group_ids: Optional[FrozenSet[int]]) -> bool:
+    """The findings action (validated by ``_prepare_findings``). Re-scans
+    as root, in helper scan mode, with exactly the requested scenarios, and
+    acts ONLY on items of its own scan whose key AND remedy fingerprint
+    equal the request's and that pass ``_finding_problem``: one
+    ``actions.act`` batch (deletion guard, fingerprint/type re-check and
+    the parent-chain check right before each removal), into ONE run in the
+    root-owned quarantine (``permanent``: deleted, no quarantine). No
+    history, nothing under the user's home. Returns True when the deadline
+    stopped it; raises service.Cancelled when it is reached while
+    scanning."""
+    from cleanix.core import actions
+
+    allowed = admin_finding_ids()
+    roots = finding_path_roots()
+    never = root_quarantine_never()
+    order = [s.key for s in plan.items]
+    sels = {s.key: s for s in plan.items}
+    out: dict = {}
+
+    def put(key: str, status: str, reason: str = "", freed: int = 0) -> None:
+        out[key] = elevate.FindingOutcome(key=key, status=status,
+                                          freed=max(0, int(freed)), reason=reason)
+
+    def flush() -> None:
+        with session.lock:
+            session.findings = [out[k] for k in order if k in out]
+
+    try:
+        for key, why in plan.refused.items():
+            put(key, "refused", why)
+            session.note(refused=1)
+        scan_keys = [k for k in order if k not in plan.refused]
+        flush()
+        if not scan_keys:
+            return False
+        with scanmode.helper_mode():
+            scan = service.scan(config, only=plan.only, cancel=cancel)
+        found = {}
+        for item in scan.all_items():
+            key = item_key(item)
+            if key in sels and key not in found:
+                found[key] = item
+        candidates = []
+        for key in scan_keys:
+            item = found.get(key)
+            if item is None:
+                put(key, "not_found", NOT_FOUND)
+                session.note(unmatched=1)
+                continue
+            why = _finding_problem(item, sels[key], allowed, roots, never)
+            if why is not None:
+                put(key, why[0], why[1])
+                if why[0] == "refused":
+                    session.note(refused=1)
+                else:
+                    session.note(unmatched=1)
+                continue
+            candidates.append(item)
+        flush()
+        if not candidates:
+            return False
+        with session.lock:
+            session.total += len(candidates)
+        qroot = None
+        if not plan.permanent:
+            try:
+                qroot = _prepare_root_quarantine(expected_uid, group_ids)
+            except Refused as exc:
+                reason = f"the administrator quarantine is not usable ({exc}); nothing was removed"
+                for item in candidates:
+                    put(item_key(item), "not_removed", reason)
+                session.note(error=f"findings not removed: {reason}")
+                return False
+
+        def chain(item) -> Optional[str]:
+            problem = _path_chain_problem(item.path or "", expected_uid, group_ids)
+            return f"untrusted parent directory ({problem})" if problem else None
+
+        old_mask = os.umask(0o077)
+        try:
+            summary = actions.act(candidates, config, dry_run=False,
+                                  permanent=plan.permanent, cancel=cancel,
+                                  record_history=False, allow_root=True,
+                                  quarantine_root=qroot, extra_check=chain)
+        finally:
+            os.umask(old_mask)
+        done = set()
+        with session.lock:
+            session.freed += summary.freed
+            session.removed += summary.removed
+            session.processed += len(summary.result.outcomes) + len(summary.skipped)
+            session.errors.extend(f"{o.item.description}: {o.error}" for o in summary.errors)
+            if summary.quarantine_run:
+                session.quarantine_run = str(summary.quarantine_run)
+        for o in summary.result.outcomes:
+            key = item_key(o.item)
+            done.add(key)
+            if o.removed:
+                put(key, "removed", "", o.freed)
+            else:
+                put(key, "not_removed", o.error or "not removed")
+        for item, reason in summary.skipped:
+            key = item_key(item)
+            done.add(key)
+            put(key, "skipped", reason)
+            session.note(error=f"{item.description}: skipped: {reason}")
+        if summary.undo_record_error:
+            session.note(error=summary.undo_record_error)
+        hit = False
+        for item in candidates:
+            key = item_key(item)
+            if key not in done:
+                put(key, "not_removed", "deadline reached; not processed")
+                hit = True
+        return hit
+    finally:
+        flush()
+
+
+# --------------------------------------------------------------------------
 # session: single final result write + watchdog
 # --------------------------------------------------------------------------
 WATCHDOG_LOCK_TIMEOUT = 5.0
@@ -1061,6 +1422,9 @@ class _Session:
         self.total = 0
         self.unmatched = 0
         self.refused = 0
+        # findings action
+        self.findings: List[elevate.FindingOutcome] = []
+        self.quarantine_run = ""
 
     def record(self, summary) -> None:
         """Add one item's clean summary to the tally."""
@@ -1082,7 +1446,8 @@ class _Session:
         return elevate.HelperResult(
             freed=self.freed, removed=self.removed,
             errors=list(self.errors) + list(extra_errors), unmatched=self.unmatched,
-            nonce=self.nonce, deadline_hit=hit, refused=self.refused)
+            nonce=self.nonce, deadline_hit=hit, refused=self.refused,
+            findings=list(self.findings), quarantine_run=self.quarantine_run)
 
     def _write(self, result: elevate.HelperResult) -> bool:
         try:
@@ -1191,6 +1556,16 @@ def _run_session(session: _Session, config_path: Optional[str],
         except ValueError as exc:
             raise Refused(str(exc)) from None
         session.nonce = selection.nonce
+        findings_plan = None
+        if selection.findings is not None:
+            # Lexical only, BEFORE the user is bound or any of their files
+            # (config) is read.
+            try:
+                findings_plan = _prepare_findings(selection.findings)
+            except Refused:
+                raise
+            except Exception:  # noqa: BLE001 - fail closed, never echo details
+                raise Refused("the findings part could not be validated") from None
         name = _check_identity(selection.invoking_user, expected_uid)
         user = _bind_user(name, expected_uid)
         config = _load_config(config_path, Path(user.home), expected_uid)
@@ -1209,7 +1584,7 @@ def _run_session(session: _Session, config_path: Optional[str],
     try:
         return _execute(session, selection, config, cancel, deadline, start,
                         expected_uid, _user_groups(user) if _is_posix() else frozenset(),
-                        reg_plan)
+                        reg_plan, findings_plan)
     except Exception as exc:  # noqa: BLE001
         session.finish([f"internal error in the elevated helper ({type(exc).__name__})"])
         if session.aborted:
@@ -1288,7 +1663,8 @@ def _execute_registry(session: _Session, plan: _RegistryPlan, config, cancel,
 def _execute(session: _Session, selection: elevate.Selection, config, cancel,
              deadline: float, start: float, expected_uid: Optional[int],
              group_ids: Optional[FrozenSet[int]],
-             reg_plan: Optional[_RegistryPlan] = None) -> int:
+             reg_plan: Optional[_RegistryPlan] = None,
+             findings_plan: Optional["_FindingsPlan"] = None) -> int:
     def finish(extra=(), hit=False) -> int:
         ok = session.finish(extra, hit)
         if session.aborted:
@@ -1296,6 +1672,18 @@ def _execute(session: _Session, selection: elevate.Selection, config, cancel,
         if not ok:
             return EXIT_INTERNAL
         return EXIT_DEADLINE if hit else EXIT_OK
+
+    if findings_plan is not None:
+        # Exclusive (parse_request refuses a findings request with other
+        # items): nothing else is scanned or cleaned in this run.
+        try:
+            if _execute_findings(session, findings_plan, config, cancel,
+                                 expected_uid, group_ids):
+                return finish(["deadline reached; the remaining findings were not removed"],
+                              hit=True)
+        except service.Cancelled:
+            return finish(["deadline reached while scanning; nothing was removed"], hit=True)
+        return finish()
 
     if reg_plan is not None:
         try:

@@ -14,7 +14,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from cleanix.core import utils, winenv
 from cleanix.core.platform import LINUX, MACOS, WINDOWS, current_os
@@ -156,3 +156,52 @@ def launch_elevated(argv: Sequence[str], *, timeout: int = 3600) -> int:
     if rc != 0:
         raise ElevationFailed(err.strip() or f"exit code {rc}", exit_code=rc)
     return 0
+
+
+def run_findings_request(findings, invoking_user: str, *,
+                         launcher: Optional[Callable[[List[str]], int]] = None,
+                         config_path: Optional[str] = None):
+    """Send one findings request (``elevate.FindingsRequest``) to the
+    elevated helper and return its ``elevate.HelperResult``.
+
+    Writes the request into a fresh private request directory, launches the
+    helper through ``launcher`` (default :func:`launch_elevated`; one
+    prompt), then reads the result, which must carry this request's nonce.
+    A helper that refused or failed after writing its result (exit 1-3)
+    still returns that result. Raises ElevationDeclined /
+    ElevationUnavailable / ElevationFailed (no usable result) and
+    ValueError for a request that cannot be written. The request directory
+    is always removed. Nothing here touches the items themselves."""
+    import shutil
+
+    from cleanix.core import elevate
+
+    selection = elevate.Selection(invoking_user=invoking_user, only=[], keys=[],
+                                  use_quarantine=False, findings=findings)
+    # Round-trip through the strict parser first: never prompt for a request
+    # the helper would refuse anyway.
+    request_dir = elevate.make_request_dir()
+    try:
+        request_path = elevate.write_request(request_dir, selection)
+        elevate.parse_request(request_path.read_bytes())
+        result_path = request_dir / elevate.RESULT_NAME
+        argv = elevated_command(request_path, result_path, config_path)
+        launch = launcher or launch_elevated
+        failure: Optional[ElevationFailed] = None
+        try:
+            launch(argv)
+        except ElevationFailed as exc:
+            if exc.exit_code not in (1, 2, 3):
+                raise
+            failure = exc
+        try:
+            result = elevate.read_result(result_path)
+        except (ValueError, OSError):
+            if failure is not None:
+                raise failure
+            raise ElevationFailed("the helper's result could not be read") from None
+        if result.nonce != selection.nonce:
+            raise ElevationFailed("the helper returned a stale or unexpected result")
+        return result
+    finally:
+        shutil.rmtree(request_dir, ignore_errors=True)

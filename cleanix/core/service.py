@@ -109,9 +109,17 @@ def clean(
     registry_verified_backups: Optional[Mapping[str, Any]] = None,
     precheck: PrecheckCB = None,
     delete_instead: DeleteCB = None,
+    quarantine_root: Optional[Path] = None,
 ) -> CleanSummary:
     """Clean ``items``. ``cancel`` must be thread-safe: it may be called from
     worker threads.
+
+    ``quarantine_root`` (the elevated helper only): the quarantine run is
+    created under this already-validated, root-owned directory instead of
+    the user's quarantine root. Only then may ``record_history=False`` be
+    combined with a quarantine: the run's own manifest (in that directory)
+    is the restore index, and nothing is written under the user's home.
+    Registry items are refused in that mode.
 
     ``record_history=False`` skips history and the manifest (the elevated
     helper must write nothing under the user's home; the GUI records history
@@ -149,7 +157,9 @@ def clean(
 
     items = list(items)
     has_registry = any(i.kind is ItemKind.REGISTRY for i in items)
-    if not record_history and use_quarantine and not dry_run:
+    if quarantine_root is not None and has_registry:
+        raise ValueError("registry entries are never cleaned into an explicit quarantine root")
+    if not record_history and use_quarantine and not dry_run and quarantine_root is None:
         raise ValueError("record_history=False cannot be combined with quarantine")
     if not record_history and has_registry and not dry_run and not registry_backup_elsewhere:
         raise ValueError(
@@ -170,7 +180,8 @@ def clean(
     if not dry_run and (use_quarantine or needs_reg_run):
         from cleanix.core import quarantine as qmod
 
-        run = qmod.new_run()
+        run = (qmod.new_run() if quarantine_root is None
+               else qmod.new_run(root=quarantine_root))
     quarantine = run if use_quarantine else None
     registry_backup = None
     if not dry_run:

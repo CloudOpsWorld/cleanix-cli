@@ -28,6 +28,8 @@ from cleanix.core.utils import current_uid, home
 
 MAX_PLIST_BYTES = 1024 * 1024
 _SIP_PREFIXES = ("/System", "/bin", "/sbin", "/usr")  # /usr/local is not SIP
+# System-wide job folders scanned (also the elevated helper's allowed roots).
+SYSTEM_DIRS = ("/Library/LaunchAgents", "/Library/LaunchDaemons")
 
 
 def job_program(plist: dict) -> Optional[str]:
@@ -73,7 +75,7 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
 
     # ------------------------------------------------------------ discovery
     def system_findings(self) -> Iterable[oc.Finding]:
-        for sub in ("/Library/LaunchAgents", "/Library/LaunchDaemons"):
+        for sub in SYSTEM_DIRS:
             yield from self._scan_dir(oc.in_root(self.sysroot, sub), system=True)
 
     def user_findings(self) -> Iterable[oc.Finding]:

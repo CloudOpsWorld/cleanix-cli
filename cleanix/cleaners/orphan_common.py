@@ -25,6 +25,7 @@ from typing import Callable, Iterable, Optional, Sequence, Tuple
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core import platform as _platform
+from cleanix.core import scanmode
 from cleanix.core.models import CleanableItem, ItemKind
 from cleanix.core.remedy import Remedy, RemedyKind, fingerprint_of
 from cleanix.core.utils import _allocated_bytes, run_command, which
@@ -517,6 +518,10 @@ class OrphanReporter(Cleaner):
             yield from self._stop_note()
             if self.budget.stop_reason:
                 return
+        if scanmode.is_helper_mode():
+            # The elevated helper acts only on system-wide findings: it never
+            # walks the invoking user's per-user areas for candidates.
+            return
         yield from self._emit(self.user_findings())
         yield from self._stop_note()
 

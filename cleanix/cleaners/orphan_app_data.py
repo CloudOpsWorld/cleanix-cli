@@ -75,6 +75,9 @@ _STEAM_DIRS = (
 _STEAM_APPS = "Library/Application Support/Steam/steamapps"
 _ACF_NAME = re.compile(r'^\s*"name"\s+"([^"]{1,200})"', re.M)
 _LAUNCH_DIRS = ("/Library/LaunchAgents", "/Library/LaunchDaemons")
+# The system-wide folders scanned (folders in the first, .plist files in the
+# second). Also the elevated helper's allowed roots for this scenario.
+SYSTEM_DIRS = ("/Library/Application Support", "/Library/Preferences")
 
 
 # --------------------------------------------------------------- id helpers
@@ -375,9 +378,8 @@ class OrphanAppDataReporter(oc.OrphanReporter):
                 requires_root=False,
             )
             return
-        lib = oc.in_root(self.sysroot, "/Library")
-        yield from self._scan_dir(lib / "Application Support", dirs=True, system=True)
-        yield from self._scan_dir(lib / "Preferences", dirs=False, system=True)
+        for logical, dirs in zip(SYSTEM_DIRS, (True, False)):
+            yield from self._scan_dir(oc.in_root(self.sysroot, logical), dirs=dirs, system=True)
 
     def user_findings(self) -> Iterable[oc.Finding]:
         if self._installed() is None:

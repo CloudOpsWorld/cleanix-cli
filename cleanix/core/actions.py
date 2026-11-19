@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from cleanix.config import Config
@@ -124,18 +125,24 @@ def _recheck(item: CleanableItem, config: Config) -> Optional[str]:
 def _verify(item: CleanableItem, batch: Set[str],
             hashed: Dict[Tuple[str, Tuple[int, ...]], Optional[str]],
             config: Config,
-            cancel: Optional[Callable[[], bool]] = None) -> Optional[str]:
+            cancel: Optional[Callable[[], bool]] = None,
+            allow_root: bool = False,
+            root_mode: bool = False) -> Optional[str]:
     """Why ``item`` must be skipped, or None when it may be acted on now.
 
     ``batch`` holds the path keys of every supplied item (a duplicate's
     kept copy must not be among them); ``hashed`` caches the kept-copy
-    content checks of this batch."""
+    content checks of this batch. ``allow_root`` lets ``requires_root``
+    findings through (elevated helper only); ``root_mode`` (helper) handles
+    plain PATH findings only: no duplicates, no launch jobs or units."""
     remedy = item.remedy
     if not item.report_only or remedy is None:
         return NOT_A_FINDING
     if item.kind is not ItemKind.PATH or remedy.kind not in _HANDLED or not item.path:
         return NOT_HANDLED
-    if item.requires_root:
+    if root_mode and (remedy.kind is not RemedyKind.PATH or remedy.group):
+        return NOT_HANDLED
+    if item.requires_root and not allow_root:
         return NEEDS_ELEVATION
     if remedy.group:
         if remedy.kind is not RemedyKind.PATH:
@@ -207,6 +214,9 @@ def act(
     progress: Optional[Callable[[str, int, int], None]] = None,
     cancel: Optional[Callable[[], bool]] = None,
     record_history: bool = True,
+    allow_root: bool = False,
+    quarantine_root: Optional[Path] = None,
+    extra_check: Optional[Callable[[CleanableItem], Optional[str]]] = None,
 ) -> ActSummary:
     """Act on findings: quarantine (or, with ``permanent``, delete) each
     verified PATH finding through :func:`service.clean`, as one batch (one
@@ -230,10 +240,24 @@ def act(
     was disabled. Their outcomes' ``note`` says what was done ("permanent:
     ... a copy of the file is kept in <dir> ..."). ``quarantine_run`` only
     ever holds PATH findings.
+
+    Elevated helper only (never the CLI/GUI path): ``allow_root=True`` acts
+    on ``requires_root`` findings (otherwise skipped "needs an elevated
+    run"); ``quarantine_root`` is the helper's own validated, root-owned
+    quarantine directory, the only case in which ``record_history=False``
+    may be combined with a quarantine; ``extra_check`` is called (after
+    every built-in check) up front and again right before each removal,
+    a non-None return skipping the item. With ``allow_root`` or
+    ``quarantine_root`` only plain PATH findings are handled (no
+    duplicates, launch jobs or units).
     """
     items = list(items)
-    if not record_history and not permanent and not dry_run:
+    if not record_history and not permanent and not dry_run and quarantine_root is None:
         raise ValueError("record_history=False cannot be combined with quarantine")
+    root_mode = allow_root or quarantine_root is not None
+
+    def extra(item: CleanableItem) -> Optional[str]:
+        return extra_check(item) if extra_check is not None else None
     # The guard below must see the user's protected globs (service.clean
     # sets them again; same value).
     safety.set_protected_globs(config.protected_globs)
@@ -262,7 +286,10 @@ def act(
             reason = KEEPS_COPY
         else:
             try:
-                reason = _verify(item, batch, hashed, config, cancel)
+                reason = _verify(item, batch, hashed, config, cancel,
+                                 allow_root=allow_root, root_mode=root_mode)
+                if reason is None:
+                    reason = extra(item)
             except Exception as exc:  # noqa: BLE001 - fail closed, never abort the batch
                 reason = f"could not be verified ({str(exc) or type(exc).__name__})"
         if key is not None:
@@ -319,6 +346,8 @@ def act(
                         why = prepare(activated, finding)
                     else:
                         why = _recheck(finding, config)
+                        if why is None:
+                            why = extra(finding)
                 except Exception as exc:  # noqa: BLE001 - fail closed
                     why = f"could not be verified ({str(exc) or type(exc).__name__})"
             if why is not None:
@@ -334,6 +363,8 @@ def act(
                 use_quarantine=quarantine_paths, progress=progress, cancel=cancel,
                 record_history=record_history, precheck=precheck,
                 delete_instead=lambda a: id(a) in jobs,
+                **({} if quarantine_root is None
+                   else {"quarantine_root": quarantine_root}),
             )
         finally:
             if backup[0] is not None:

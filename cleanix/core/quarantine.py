@@ -125,7 +125,11 @@ class Quarantine:
     anything was written. :meth:`save` refuses to replace a manifest this
     object did not write."""
 
-    def __init__(self, run_id: str):
+    def __init__(self, run_id: str, root: Optional[Path] = None):
+        # ``root`` (the elevated helper only): a quarantine root the caller
+        # created and validated itself; it is used instead of
+        # ``quarantine_root()`` and never created here.
+        self._root: Optional[Path] = Path(root) if root is not None else None
         self._set_id(run_id)
         self.items: List[Dict] = []
         # item_key -> index of its registry entry in ``items`` (this process only)
@@ -133,25 +137,33 @@ class Quarantine:
         self._claimed = False
         self._written: Optional[str] = None  # sha256 of the manifest we last wrote
 
+    def _base(self) -> Path:
+        return self._root if self._root is not None else quarantine_root()
+
     def _set_id(self, run_id: str) -> None:
         self.run_id = run_id
-        self.dir = quarantine_root() / run_id
+        self.dir = self._base() / run_id
         self.files_dir = self.dir / "files"
 
     def _claim(self) -> None:
-        """Create this run's directory exclusively (retrying with a fresh id)."""
+        """Create this run's directory exclusively (retrying with a fresh id).
+        An explicit ``root`` must already exist (it is never created here)."""
         if self._claimed:
             return
-        quarantine_root().mkdir(parents=True, exist_ok=True)
+        if self._root is None:
+            quarantine_root().mkdir(parents=True, exist_ok=True)
         for _ in range(32):
             try:
-                self.dir.mkdir(exist_ok=False)
+                if self._root is None:
+                    self.dir.mkdir(exist_ok=False)
+                else:
+                    self.dir.mkdir(mode=0o700, exist_ok=False)
             except FileExistsError:
                 self._set_id(_make_run_id())
                 continue
             self._claimed = True
             return
-        raise FileExistsError(f"could not create a unique quarantine run under {quarantine_root()}")
+        raise FileExistsError(f"could not create a unique quarantine run under {self._base()}")
 
     def store(self, path: os.PathLike | str) -> None:
         """Move ``path`` into this quarantine run, recording its origin."""
@@ -409,9 +421,10 @@ class Quarantine:
         return describe_registry_entries(run_id)
 
 
-def new_run() -> Quarantine:
-    """A new run. Nothing is created on disk until the first write."""
-    return Quarantine(_make_run_id())
+def new_run(root: Optional[Path] = None) -> Quarantine:
+    """A new run. Nothing is created on disk until the first write.
+    ``root``: see :class:`Quarantine` (elevated helper only)."""
+    return Quarantine(_make_run_id(), root=root)
 
 
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024

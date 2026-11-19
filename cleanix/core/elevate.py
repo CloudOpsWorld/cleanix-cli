@@ -23,13 +23,14 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import stat
 import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 REQUEST_NAME = "request.json"
 RESULT_NAME = "result.json"
@@ -49,6 +50,26 @@ _REQUEST_FIELDS = {"version", "invoking_user", "only", "keys", "use_quarantine",
 REGISTRY_FIELD = "registry"
 _REGISTRY_FIELDS = {"only", "keys", "backup_run", "quarantine_root"}
 MAX_ROOT_LEN = 1024
+# The optional findings action (system-wide report-only findings, POSIX
+# only; see ``FindingsRequest``).
+FINDINGS_FIELD = "findings"
+_FINDINGS_FIELDS = {"only", "items", "permanent"}
+_FINDING_ITEM_FIELDS = {"key", "fingerprint", "kind"}
+MAX_FINDING_SCENARIOS = 16
+MAX_FINDING_ITEMS = 1000
+MAX_FINDING_PATH_LEN = 1024
+MAX_FINDING_COMPONENT_BYTES = 255
+# Every RemedyKind value (the request may name any; the helper refuses, per
+# item, the kinds it does not handle yet).
+FINDING_KINDS = frozenset({"path", "launch_job", "systemd_unit", "pkg_receipt"})
+FINDING_STATUSES = frozenset({"removed", "not_removed", "skipped", "refused", "not_found"})
+_FP_MIN = -(2 ** 63)
+_FP_MAX = 2 ** 64
+# Report-only cleaners whose findings can be system-wide (requires_root).
+SYSTEM_FINDING_IDS = frozenset({
+    "orphan_files", "orphan_app_data", "stale_launchers", "stale_services",
+    "orphan_launch_jobs", "stale_receipts",
+})
 
 _POSIX = os.name != "nt"
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -76,6 +97,43 @@ class RegistryRequest:
     quarantine_root: str
 
 
+@dataclass(frozen=True)
+class FindingSelection:
+    """One finding the user ticked: its item key (``<cleaner>|path|<path>``),
+    the remedy fingerprint seen by the caller's scan and the remedy kind
+    (a ``RemedyKind`` value). Identifiers only: the helper acts on its OWN
+    scan's item with this key and fingerprint, never on this claim."""
+
+    key: str
+    fingerprint: Tuple[int, int, int, int]
+    kind: str
+
+
+@dataclass
+class FindingsRequest:
+    """The findings action: act on system-wide (requires_root) report-only
+    findings (POSIX only). ``only`` names the scenarios (report-only cleaner
+    ids) the helper re-scans; ``permanent`` deletes instead of moving into
+    the helper's root-owned quarantine. There is deliberately NO quarantine
+    or home path here: the helper chooses its own root-owned location and
+    writes nothing under the invoking user's home."""
+
+    only: List[str]
+    items: List[FindingSelection]
+    permanent: bool = False
+
+
+@dataclass
+class FindingOutcome:
+    """Per-item result of the findings action. ``status`` is one of
+    ``FINDING_STATUSES``; ``key`` is the request's own (validated) key."""
+
+    key: str
+    status: str
+    freed: int = 0
+    reason: str = ""
+
+
 @dataclass
 class Selection:
     invoking_user: str
@@ -87,6 +145,9 @@ class Selection:
     use_quarantine: bool
     nonce: str = field(default_factory=new_nonce)
     registry: Optional[RegistryRequest] = None
+    # Exclusive: a request with a findings part has empty only/keys and no
+    # registry part.
+    findings: Optional[FindingsRequest] = None
 
 
 @dataclass
@@ -100,6 +161,11 @@ class HelperResult:
     # Requested keys that matched the fresh scan but are not eligible for an
     # elevated clean (report-only, or not requiring admin rights).
     refused: int = 0
+    # Findings action only: one outcome per requested item (request order)
+    # and the id of the run in the helper's root-owned quarantine ("" when
+    # nothing was moved there).
+    findings: List[FindingOutcome] = field(default_factory=list)
+    quarantine_run: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -284,6 +350,14 @@ def write_request(directory: Path, selection: Selection) -> Path:
             "backup_run": reg.backup_run,
             "quarantine_root": reg.quarantine_root,
         }
+    fnd = selection.findings
+    if fnd is not None:
+        payload[FINDINGS_FIELD] = {
+            "only": list(fnd.only),
+            "items": [{"key": s.key, "fingerprint": [int(x) for x in s.fingerprint],
+                       "kind": s.kind} for s in fnd.items],
+            "permanent": bool(fnd.permanent),
+        }
     path = Path(directory) / REQUEST_NAME
     _atomic_write(path, json.dumps(payload).encode("utf-8"), 0o600)
     return path
@@ -397,13 +471,232 @@ def _parse_registry(obj) -> RegistryRequest:
     return RegistryRequest(only=only, keys=keys, backup_run=run, quarantine_root=root)
 
 
+# --------------------------------------------------------------------------
+# findings action: purely lexical checks (never touch the filesystem)
+# --------------------------------------------------------------------------
+def _bad_char(c: str) -> bool:
+    o = ord(c)
+    # C0/C1 controls, DEL, lone surrogates (non-UTF-8 names arriving through
+    # JSON) and the Unicode line/paragraph separators.
+    return (o < 0x20 or 0x7F <= o <= 0x9F or 0xD800 <= o <= 0xDFFF
+            or o in (0x2028, 0x2029))
+
+
+def posix_path_problem(path) -> Optional[str]:
+    """Why ``path`` is not an acceptable POSIX path for the findings action,
+    judged from its text alone (``posixpath``, also on Windows), or None.
+
+    Accepted: absolute (one leading ``/``), already normalised (no trailing
+    slash, no ``//``, ``.`` or ``..`` component), no control characters,
+    surrogates or line separators, at most ``MAX_FINDING_PATH_LEN``
+    characters and ``MAX_FINDING_COMPONENT_BYTES`` bytes per component,
+    and never the filesystem root itself."""
+    if not isinstance(path, str) or not path:
+        return "not a path"
+    if len(path) > MAX_FINDING_PATH_LEN:
+        return "the path is too long"
+    if any(_bad_char(c) for c in path):
+        return "the path contains control or invalid characters"
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return "the path is not valid UTF-8"
+    if not path.startswith("/") or path.startswith("//"):
+        return "the path is not absolute"
+    if path == "/":
+        return "the path is the filesystem root"
+    if posixpath.normpath(path) != path:
+        return "the path is not normalised"
+    for comp in path.split("/")[1:]:
+        if comp in ("", ".", ".."):
+            return "the path is not normalised"
+        if len(comp.encode("utf-8")) > MAX_FINDING_COMPONENT_BYTES:
+            return "a path component is too long"
+    return None
+
+
+def finding_key_parts(key) -> Tuple[str, str]:
+    """``(cleaner_id, path)`` of a PATH item key (``models.item_key``:
+    ``<cleaner>|path|<path>``) with a lexically acceptable POSIX path.
+    Raises ValueError for anything else."""
+    if not isinstance(key, str) or len(key) > 64 + 6 + MAX_FINDING_PATH_LEN:
+        raise ValueError("not a finding key")
+    parts = key.split("|", 2)
+    if len(parts) != 3 or parts[1] != "path" or not _CLEANER_ID_RE.fullmatch(parts[0]):
+        raise ValueError("not a finding key")
+    problem = posix_path_problem(parts[2])
+    if problem:
+        raise ValueError(f"not a finding key: {problem}")
+    return parts[0], parts[2]
+
+
+def _parse_fingerprint(value) -> Tuple[int, int, int, int]:
+    if not isinstance(value, list) or len(value) != 4:
+        raise ValueError("request field 'findings.items.fingerprint' is invalid")
+    for v in value:
+        if type(v) is not int or not _FP_MIN <= v < _FP_MAX:  # bool is refused
+            raise ValueError("request field 'findings.items.fingerprint' is invalid")
+    if all(v == 0 for v in value):
+        raise ValueError("request field 'findings.items.fingerprint' is invalid")
+    return (value[0], value[1], value[2], value[3])
+
+
+def _parse_findings(obj) -> FindingsRequest:
+    """The findings action. Exact fields and types, bounded sizes, every
+    key a ``<cleaner>|path|<path>`` key of a listed scenario with a
+    lexically acceptable path, no key twice; anything else refuses the
+    WHOLE request (nothing is scanned or deleted)."""
+    if not isinstance(obj, dict) or set(obj) != _FINDINGS_FIELDS:
+        raise ValueError("request field 'findings' has missing or unexpected fields")
+    only = _str_list(obj["only"], "findings.only", _CLEANER_ID_RE, 64)
+    if not only or len(only) > MAX_FINDING_SCENARIOS or len(set(only)) != len(only):
+        raise ValueError("request field 'findings.only' is invalid")
+    if not isinstance(obj["permanent"], bool):
+        raise ValueError("request field 'findings.permanent' is invalid")
+    raw = obj["items"]
+    if not isinstance(raw, list) or not raw or len(raw) > MAX_FINDING_ITEMS:
+        raise ValueError("request field 'findings.items' is invalid")
+    items: List[FindingSelection] = []
+    seen = set()
+    for entry in raw:
+        if not isinstance(entry, dict) or set(entry) != _FINDING_ITEM_FIELDS:
+            raise ValueError("request field 'findings.items' is invalid")
+        key = entry["key"]
+        try:
+            cid, _path = finding_key_parts(key)
+        except ValueError:
+            raise ValueError("request field 'findings.items.key' is invalid") from None
+        if cid not in only:
+            raise ValueError("request field 'findings.items.key' names an unlisted scenario")
+        if key in seen:
+            raise ValueError("request field 'findings.items' lists an item twice")
+        seen.add(key)
+        kind = entry["kind"]
+        if not isinstance(kind, str) or kind not in FINDING_KINDS:
+            raise ValueError("request field 'findings.items.kind' is invalid")
+        items.append(FindingSelection(key=key, fingerprint=_parse_fingerprint(
+            entry["fingerprint"]), kind=kind))
+    return FindingsRequest(only=only, items=items, permanent=obj["permanent"])
+
+
+def findings_request_for(items: Sequence, *, permanent: bool = False) -> FindingsRequest:
+    """The findings part for ``items`` (report-only PATH items with a
+    remedy), as the unprivileged caller builds it. Raises ValueError for an
+    item that cannot be named (no remedy, no lexically acceptable key)."""
+    from cleanix.core.models import item_key
+
+    only: List[str] = []
+    sels: List[FindingSelection] = []
+    for item in items:
+        remedy = getattr(item, "remedy", None)
+        if remedy is None or not getattr(item, "report_only", False):
+            raise ValueError("only findings with a remedy can be requested")
+        key = item_key(item)
+        cid, _path = finding_key_parts(key)
+        if cid not in only:
+            only.append(cid)
+        fp = tuple(int(x) for x in remedy.fingerprint)
+        sels.append(FindingSelection(key=key, fingerprint=fp,  # type: ignore[arg-type]
+                                     kind=str(remedy.kind.value)))
+    return FindingsRequest(only=only, items=sels, permanent=bool(permanent))
+
+
+def admin_finding_ids() -> FrozenSet[str]:
+    """Scenarios whose system-wide findings the helper may act on: the
+    report-only cleaners in ``SYSTEM_FINDING_IDS`` that have a finding
+    category and support this platform. POSIX only (empty on Windows).
+    Separate from ``admin_cleaner_ids()`` (ordinary admin cleaners) and
+    ``admin_registry_cleaner_ids()`` (registry detectors)."""
+    from cleanix.config import Config
+    from cleanix.core import platform as plat
+    from cleanix.core import registry
+    from cleanix.core.findings import FINDING_CATEGORIES
+
+    if plat.is_windows():
+        return frozenset()
+    ids = set()
+    for cls in registry.ALL_CLEANERS:
+        cid = cls.id
+        if cid not in SYSTEM_FINDING_IDS or cid not in FINDING_CATEGORIES:
+            continue
+        try:
+            inst = cls(Config())
+        except Exception:  # noqa: BLE001
+            continue
+        if inst.supported():
+            ids.add(cid)
+    return frozenset(ids)
+
+
+def finding_path_roots() -> Dict[str, Tuple[str, ...]]:
+    """Per scenario, the system directories under which its system-wide
+    findings lie, taken from the detectors' own constants (never invented
+    here). A findings path must lie STRICTLY below one of its scenario's
+    roots. A scenario with no PATH findings has no roots."""
+    from cleanix.cleaners import (
+        orphan_app_data,
+        orphan_files,
+        orphan_launch_jobs,
+        stale_launchers,
+        stale_receipts,
+        stale_services,
+    )
+
+    return {
+        "orphan_files": tuple(orphan_files._ROOTS),
+        "orphan_app_data": tuple(orphan_app_data.SYSTEM_DIRS),
+        "stale_launchers": (stale_launchers._LOCAL_DIR,) + tuple(stale_launchers._OWNED_DIRS),
+        "stale_services": tuple(stale_services._SYSTEM_SCAN),
+        "orphan_launch_jobs": tuple(orphan_launch_jobs.SYSTEM_DIRS),
+        "stale_receipts": (stale_receipts.RECEIPTS_DIR,),
+    }
+
+
+def _under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def finding_path_problem(cleaner_id: str, path: str,
+                         roots: Dict[str, Tuple[str, ...]],
+                         never: Sequence[str] = ()) -> Optional[str]:
+    """Why the helper never acts on ``path`` for ``cleaner_id`` (lexical
+    only), or None. ``path`` must be acceptable to ``posix_path_problem``,
+    lie strictly below one of the scenario's ``roots``, and be neither
+    equal to nor an ancestor of a protected root (``safety._PROTECTED``),
+    any scenario's root, the standard ``/usr/local`` folders or a path in
+    ``never`` (the helper's own quarantine); nor lie inside a ``never``
+    path."""
+    from cleanix.cleaners import orphan_files
+    from cleanix.core import safety
+
+    problem = posix_path_problem(path)
+    if problem:
+        return problem
+    own = roots.get(cleaner_id, ())
+    if not any(path != r and _under(path, r) for r in own):
+        return "it is not inside a folder this scenario reports on"
+    fixed = set(safety._PROTECTED)
+    for rs in roots.values():
+        fixed.update(rs)
+    fixed.update(f"/usr/local/{d}" for d in orphan_files._USR_LOCAL_STD)
+    fixed.update(never)
+    for p in fixed:
+        if _under(p, path):
+            return "it is, or contains, a protected folder"
+    for p in never:
+        if _under(path, p):
+            return "it is inside the administrator quarantine"
+    return None
+
+
 def parse_request(data: bytes) -> Selection:
     try:
         obj = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise ValueError("request is not valid JSON") from None
     if not isinstance(obj, dict) or (set(obj) != _REQUEST_FIELDS
-                                     and set(obj) != _REQUEST_FIELDS | {REGISTRY_FIELD}):
+                                     and set(obj) != _REQUEST_FIELDS | {REGISTRY_FIELD}
+                                     and set(obj) != _REQUEST_FIELDS | {FINDINGS_FIELD}):
         raise ValueError("request has missing or unexpected fields")
     if obj["version"] != FORMAT_VERSION or isinstance(obj["version"], bool):
         raise ValueError("request version is not supported")
@@ -416,14 +709,23 @@ def parse_request(data: bytes) -> Selection:
     nonce = obj["nonce"]
     if not isinstance(nonce, str) or not _NONCE_RE.fullmatch(nonce):
         raise ValueError("request field 'nonce' is invalid")
+    only = _str_list(obj["only"], "only", _CLEANER_ID_RE, 64)
+    keys = _str_list(obj["keys"], "keys")
+    findings = None
+    if FINDINGS_FIELD in obj:
+        # Exclusive: never combined with ordinary admin items.
+        if only or keys:
+            raise ValueError("request combines findings with other items")
+        findings = _parse_findings(obj[FINDINGS_FIELD])
     return Selection(
         invoking_user=user,
-        only=_str_list(obj["only"], "only", _CLEANER_ID_RE, 64),
-        keys=_str_list(obj["keys"], "keys"),
+        only=only,
+        keys=keys,
         use_quarantine=obj["use_quarantine"],
         nonce=nonce,
         registry=(_parse_registry(obj[REGISTRY_FIELD])
                   if REGISTRY_FIELD in obj else None),
+        findings=findings,
     )
 
 
@@ -517,7 +819,34 @@ def _result_payload(result: HelperResult) -> dict:
         "refused": int(result.refused),
         "deadline_hit": bool(result.deadline_hit),
         "errors": [plain_text(e) for e in list(result.errors)[:MAX_ERRORS]],
+        "findings": [
+            {"key": str(o.key), "status": str(o.status), "freed": max(0, int(o.freed)),
+             "reason": plain_text(o.reason)}
+            for o in list(result.findings)[:MAX_FINDING_ITEMS]
+        ],
+        "quarantine_run": str(result.quarantine_run),
     }
+
+
+_RESULT_RUN_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z._-]{0,127}")
+
+
+def _parse_finding_outcomes(value) -> List[FindingOutcome]:
+    if not isinstance(value, list) or len(value) > MAX_FINDING_ITEMS:
+        raise ValueError("result field 'findings' is invalid")
+    out: List[FindingOutcome] = []
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != {"key", "status", "freed", "reason"}:
+            raise ValueError("result field 'findings' is invalid")
+        key, status, freed, reason = (entry["key"], entry["status"], entry["freed"],
+                                      entry["reason"])
+        if (not isinstance(key, str) or len(key) > 64 + 6 + MAX_FINDING_PATH_LEN
+                or status not in FINDING_STATUSES or not isinstance(reason, str)
+                or type(freed) is not int or freed < 0):
+            raise ValueError("result field 'findings' is invalid")
+        out.append(FindingOutcome(key=key, status=status, freed=freed,
+                                  reason=plain_text(reason)))
+    return out
 
 
 def write_result(path: Path, result: HelperResult, *,
@@ -551,9 +880,14 @@ def read_result(path: Path) -> HelperResult:
     deadline_hit = obj.get("deadline_hit", False)
     if not isinstance(nonce, str) or not isinstance(deadline_hit, bool):
         raise ValueError("result is invalid")
+    run = obj.get("quarantine_run", "")
+    if not isinstance(run, str) or (run and not _RESULT_RUN_RE.fullmatch(run)):
+        raise ValueError("result field 'quarantine_run' is invalid")
     return HelperResult(
         freed=num("freed"), removed=num("removed"),
         errors=[plain_text(e) for e in errors[:MAX_ERRORS]],
         unmatched=num("unmatched"), nonce=nonce, deadline_hit=deadline_hit,
         refused=num("refused"),
+        findings=_parse_finding_outcomes(obj.get("findings", [])),
+        quarantine_run=run,
     )
