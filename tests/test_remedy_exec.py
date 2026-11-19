@@ -324,6 +324,33 @@ def test_symlinked_plist_refused(env, tmp_path):
 
 
 @posix_only
+def test_broken_job_link_from_scan_gets_an_honest_reason(env, tmp_path):
+    link = _agents(env) / "com.gone.link.plist"
+    link.parent.mkdir(parents=True)
+    os.symlink(str(tmp_path / "nowhere.plist"), str(link))
+    item = _scanned(olj.OrphanLaunchJobReporter, link)
+    assert item.remedy.kind is RemedyKind.LAUNCH_JOB
+    summary = actions.act([item], Config(), dry_run=False)
+    assert _skips(summary) == [remedy_exec.IS_LINK]
+    assert os.path.islink(link) and env.rec.calls == []
+
+
+def test_copy_only_run_is_never_the_run_to_undo(env):
+    f = env.home / "big.bin"
+    f.write_bytes(b"x" * 4096)
+    path_item = CleanableItem(cleaner_id="big_files", description="big", size=4096,
+                              path=str(f), report_only=True, remedy=path_remedy(str(f)))
+    first = actions.act([path_item], Config(), dry_run=False)
+    assert first.quarantine_run
+    _p, item = _job_item(env)
+    second = actions.act([item], Config(), dry_run=False, permanent=True)
+    assert second.backup_run and second.backup_run != first.quarantine_run
+    run = [r for r in quarantine.list_runs() if r["run_id"] == second.backup_run][0]
+    assert run["copies"] == run["count"] == 1 and run["removed_count"] == 0
+    assert quarantine.latest_run() == first.quarantine_run
+
+
+@posix_only
 def test_symlinked_launchagents_dir_refused(env, tmp_path):
     outside = tmp_path / "outside"
     p = _job(env, name="com.gone.out", where=outside)

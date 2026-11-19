@@ -64,6 +64,7 @@ BAD_DATA = "unexpected remedy data; refused"
 EVIDENCE_GONE = ("the detector no longer reports it as stale (program present, "
                  "file changed or cannot be judged); nothing removed")
 NOT_OWNED = "not owned by your account; refused"
+IS_LINK = "a link, not a job file; not handled here (remove the link by hand)"
 BLOCKED = "blocked by safety guard (protected path)"
 
 
@@ -334,6 +335,10 @@ def check(item: "CleanableItem", config: "Config") -> Tuple[Optional[str], Optio
     why = _placement(path, kind)
     if why is not None:
         return why, None
+    if os.path.islink(path):
+        # e.g. a broken job link the detector reports: there is no job file
+        # to stop or copy here (only a plain file is ever acted on).
+        return IS_LINK, None
     why = _identity(path, remedy.fingerprint)
     if why is not None:
         return why, None
