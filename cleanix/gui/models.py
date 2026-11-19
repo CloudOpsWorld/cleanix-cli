@@ -88,6 +88,20 @@ class CleanerListModel(QAbstractListModel):
         return [i.id for i in self._infos if self._checked[i.id]]
 
 
+def is_bulk_selectable(item: CleanableItem) -> bool:
+    """Whether a bulk action (Select all, quick-selects) may tick the item.
+    Registry entries are only ever ticked one by one or by their own group."""
+    return not item.report_only and item.kind is not ItemKind.REGISTRY
+
+
+def size_text(items) -> str:
+    """Size cell text: registry entries have no size, shown as a dash."""
+    items = list(items)
+    if items and all(i.kind is ItemKind.REGISTRY for i in items):
+        return "-"
+    return human_size(sum(i.size for i in items))
+
+
 def _type_label(item: CleanableItem) -> str:
     if item.report_only:
         return "Review"
@@ -237,7 +251,7 @@ class ItemTableModel(QAbstractTableModel):
                 return f"{ADMIN_TOOLTIP}. {problem}" if problem else ADMIN_TOOLTIP
             if col == 2:
                 return f"{item.description}\n{_target_text(item)}"
-            return self._text(item, col) if col != 3 else human_size(item.size)
+            return self._text(item, col) if col != 3 else size_text([item])
         if role == Qt.ItemDataRole.TextAlignmentRole and col == 3:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if role == Qt.ItemDataRole.DisplayRole:
@@ -252,7 +266,7 @@ class ItemTableModel(QAbstractTableModel):
         if col == 2:
             return item.description
         if col == 3:
-            return human_size(item.size)
+            return size_text([item])
         if col == 4:
             return "Admin" if item.requires_root else ""
         return _type_label(item)

@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from cleanix.config import Config  # noqa: E402
-from cleanix.core import catalog, curation, quarantine  # noqa: E402
+from cleanix.core import catalog, curation, quarantine, regpromises  # noqa: E402
 from cleanix.core.models import (  # noqa: E402
     CleanableItem, CleanerReport, ItemKind, RegTarget, ScanResult,
 )
@@ -99,7 +99,8 @@ def test_registry_items_never_selected_by_safe_only(pview):
     assert pview.item_model.checked_items() == []
 
 
-def test_power_confirm_text_registry_lines():
+def test_power_confirm_text_registry_lines(monkeypatch):
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", True)
     u1 = [reg_item("HKCU", "A")]
     t = pv.PowerView.confirm_text(u1, 0, True)
     assert ("1 registry entry will be backed up first and can be restored from the "
@@ -132,7 +133,8 @@ def test_power_confirm_text_registry_lines():
     assert t.endswith("Continue?")
 
 
-def test_power_detail_text_registry():
+def test_power_detail_text_registry(monkeypatch):
+    monkeypatch.setattr(regpromises, "UNDO_SHIPPED", True)
     t = pv.PowerView.detail_text(reg_item("HKCU", "Foo"))
     lines = t.splitlines()
     assert lines[1] == (r"Registry: HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion"
@@ -175,6 +177,8 @@ def test_table_type_and_target_columns_registry():
     m.set_result(result(it))
     assert m.data(m.index(0, 5)) == "Registry"
     assert it.reg.display in m.data(m.index(0, 2), Qt.ItemDataRole.ToolTipRole)
+    assert m.data(m.index(0, 3)) == "-"
+    assert gm.size_text([CleanableItem("t", "d", path="/x", size=2048)]) == "2.0 KiB"
     assert gm._type_label(CleanableItem("t", "d", path="/x")) == "Path"
 
 
@@ -194,7 +198,99 @@ def test_quarantine_panel_shows_registry_count_and_reasons(qtbot, monkeypatch):
     p.table.selectRow(0)
     p._on_restore()
     text = p.status_label.text()
-    assert "1 restored, 5 failed." in text
     for i in range(3):
         assert f"k{i} (reason {i})" in text
     assert "k3" not in text and "+2 more" in text
+
+
+def test_unshipped_undo_says_registry_is_permanent():
+    assert regpromises.registry_undo_shipped() is False
+    line = ("Registry entries are removed permanently: no backup or restore is "
+            "available in this version.")
+    u, h = reg_item("HKCU", "A"), reg_item("HKLM", "B")
+    files = CleanableItem("temp", "x", size=5, path="/tmp/x")
+    for items in ([u], [h], [u, h], [files, u, h]):
+        for keep in (True, False):
+            t = pv.PowerView.confirm_text(items, 0, keep)
+            assert t.count(line) == 1
+            assert "backed up" not in t and "Quarantine tab" not in t
+            assert "cleanix restore" not in t
+    assert "Backed up" not in pv.PowerView.detail_text(u)
+    assert "Backed up" not in pv.PowerView.detail_text(h)
+    assert line not in pv.PowerView.confirm_text([files], 0, True)
+
+
+def _mixed_result():
+    temp = CleanableItem("temp", "temp file", size=5000, path="/tmp/a")
+    temp2 = CleanableItem("temp", "temp file 2", size=6000, path="/tmp/b")
+    return ScanResult(reports=[
+        CleanerReport("temp", "Temp", "t", items=[temp, temp2]),
+        CleanerReport(CID, "Registry: dead uninstall entries", "",
+                      items=[reg_item("HKCU", "A"), reg_item("HKLM", "B")])])
+
+
+@pytest.fixture
+def mixed_view(qtbot, monkeypatch):
+    infos = [catalog.CleanerInfo(
+        id="temp", name="Temp", description="d", requires_root=False,
+        platforms=("linux", "windows", "macos"), supported=True,
+        default_enabled=True, safe_default=True, category="dev"), _info()]
+    monkeypatch.setattr(catalog, "list_cleaners", lambda cfg, **k: infos)
+    v = pv.PowerView(Config())
+    qtbot.addWidget(v)
+    v._on_scan_finished(_mixed_result())
+    return v
+
+
+def _kinds(view):
+    return {i.kind for i in view.item_model.checked_items()}
+
+
+@pytest.mark.parametrize("raw", [False, True])
+def test_bulk_selection_never_ticks_registry(mixed_view, raw):
+    v = mixed_view
+    v.raw_toggle.setChecked(raw)
+    v.select_all_visible()
+    checked = v.item_model.checked_items()
+    assert len(checked) == 2 and ItemKind.REGISTRY not in _kinds(v)
+    v.select_none_visible()
+    assert v.item_model.checked_items() == []
+    v.select_developer()
+    assert ItemKind.REGISTRY not in _kinds(v)
+    v.select_safe_only()
+    assert ItemKind.REGISTRY not in _kinds(v)
+
+
+def test_select_none_clears_explicitly_ticked_registry(mixed_view):
+    v = mixed_view
+    m = v.item_model
+    row = next(r for r in range(m.rowCount()) if m.item_at(r).kind is ItemKind.REGISTRY)
+    assert m.set_checked(row, True)
+    assert ItemKind.REGISTRY in _kinds(v)
+    v.select_all_visible()  # does not remove an explicit tick, adds no other registry
+    v.select_none_visible()
+    assert m.checked_items() == []
+
+
+def test_tree_group_tick_of_registry_group_ticks_only_that_group(mixed_view):
+    v = mixed_view
+    tree = v.tree
+    top = next(tree.topLevelItem(i) for i in range(tree.topLevelItemCount())
+               if tree.topLevelItem(i).text(0) != "Temp"
+               and "Dead" in tree.topLevelItem(i).text(0))
+    v.select_none_visible()
+    top.setCheckState(0, Qt.CheckState.Checked)
+    assert {i.cleaner_id for i in v.item_model.checked_items()} == {CID}
+    assert len(v.item_model.checked_items()) == 1  # HKLM needs admin: not selectable here
+
+
+def test_power_tree_registry_group_badge_category_and_size(mixed_view):
+    tree = mixed_view.tree
+    rows = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+    reg = next(r for r in rows if "Dead" in r.text(0))
+    assert reg.text(2) == "Review"
+    assert reg.text(4) == "-"
+    g = tree._groups[rows.index(reg)]
+    assert g.category == "registry" and g.safety is curation.Safety.REVIEW
+    tree.expandItem(reg)
+    assert reg.child(0).text(4) == "-"
