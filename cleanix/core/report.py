@@ -105,14 +105,14 @@ def render_registry_items(items: list, console: Console) -> None:
     table = Table(title="Registry entries", title_style="cyan")
     table.add_column("Hive", style="magenta")
     table.add_column("Target", style="cyan", overflow="fold")
-    table.add_column("Evidence", overflow="fold")
-    table.add_column("Hint", style="dim", overflow="fold")
+    table.add_column("What", overflow="fold")
+    table.add_column("Evidence", style="dim", overflow="fold")
     for i in items:
         table.add_row(
             i.reg.hive if i.reg else "",
             safe(item_target(i)),
             safe(i.description),
-            safe(i.hint or ""),
+            safe(i.hint or ""),  # the detectors put their evidence in the hint
         )
     console.print(table)
     console.print(f"[yellow]{safe(registry_notice())}[/yellow]")
