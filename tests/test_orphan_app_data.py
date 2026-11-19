@@ -44,12 +44,18 @@ def _age(path: Path, days: float = OLD_DAYS) -> Path:
 def _old_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     (path / "data.bin").write_text("x" * 100)
+    _age(path / "data.bin")
     return _age(path)
 
 
 def _old_file(path: Path) -> Path:
     _plist(path, {"k": "v"})
     return _age(path)
+
+
+def _fillers(env, n, start=0):
+    for k in range(start, start + n):
+        _app(env.root / "Applications", f"Filler{k}.app", f"com.filler{k}.app")
 
 
 @pytest.fixture
@@ -59,6 +65,7 @@ def mac(orphan_env):
     apps = env.root / "Applications"
     acme = _app(apps, "Acme Editor.app", "com.acme.Editor")
     _app(acme / "Contents" / "Library" / "LoginItems", "Helper.app", "com.helperco.agent")
+    _fillers(env, 4)  # the inventory needs >= 5 apps with a readable id
     env.support = env.home / "Library" / "Application Support"
     env.prefs = env.home / "Library" / "Preferences"
     env.containers = env.home / "Library" / "Containers"
@@ -159,11 +166,112 @@ def test_installed_ids_other_locations_and_bundles(mac):
             "com.hostco.host.ext", "com.xpcco.svc"} <= ids
 
 
-def test_installed_ids_tolerates_broken_plists(mac):
-    bad = mac.root / "Applications" / "Bad.app" / "Contents"
+def test_broken_plist_app_protected_by_name(mac):
+    _fillers(mac, 10, start=10)  # keep the no-id share under 10%
+    bad = mac.root / "Applications" / "Bad Thing.app" / "Contents"
     bad.mkdir(parents=True)
     (bad / "Info.plist").write_text("not a plist")
     assert "com.acme.Editor" in oad.installed_ids(mac.root, mac.home)
+    _old_dir(mac.support / "com.unknownvendor.BadThing")
+    _old_dir(mac.support / "com.unknownvendor.Other")
+    assert _ids(_scan()) == {"com.unknownvendor.Other"}
+
+
+def test_bare_app_without_plist_protected_by_name(mac):
+    _fillers(mac, 10, start=10)
+    (mac.root / "Applications" / "Bare.app").mkdir()
+    _old_dir(mac.support / "com.bare.Bare.cache")
+    _old_dir(mac.support / "com.zzz.bare")
+    _old_dir(mac.support / "com.zzz.Other")
+    assert _ids(_scan()) == {"com.zzz.Other"}
+
+
+def test_too_many_unreadable_apps_means_not_checked(mac):
+    for n in range(4):
+        (mac.root / "Applications" / f"Bare{n}.app").mkdir()
+    _old_dir(mac.support / "com.oldvendor.OldApp")
+    items = _scan()
+    assert _reported(items) == [] and len(_notes(items)) == 1
+
+
+def test_ios_wrapper_app_id_collected(mac):
+    wrap = mac.root / "Applications" / "Foo.app" / "Wrapper"
+    _plist(wrap / "Foo.app" / "Info.plist", {"CFBundleIdentifier": "com.wrapco.foo"})
+    assert "com.wrapco.foo" in oad.installed_ids(mac.root, mac.home)
+    _old_dir(mac.support / "com.wrapco.foo.data")
+    assert _reported(_scan()) == []
+
+
+def test_unusable_inventory_with_launch_jobs_and_pkgs_reports_nothing(orphan_env):
+    env = orphan_env
+    (env.root / "Applications").mkdir()
+    ag = env.home / "Library" / "LaunchAgents"
+    ag.mkdir(parents=True)
+    for n in range(8):
+        (ag / f"com.job{n}.x.plist").write_text("x")
+    env.cmds.on(("pkgutil", "--pkgs"), 0, chr(10).join(f"com.pkg{n}.i" for n in range(8)))
+    _old_dir(env.home / "Library" / "Application Support" / "com.oldvendor.OldApp")
+    items = _scan()
+    assert _reported(items) == [] and len(_notes(items)) == 1
+
+
+def test_inventory_needs_five_apps(orphan_env):
+    env = orphan_env
+    _fillers(env, 4)
+    _old_dir(env.home / "Library" / "Application Support" / "com.oldvendor.OldApp")
+    items = _scan()
+    assert _reported(items) == [] and len(_notes(items)) == 1
+    _fillers(env, 1, start=4)
+    assert _ids(_scan()) == {"com.oldvendor.OldApp"}
+
+
+def test_union_over_all_target_users(mac, monkeypatch):
+    from cleanix.core import context
+
+    home2 = mac.root.parent / "home" / "v"
+    (home2 / "Library").mkdir(parents=True)
+    _app(home2 / "Applications", "Second.app", "com.second.App")
+    ag = home2 / "Library" / "LaunchAgents"
+    ag.mkdir()
+    (ag / "com.agent2.job.plist").write_text("x")
+    users = [context.TargetUser("u", mac.home, 1000, 1000, True),
+             context.TargetUser("v", home2, 1001, 1001, False)]
+    monkeypatch.setattr(context, "_cached_targets", users)
+    _old_dir(mac.support / "com.second.Data")
+    _old_dir(mac.support / "com.agent2.data")
+    _old_dir(mac.support / "com.oldvendor.OldApp")
+    assert _ids(_scan()) == {"com.oldvendor.OldApp"}
+
+
+def test_directory_with_recent_child_is_not_old(mac):
+    d = _old_dir(mac.support / "com.oldvendor.Active")
+    (d / "fresh.db").write_text("x")  # touched just now
+    _age(d)
+    assert _reported(_scan()) == []
+
+
+@pytest.mark.parametrize("name", [
+    "org.cups.cupsd", "edu.mit.Kerberos", "org.gnu.emacs",
+    "org.freedesktop.dbus", "org.x.startx", "ORG.GNU.Emacs",
+])
+def test_os_cli_deny_prefixes(mac, name):
+    _old_dir(mac.support / name)
+    assert _reported(_scan()) == []
+
+
+def test_prefix_rule_alone():
+    idx = oad._Index({"com.x.y.z"})
+    assert "com.x.y" in idx.prefixes
+    assert oad.is_excluded("com.x.y", {"com.x.y.z"})
+    assert oad.is_excluded("com.x.y.z.extra", {"com.x.y.z"})
+
+
+def test_expired_budget_during_inventory_is_not_checked(mac):
+    _old_dir(mac.support / "com.oldvendor.OldApp")
+    cfg = Config()
+    cfg.orphan_max_seconds = 0
+    items = _scan(cfg)
+    assert _reported(items) == [] and len(_notes(items)) == 1
 
 
 def test_reports_old_app_data(mac):

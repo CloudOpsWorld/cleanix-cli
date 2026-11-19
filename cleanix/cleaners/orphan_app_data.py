@@ -19,17 +19,20 @@ import os
 import plistlib
 import re
 import shlex
+import stat as _stat
 import time
 from pathlib import Path
 from typing import Iterable, Optional, Union
 
 from cleanix.cleaners import orphan_common as oc
 from cleanix.cleaners.base import SCOPE_USER
+from cleanix.core import context
 from cleanix.core.platform import MACOS
 from cleanix.core.utils import home
 
 MAX_PLIST_BYTES = 1024 * 1024
 MAX_MDFIND_PATHS = 50000
+MIN_APPS = 5  # distinct app ids an inventory needs before it is believed
 
 _ID_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9_-]+){2,}$")
 _TEAM_RE = re.compile(r"^[A-Z0-9]{10}\.")
@@ -39,6 +42,8 @@ _SHARED_HOSTS = {
     "org.sourceforge", "net.sourceforge",
 }
 _APPLE_EXACT = {".globalpreferences", "loginwindow", "pbs", "com.apple"}
+# OS / command-line components that use non-Apple ids but have no app bundle.
+_OS_DENY_PREFIXES = ("org.cups.", "edu.mit.", "org.gnu.", "org.freedesktop.", "org.x.")
 _BUNDLE_SUFFIXES = (".app", ".appex", ".xpc")
 _NESTED_DIRS = (
     "Library/LoginItems", "Helpers", "Frameworks", "PlugIns",
@@ -78,13 +83,18 @@ def vendor_key(bundle_id: str) -> str:
     return ".".join(parts[:3]) if two in _SHARED_HOSTS else two
 
 
+def _norm_name(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
 class _Index:
     """Normalised lookup sets, built once per scan."""
 
-    def __init__(self, installed: Iterable[str]):
+    def __init__(self, installed: Iterable[str], noid_names: Iterable[str] = ()):
         self.ids: set = set()
         self.vendors: set = set()
         self.prefixes: set = set()  # proper dotted prefixes of installed ids
+        self.names: set = {n for n in map(_norm_name, noid_names) if n}
         for raw in installed:
             i = raw.strip().lower()
             if not i:
@@ -101,6 +111,8 @@ def is_excluded(bid: str, installed: Union[set, _Index]) -> bool:
     b = bid.lower()
     if b.startswith("com.apple.") or b in _APPLE_EXACT:
         return True
+    if any(b.startswith(p) for p in _OS_DENY_PREFIXES):
+        return True
     idx = installed if isinstance(installed, _Index) else _Index(installed)
     if b in idx.ids:
         return True
@@ -110,16 +122,34 @@ def is_excluded(bid: str, installed: Union[set, _Index]) -> bool:
     for k in range(1, len(parts)):  # bid starts with an installed id + "."
         if ".".join(parts[:k]) in idx.ids:
             return True
+    if idx.names and any(_norm_name(label) in idx.names for label in parts):
+        return True  # an app whose id we could not read has this name
     return vendor_key(b) in idx.vendors
 
 
 # ------------------------------------------------------ installed-app index
+class _Unknown(Exception):
+    """The inventory cannot be trusted (budget spent, too many gaps)."""
+
+
+class _Ctx:
+    def __init__(self, budget):
+        self.budget = budget
+        self.ids: set = set()
+        self.top_ids: set = set()  # ids of top-level apps from the app folders
+        self.noid: list = []       # folder names of apps without a readable id
+        self.apps = 0
+
+    def check(self) -> None:
+        if self.budget is not None and self.budget.expired():
+            raise _Unknown
+
+
 def _is_real_dir(path: Path) -> bool:
     return os.path.isdir(path) and not os.path.islink(path)
 
 
-def _bundle_id(bundle: Path) -> Optional[str]:
-    plist = bundle / "Contents" / "Info.plist"
+def _read_id(plist: Path) -> Optional[str]:
     try:
         if plist.stat().st_size > MAX_PLIST_BYTES:
             return None
@@ -131,43 +161,70 @@ def _bundle_id(bundle: Path) -> Optional[str]:
     return bid if isinstance(bid, str) and bid else None
 
 
-def _collect_bundle(bundle: Path, ids: set, level: int = 0) -> None:
-    bid = _bundle_id(bundle)
-    if bid:
-        ids.add(bid)
+def _bundle_ids(bundle: Path) -> list:
+    """Ids of a bundle: Contents/Info.plist, a flat Info.plist, and the
+    ``Wrapper/*.app`` of iOS apps running on the Mac."""
+    out = []
+    for rel in ("Contents/Info.plist", "Info.plist"):
+        bid = _read_id(bundle / rel)
+        if bid:
+            out.append(bid)
+            break
+    for child in oc.list_dir(bundle / "Wrapper") or ():
+        if child.name.endswith(".app") and _is_real_dir(child):
+            for rel in ("Info.plist", "Contents/Info.plist"):
+                bid = _read_id(child / rel)
+                if bid:
+                    out.append(bid)
+                    break
+    return out
+
+
+def _collect_bundle(bundle: Path, ctx: _Ctx, level: int = 0, top: bool = False) -> None:
+    ctx.check()
+    found = _bundle_ids(bundle)
+    ctx.ids.update(found)
+    if top:
+        ctx.apps += 1
+        if found:
+            ctx.top_ids.update(found)
+        else:
+            ctx.noid.append(bundle.name[: -len(".app")])
     if level >= 4:
         return
     for sub in _NESTED_DIRS:
-        _collect_nested(bundle / "Contents" / sub, ids, 1, level)
+        _collect_nested(bundle / "Contents" / sub, ctx, 1, level)
 
 
-def _collect_nested(directory: Path, ids: set, depth: int, level: int) -> None:
+def _collect_nested(directory: Path, ctx: _Ctx, depth: int, level: int) -> None:
     children = oc.list_dir(directory)
     if not children:
         return
     for child in children:
+        ctx.check()
         if oc.bad_name(child.name):
             continue
         if child.name.endswith(_BUNDLE_SUFFIXES):
             if _is_real_dir(child):
-                _collect_bundle(child, ids, level + 1)
+                _collect_bundle(child, ctx, level + 1)
         elif depth < 4 and _is_real_dir(child):
-            _collect_nested(child, ids, depth + 1, level)
+            _collect_nested(child, ctx, depth + 1, level)
 
 
-def _walk_apps(directory: Path, ids: set, depth: int, max_depth: int) -> bool:
-    """Collect ids of every ``*.app`` under ``directory``; False if unreadable."""
+def _walk_apps(directory: Path, ctx: _Ctx, depth: int, max_depth: int) -> bool:
+    """Collect every ``*.app`` under ``directory``; False if unreadable."""
     children = oc.list_dir(directory)
     if children is None:
         return False
     for child in children:
+        ctx.check()
         if oc.bad_name(child.name):
             continue
         if child.name.endswith(".app"):
             if os.path.isdir(child):  # a symlinked (cask) app is still an app
-                _collect_bundle(child, ids)
+                _collect_bundle(child, ctx, top=True)
         elif depth < max_depth and _is_real_dir(child):
-            _walk_apps(child, ids, depth + 1, max_depth)
+            _walk_apps(child, ctx, depth + 1, max_depth)
     return True
 
 
@@ -177,45 +234,64 @@ def _launch_stems(directory: Path, ids: set) -> None:
             ids.add(child.stem)
 
 
-def installed_ids(root, home_dir: Path) -> Optional[set]:
+def _inventory(root, homes: Iterable[Path], budget=None) -> Optional[tuple]:
+    """``(ids, names_of_apps_without_id)`` or None when the inventory cannot
+    be trusted: ``/Applications`` unreadable, fewer than MIN_APPS distinct app
+    ids, too many apps with no readable id, or the budget ran out."""
+    homes = [Path(h) for h in homes]
+    ctx = _Ctx(budget)
+    try:
+        apps = oc.in_root(root, "/Applications")
+        if not os.path.isdir(apps) or not _walk_apps(apps, ctx, 1, 3):
+            return None
+        for logical, depth in _APP_ROOTS[1:]:
+            _walk_apps(oc.in_root(root, logical), ctx, 1, depth)
+        for h in homes:
+            _walk_apps(h / "Applications", ctx, 1, 3)
+        if len(ctx.top_ids) < MIN_APPS:
+            return None
+        if len(ctx.noid) > 3 or len(ctx.noid) * 10 > ctx.apps:
+            return None
+
+        rc, out, _ = oc.run(
+            ["mdfind", "kMDItemContentType == 'com.apple.application-bundle'"]
+        )
+        if rc == 0:
+            for n, line in enumerate(out.splitlines()):
+                if n >= MAX_MDFIND_PATHS:
+                    break
+                ctx.check()
+                line = line.strip()
+                if not line.endswith(".app") or oc.bad_name(line):
+                    continue
+                for cand in (oc.in_root(root, line), Path(line)):
+                    if os.path.isdir(cand):
+                        _collect_bundle(cand, ctx)  # ids only, not counted
+                        break
+
+        for h in homes:
+            _launch_stems(h / "Library" / "LaunchAgents", ctx.ids)
+        for logical in _LAUNCH_DIRS:
+            _launch_stems(oc.in_root(root, logical), ctx.ids)
+
+        rc, out, _ = oc.run(["pkgutil", "--pkgs"])
+        if rc == 0:
+            ctx.ids.update(ln.strip() for ln in out.splitlines() if ln.strip())
+        ctx.check()
+    except _Unknown:
+        return None
+    return ctx.ids, list(ctx.noid)
+
+
+def installed_ids(root, home_dir) -> Optional[set]:
     """Bundle ids of everything that looks installed, or None if unknown.
 
-    None when ``/Applications`` is missing or unreadable, or when nothing at
-    all was found (an empty inventory would make every name look orphaned).
+    ``home_dir`` is one home or an iterable of homes (their ``~/Applications``
+    and LaunchAgents are all included).
     """
-    apps = oc.in_root(root, "/Applications")
-    if not _is_real_dir(apps) and not os.path.isdir(apps):
-        return None
-    ids: set = set()
-    if not _walk_apps(apps, ids, 1, 3):
-        return None
-    for logical, depth in _APP_ROOTS[1:]:
-        _walk_apps(oc.in_root(root, logical), ids, 1, depth)
-    _walk_apps(Path(home_dir) / "Applications", ids, 1, 3)
-
-    rc, out, _ = oc.run(
-        ["mdfind", "kMDItemContentType == 'com.apple.application-bundle'"]
-    )
-    if rc == 0:
-        for n, line in enumerate(out.splitlines()):
-            if n >= MAX_MDFIND_PATHS:
-                break
-            line = line.strip()
-            if not line.endswith(".app") or oc.bad_name(line):
-                continue
-            for cand in (oc.in_root(root, line), Path(line)):
-                if os.path.isdir(cand):
-                    _collect_bundle(cand, ids)
-                    break
-
-    _launch_stems(Path(home_dir) / "Library" / "LaunchAgents", ids)
-    for logical in _LAUNCH_DIRS:
-        _launch_stems(oc.in_root(root, logical), ids)
-
-    rc, out, _ = oc.run(["pkgutil", "--pkgs"])
-    if rc == 0:
-        ids.update(ln.strip() for ln in out.splitlines() if ln.strip())
-    return ids or None
+    homes = [home_dir] if isinstance(home_dir, (str, os.PathLike)) else list(home_dir)
+    inv = _inventory(root, homes)
+    return inv[0] if inv else None
 
 
 # ----------------------------------------------------------------- reporter
@@ -237,8 +313,13 @@ class OrphanAppDataReporter(oc.OrphanReporter):
     def _installed(self) -> Optional[_Index]:
         if not self._index_built:
             self._index_built = True
-            ids = installed_ids(self.sysroot, home())
-            self._index = _Index(ids) if ids is not None else None
+            homes = [home()]
+            try:
+                homes += [u.home for u in context.get_target_users()]
+            except Exception:  # noqa: BLE001 - fall back to the current user
+                pass
+            inv = _inventory(self.sysroot, homes, self.budget)
+            self._index = _Index(*inv) if inv is not None else None
         return self._index
 
     # ------------------------------------------------------------ discovery
@@ -303,13 +384,14 @@ class OrphanAppDataReporter(oc.OrphanReporter):
                 st = child.lstat()
             except OSError:
                 continue
-            import stat as _stat
-
             if _stat.S_ISLNK(st.st_mode):
                 continue
             if _stat.S_ISDIR(st.st_mode) != dirs:
                 continue  # Support/Containers: folders only; Preferences: files
-            if st.st_mtime > cutoff:
+            newest = st.st_mtime
+            if dirs:
+                newest = max(newest, self._newest_child_mtime(child))
+            if newest > cutoff:
                 continue
             real_logical = oc.logical_path(self.sysroot, child)
             yield oc.Finding(
@@ -319,12 +401,30 @@ class OrphanAppDataReporter(oc.OrphanReporter):
                 requires_root=system,
             )
 
+    def _newest_child_mtime(self, directory: Path) -> float:
+        """Newest lstat mtime among up to 20 immediate children."""
+        newest = 0.0
+        try:
+            with os.scandir(directory) as it:
+                for n, entry in enumerate(it):
+                    if n >= 20 or self.budget.expired():
+                        break
+                    try:
+                        newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        return newest
+
     @staticmethod
     def _hint(bid: str, logical: str) -> str:
         return (
             f"No installed app uses the id {bid}. Check with: "
             f"mdfind \"kMDItemCFBundleIdentifier == '{bid}'\" "
-            "(no result means it is not installed). "
+            "(no result means it is not installed). Command-line tools have no "
+            "bundle id and are not found by mdfind; do not remove it if you "
+            "installed such a tool. "
             f"If you no longer need it, move {shlex.quote(logical)} "
             "to the Trash in Finder."
         )
