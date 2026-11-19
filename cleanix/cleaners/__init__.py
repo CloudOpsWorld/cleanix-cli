@@ -32,6 +32,15 @@ from cleanix.cleaners.big_files import BigFileReporter
 from cleanix.cleaners.downloads import DownloadsReporter
 from cleanix.cleaners.browser_profiles import BrowserProfileReporter
 from cleanix.cleaners.duplicates import DuplicateFileReporter
+from cleanix.cleaners.orphan_app_data import OrphanAppDataReporter
+from cleanix.cleaners.orphan_files import UnownedSystemFilesReporter
+from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
+from cleanix.cleaners.stale_launchers import (
+    BrokenAlternativesReporter,
+    StaleDesktopEntryReporter,
+)
+from cleanix.cleaners.stale_receipts import StaleReceiptReporter
+from cleanix.cleaners.stale_services import StaleSystemdUnitReporter
 
 # Logs / crashes
 from cleanix.cleaners.logs import JournalCleaner, RotatedLogCleaner
@@ -293,6 +302,14 @@ ALL_CLEANERS: List[Type[Cleaner]] = [
     DownloadsReporter,
     BrowserProfileReporter,
     DuplicateFileReporter,
+    # System-wide orphan reports (report-only)
+    UnownedSystemFilesReporter,
+    StaleSystemdUnitReporter,
+    StaleDesktopEntryReporter,
+    BrokenAlternativesReporter,
+    OrphanLaunchJobReporter,
+    OrphanAppDataReporter,
+    StaleReceiptReporter,
     # macOS extras
     MacExtraCachesCleaner,
     MacContainerCacheCleaner,

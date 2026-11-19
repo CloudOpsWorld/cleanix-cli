@@ -102,6 +102,36 @@ def test_zero_only_group_hidden():
     assert len(g) == 1 and g[0].shown == [] and len(g[0].zero) == 2
 
 
+def _ro_item(desc="note", size=0, cid="x"):
+    return CleanableItem(cleaner_id=cid, description=desc, size=size,
+                         path=f"/opt/{desc}", report_only=True, hint="check it")
+
+
+def test_zero_size_report_only_group_stays_visible():
+    g = build_groups(_result([_ro_item("a"), _ro_item("b")]), {"x": _info()})
+    assert len(g) == 1
+    assert len(g[0].shown) == 2 and g[0].zero == []
+    assert g[0].safety is Safety.REVIEW
+
+
+def test_report_only_zero_is_not_empty_but_plain_zero_still_is():
+    assert not is_empty(_ro_item())
+    assert is_empty(_path_item(size=0))
+
+
+def test_zero_size_non_report_only_group_still_hidden():
+    items = [_path_item(desc="a", size=0), _path_item(desc="b", size=0)]
+    assert build_groups(_result(items), {"x": _info()}) == []
+
+
+def test_mixed_group_keeps_zero_report_only_among_shown():
+    items = [_path_item(desc="big", size=9), _ro_item("note"),
+             _path_item(desc="z", size=0)]
+    g = build_groups(_result(items), {"x": _info()})[0]
+    assert [i.description for i in g.shown] == ["big", "note"]
+    assert [i.description for i in g.zero] == ["z"]
+
+
 def _cmd_item(size=0, cid="x"):
     return CleanableItem(cleaner_id=cid, description="Empty the Recycle Bin",
                          size=size, kind=ItemKind.COMMAND, command=["empty-bin"])
@@ -197,7 +227,9 @@ def test_will_not_delete_copy_only_on_report_only_cleaners():
     assert flagged
     for cid in flagged:
         assert cid in cleaners, cid
-        src = inspect.getsource(type(cleaners[cid]))
+        src = "".join(
+            inspect.getsource(k) for k in type(cleaners[cid]).__mro__
+            if k.__name__ not in ("Cleaner", "ABC", "object"))
         assert "report_item(" in src or "report_only=True" in src, cid
 
 

@@ -45,7 +45,7 @@ from cleanix.gui.grouped_results import GroupedResults
 IDLE_HEADLINE = "Free up disk space"
 IDLE_REASSURANCE = ("Nothing is deleted until you review it. "
                     "Most cleanups can be undone.")
-DEEP_SCAN_TEXT = "Deep scan (slower: duplicates, big files)"
+DEEP_SCAN_TEXT = "Deep scan (slower: duplicates, big files, Mac leftovers)"
 SLOW = catalog.SLOW_SCAN_IDS
 
 
@@ -571,9 +571,14 @@ class SimpleView(QWidget):
         self.results_tree.setVisible(bool(main))
         self.also_found_toggle.setVisible(bool(also))
         self.review_toggle.setVisible(bool(review))
-        self.results_summary.setText(
-            "Nothing found to clean." if not groups
-            else f"Found {human_size(result.total_size)} in {result.total_items} items.")
+        if not groups:
+            summary = "Nothing found to clean."
+        elif result.cleanable_size <= 0:
+            summary = f"{result.total_items} findings to review (nothing to free)."
+        else:
+            n = len(result.cleanable_items())
+            summary = f"Found {human_size(result.cleanable_size)} in {n} items."
+        self.results_summary.setText(summary)
         self._refresh_clean_button()
         self._set_state(SimpleState.RESULTS)
         self.scanned.emit(result)

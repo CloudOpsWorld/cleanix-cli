@@ -19,6 +19,7 @@ _LEFTOVER_SUFFIXES = (
     ".dpkg-old", ".dpkg-dist", ".dpkg-new", ".dpkg-bak",  # dpkg
     ".ucf-old", ".ucf-dist", ".ucf-new",   # ucf (Debian)
 )
+LEFTOVER_SUFFIXES = _LEFTOVER_SUFFIXES  # public alias for other modules
 
 
 class ConfigLeftoverCleaner(Cleaner):

@@ -139,7 +139,7 @@ def test_idle_page_has_headline_reassurance_and_deep_scan_off(qtbot):
     assert v.reassurance_label.text() == (
         "Nothing is deleted until you review it. Most cleanups can be undone.")
     assert v.scan_button.isDefault() and v.scan_button.minimumHeight() >= 40
-    assert v.deep_scan_check.text() == "Deep scan (slower: duplicates, big files)"
+    assert v.deep_scan_check.text() == "Deep scan (slower: duplicates, big files, Mac leftovers)"
     assert not v.deep_scan_check.isChecked()
 
 
@@ -195,6 +195,20 @@ def test_empty_result_says_nothing_found(qtbot):
     assert v.results_summary.text() == "Nothing found to clean."
     assert v.selected_items() == []
     assert not v.clean_button.isEnabled()
+
+
+def test_zero_size_findings_summary_says_nothing_to_free(qtbot):
+    v = make_view(qtbot)
+    v.set_scan_result(result(
+        item("temp", 0, report_only=True, hint="Not checked", path="/a"),
+        item("temp", 0, report_only=True, hint="Not checked", path="/b")))
+    assert v.results_summary.text() == "2 findings to review (nothing to free)."
+
+
+def test_sized_result_keeps_found_summary(qtbot):
+    v = make_view(qtbot)
+    v.set_scan_result(result(item("temp", 1000)))
+    assert v.results_summary.text() == f"Found {simple_view.human_size(1000)} in 1 items."
 
 
 def test_review_groups_in_own_collapsed_unticked_section(qtbot):
@@ -829,3 +843,18 @@ def test_shutdown_cancels_running_worker_and_blocks_new_work(qtbot):
     qtbot.waitUntil(lambda: v.state() is SimpleState.IDLE, timeout=3000)
     v.start_scan()
     assert len(created) == 1 and v.state() is SimpleState.IDLE
+
+
+def test_zero_size_report_only_finding_shown_read_only_in_review(qtbot):
+    v = make_view(qtbot)
+    it = CleanableItem("stale_services", "Unit foo.service points at a missing "
+                       "program", size=0, path="/etc/systemd/system/foo.service",
+                       report_only=True, hint="systemctl status foo")
+    v.set_scan_result(result(it))
+    assert v.review_tree.group_count() == 1
+    assert v.results_tree.group_count() == 0
+    assert v.review_tree.checked_items() == []
+    assert v.review_tree.refusal_reason(it)
+    for tree in all_trees(v):
+        tree.set_checked_keys({item_key(it)})
+    assert v.selected_items() == []

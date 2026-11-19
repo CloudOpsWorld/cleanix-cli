@@ -41,6 +41,9 @@ REVIEW_CLASSES = [
     "ProjectCruftCleaner", "BrowserProfileReporter", "WinPrefetchReporter",
     "WindowsOldReporter", "WslDiskReporter", "SnapshotReporter",
     "TimeMachineReporter", "DeviceBackupReporter",
+    "UnownedSystemFilesReporter", "StaleSystemdUnitReporter",
+    "StaleDesktopEntryReporter", "BrokenAlternativesReporter",
+    "OrphanLaunchJobReporter", "OrphanAppDataReporter", "StaleReceiptReporter",
 ]
 BY_NAME = {c.__name__: c for c in ALL_CLEANERS}
 
@@ -151,5 +154,7 @@ def test_list_cleaners_filters_unsupported_platforms():
 
 
 def test_slow_scan_ids_are_registered_cleaners():
-    assert catalog.SLOW_SCAN_IDS == ("duplicates", "big_files", "downloads")
+    assert catalog.SLOW_SCAN_IDS == (
+        "duplicates", "big_files", "downloads", "stale_receipts", "orphan_app_data",
+    )
     assert set(catalog.SLOW_SCAN_IDS) <= set(known_ids())

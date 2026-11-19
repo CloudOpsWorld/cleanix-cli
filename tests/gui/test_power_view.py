@@ -857,3 +857,30 @@ def test_zero_size_command_item_visible_and_selectable_without_show_empty(
     assert v.item_model.checked_items() == []  # never preselected
     v.select_all_visible()
     assert [i.kind for i in v.item_model.checked_items()] == [ItemKind.COMMAND]
+
+
+def test_zero_size_report_only_finding_visible_but_never_selected(qtbot, sync_workers):
+    v = pv.PowerView(Config())
+    qtbot.addWidget(v)
+    ro = CleanableItem("stale_services", "foo.service orphaned", size=0,
+                       path="/etc/systemd/system/foo.service", report_only=True,
+                       hint="systemctl status foo")
+    v._on_scan_finished(ScanResult(reports=[
+        CleanerReport("stale_services", "Stale", "s", items=[ro]),
+        CleanerReport("temp", "Temp", "t", items=[
+            CleanableItem("temp", "empty", size=0, path="/t/empty")])]))
+    assert v.tree.group_count() == 1  # the plain zero-size group stays hidden
+    v.select_all_visible()
+    assert v.item_model.checked_items() == []
+
+
+def test_status_line_does_not_count_report_only_size_as_freeable(view):
+    only = ScanResult(reports=[CleanerReport("big_files", "Big", "Big", items=[
+        CleanableItem("big_files", "huge.iso", size=2000 * MB, path="/x/huge.iso",
+                      report_only=True, hint="Delete it manually")])])
+    view._on_scan_finished(only)
+    assert view.status_label.text() == "1 findings to review (nothing to free)"
+    view._on_scan_finished(_result())
+    freeable = 900 * 1024 + 10 * MB + 1 + 5 * MB
+    assert view.status_label.text() == (
+        f"Found 5 items, {pv.human_size(freeable)} to free")

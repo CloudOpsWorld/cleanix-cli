@@ -28,7 +28,11 @@ CATEGORIES: Dict[str, str] = {
 }
 
 # Cleaners excluded from the default (fast) scan; Simple's "Deep scan" opts in.
-SLOW_SCAN_IDS = ("duplicates", "big_files", "downloads")
+SLOW_SCAN_IDS = (
+    "duplicates", "big_files", "downloads",
+    # macOS orphan reports that run mdfind/pkgutil and walk app folders
+    "stale_receipts", "orphan_app_data",
+)
 
 # Categories whose items are never pre-selected, whatever the cleaner says.
 _NEVER_PRESELECT = frozenset(
@@ -106,7 +110,9 @@ _assign(
     "review",
     "big_files downloads duplicates project_cruft browser_profiles "
     "win_prefetch win_windows_old wsl_disk snapshots time_machine "
-    "device_backups libvirt_saves macos_sleepimage",
+    "device_backups libvirt_saves macos_sleepimage "
+    "orphan_files stale_services stale_launchers stale_alternatives "
+    "orphan_launch_jobs orphan_app_data stale_receipts",
 )
 # Administrator / system-wide cleaners and package managers.
 _assign(

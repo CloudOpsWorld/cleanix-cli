@@ -620,8 +620,13 @@ class PowerView(QWidget):
         if not self._scanned_once:
             self._scanned_once = True
             self.cleaner_toggle.setChecked(False)  # collapse after first scan
-        self.status_label.setText(
-            f"Found {result.total_items} items, {human_size(result.total_size)}")
+        if result.cleanable_size <= 0 and result.report_only_items():
+            self.status_label.setText(
+                f"{result.total_items} findings to review (nothing to free)")
+        else:
+            self.status_label.setText(
+                f"Found {result.total_items} items, "
+                f"{human_size(result.cleanable_size)} to free")
         self._set_busy(False)
         self.scan_finished.emit(result)
 

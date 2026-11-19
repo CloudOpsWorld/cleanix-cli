@@ -137,6 +137,12 @@ class Config:
     dup_min_size_mb: float = 10.0
     dup_top_n: int = 50
 
+    # Report-only orphan scans (Linux/macOS): per-cleaner caps on findings and
+    # wall-clock time, and how long Mac app data must sit untouched.
+    orphan_max_items: int = 200
+    orphan_max_seconds: float = 60.0
+    orphan_min_age_days: float = 30.0
+
     @classmethod
     def load(cls, path: str | os.PathLike | None = None) -> "Config":
         """Load config, layering a YAML file over the defaults if present."""
@@ -195,6 +201,9 @@ FIELD_HELP = {
     "browser_profile_stale_days": "Report browser profiles idle N+ days (report only)",
     "dup_min_size_mb": "Only compare files in $HOME at least this large (MiB)",
     "dup_top_n": "Report at most the N largest duplicate groups",
+    "orphan_max_items": "Report at most N orphan findings per cleaner",
+    "orphan_max_seconds": "Stop an orphan scan after N seconds",
+    "orphan_min_age_days": "Orphan data (Mac app data, unowned files) must be untouched N days to be reported",
 }
 
 

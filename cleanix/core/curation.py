@@ -161,6 +161,14 @@ _RAW = {
     "win_reg_file_assoc": ("Dead file-type handlers", "Open-with handlers pointing at deleted programs. Affected files fall back to 'choose an app'; a backup is kept."),
     "win_reg_startup": ("Dead startup entries", "Startup entries for programs that no longer exist. Nothing starts from them today; a backup is kept."),
     "win_reg_shared_dlls": ("Stale shared-file counters", "Install counters for shared files that no longer exist. Uninstallers no longer need them; a backup is kept."),
+    # --- Linux/macOS orphan reports (report-only; never deleted by cleanix)
+    "orphan_files": ("Files not from any package", "Folders in /opt, /usr/local, /var/lib and /var/cache that no installed package owns (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
+    "stale_services": ("Services for removed programs", "Startup services whose program or unit file is gone (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
+    "stale_launchers": ("Menu entries for removed programs", "App menu and autostart entries whose program is missing (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
+    "stale_alternatives": ("Broken default-program links", "System default-program links that point at removed programs (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
+    "orphan_launch_jobs": ("Background jobs of removed apps", "Mac launch agents and daemons whose program is gone (may be a false positive; confirm before removing). " + _REVIEW_TAIL),
+    "orphan_app_data": ("Data of removed apps", "Settings and data left by Mac apps that are no longer installed (may be a false positive; confirm before removing). " + _REVIEW_TAIL),
+    "stale_receipts": ("Install records of removed packages", "Mac installer receipts whose files are all gone (may be a false positive; confirm before removing). " + _REVIEW_TAIL),
 }
 
 COPY: Dict[str, Copy] = {k: Copy(*v) for k, v in _RAW.items()}
@@ -249,8 +257,12 @@ class Group:
 def is_empty(item: CleanableItem) -> bool:
     """True for items with nothing to show. A COMMAND item's size is unknown
     (best effort, often 0), so it is never treated as empty. Registry items
-    always have size 0 and are never hidden."""
-    return item.size <= 0 and item.kind not in (ItemKind.COMMAND, ItemKind.REGISTRY)
+    always have size 0 and are never hidden. A report-only finding or "not
+    checked" note legitimately has size 0 and must stay visible (it can never
+    be selected for deletion anyway)."""
+    return (item.size <= 0
+            and item.kind not in (ItemKind.COMMAND, ItemKind.REGISTRY)
+            and not item.report_only)
 
 
 def build_groups(
