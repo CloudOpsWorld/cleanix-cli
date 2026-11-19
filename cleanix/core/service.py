@@ -82,6 +82,7 @@ def clean(
     registry_backup_elsewhere: bool = False,
     registry_backup_run: Optional[str] = None,
     registry_backup_dir: Optional[Path] = None,
+    registry_backup_root: Optional[Path] = None,
 ) -> CleanSummary:
     """Clean ``items``. ``cancel`` must be thread-safe: it may be called from
     worker threads.
@@ -97,6 +98,9 @@ def clean(
     ``registry_backup_elsewhere=True`` (the elevated helper only) means the
     backup was already written by the GUI as the user into the quarantine run
     ``registry_backup_run`` (a run id of the invoking account's quarantine;
+    ``registry_backup_root`` is the quarantine root that run lives in --
+    the elevated helper passes the INVOKING user's validated root, never
+    its own %LOCALAPPDATA%; default ``quarantine_root()``;
     ``registry_backup_dir`` is a deprecated alias accepted only when it is
     exactly such a run directory). No run is created and
     :class:`regclean.VerifyOnlySink` deletes only HKLM entries that run would
@@ -144,7 +148,7 @@ def clean(
                 bound = Path(registry_backup_dir)
             else:
                 bound = None
-            registry_backup = regclean.VerifyOnlySink(bound)
+            registry_backup = regclean.VerifyOnlySink(bound, root=registry_backup_root)
         else:
             registry_backup = run
 

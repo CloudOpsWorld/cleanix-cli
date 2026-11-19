@@ -377,12 +377,44 @@ def new_run() -> Quarantine:
     return Quarantine(_make_run_id())
 
 
+MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+
+
 def _read_manifest(run_dir: Path) -> Optional[Dict]:
-    mf = run_dir / "manifest.json"
-    if not mf.exists():
-        return None
+    """The run's manifest, or None. Only a regular file that is not a link
+    (symlink, junction or other reparse point) and at most
+    ``MAX_MANIFEST_BYTES`` is read (the elevated helper reads manifests in a
+    user-writable folder)."""
+    import stat as _stat
+
+    mf = Path(run_dir) / "manifest.json"
     try:
-        data = json.loads(mf.read_text(encoding="utf-8-sig"))
+        st = os.lstat(str(mf))
+    except OSError:
+        return None
+    if (
+        _stat.S_ISLNK(st.st_mode)
+        or not _stat.S_ISREG(st.st_mode)
+        or getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(mf), flags)
+        chunks, total = [], 0
+        try:
+            while total <= MAX_MANIFEST_BYTES:
+                chunk = os.read(fd, 1 << 20)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+        finally:
+            os.close(fd)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_MANIFEST_BYTES:
+            return None
+        data = json.loads(raw.decode("utf-8-sig"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None

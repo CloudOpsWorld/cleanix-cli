@@ -51,12 +51,17 @@ nothing in it beyond *identifiers*, and nothing in its environment:
     invoking user's quarantine root -- never a key list to delete). Before
     anything is deleted (else exit 1, nothing deleted, also no files):
     every detector id is on ``admin_registry_cleaner_ids``, every key names
-    HKLM, the run id is a plain name, the process is elevated, the request
+    HKLM, the run id is a plain name, the process is elevated, the
+    quarantine root is a LOCAL-DRIVE path (judged from its text alone,
+    before any filesystem call: never UNC/WebDAV/device paths, which an
+    administrator process would open over the network), the request
     directory and request are owned by one user SID, that SID's profile
-    (HKLM ProfileList, writable by administrators only) contains the
-    quarantine root, which is ``...\\cleanix\\quarantine``, equal to its
-    realpath, with no link/junction from the profile down to the run, and
-    whose root, run directory and manifest are owned by that SID. Then the
+    (HKLM ProfileList, writable by administrators only, itself a local
+    path) strictly contains the quarantine root, which is
+    ``...\\cleanix\\quarantine``, with no link/junction (lstat) from the
+    profile down to the run, its registry folder and manifest, equal to its
+    realpath, and whose root, run directory and manifest are owned by that
+    SID. Then the
     helper re-scans with exactly those detectors in helper scan mode
     (``scanmode``: owner_matches=False) through an HKLM-only backend (an
     HKCU call never reaches the registry: R15, HKCU here is the
@@ -64,9 +69,10 @@ nothing in it beyond *identifiers*, and nothing in its environment:
     scan whose key (fingerprint included) was requested and that pass the
     registry safety rules, each with ``service.clean(...,
     use_quarantine=False, record_history=False,
-    registry_backup_elsewhere=True, registry_backup_run=<run>)`` while
-    ``quarantine.quarantine_root()`` is the INVOKING user's root, so
-    ``VerifyOnlySink`` deletes only what that run can restore.
+    registry_backup_elsewhere=True, registry_backup_run=<run>,
+    registry_backup_root=<the invoking user's validated root>)``, so
+    ``VerifyOnlySink`` deletes only what that run can restore (the
+    helper's own %LOCALAPPDATA% quarantine is never consulted).
 
 What the design does and does not protect:
 * The nonce only detects stale or mixed-up result files; it provides no
@@ -535,8 +541,10 @@ def _invoking_sid(rdir: elevate.RequestDir) -> str:
 
 def _profile_for_sid(sid: str) -> str:
     """The account's profile directory from HKLM ProfileList (writable by
-    administrators only), with only %SystemDrive%/%SystemRoot% expanded
-    from the sanitised environment."""
+    administrators only). REG_SZ or REG_EXPAND_SZ only; the one expansion
+    is %SystemDrive% (any other %VAR% refuses); the result must be an
+    absolute path on a local drive (a UNC/roaming profile refuses).
+    Lexical only: nothing on the filesystem is touched here."""
     from cleanix.core.winregistry import REG_EXPAND_SZ, REG_SZ, RegistryError
 
     try:
@@ -545,28 +553,33 @@ def _profile_for_sid(sid: str) -> str:
         raise Refused("the requesting account has no profile") from None
     raw = None
     for v in values:
-        if (v.name.casefold() == "profileimagepath" and v.type in (REG_SZ, REG_EXPAND_SZ)
-                and isinstance(v.data, str)):
+        if v.name.casefold() == "profileimagepath":
+            if v.type not in (REG_SZ, REG_EXPAND_SZ) or not isinstance(v.data, str):
+                raise Refused("the requesting account's profile path is not usable")
             raw = v.data
             break
     if not raw:
         raise Refused("the requesting account has no profile")
 
     def expand(m):
-        name = m.group(1).casefold()
-        if name in ("systemdrive", "systemroot"):
+        if m.group(1).casefold() == "systemdrive":
             for k, val in os.environ.items():
-                if k.casefold() == name and val:
+                if k.casefold() == "systemdrive" and val:
                     return val
         return m.group(0)
 
     path = _PROFILE_VARS.sub(expand, raw)
-    if "%" in path or not os.path.isabs(path):
+    if "%" in path:
         raise Refused("the requesting account's profile path is not usable")
-    return os.path.normpath(path)
+    path = os.path.normpath(path)  # lexical
+    if not elevate.is_local_absolute_path(path):
+        raise Refused("the requesting account's profile path is not usable")
+    return path
 
 
-def _no_link_dir(path: str, what: str) -> None:
+def _no_link(path: str, what: str, *, directory: bool = True) -> None:
+    """lstat (never follows) ``path``: no symlink/junction/reparse point,
+    and a directory (or a regular file with ``directory=False``)."""
     try:
         st = _lstat(path)
     except OSError:
@@ -574,8 +587,10 @@ def _no_link_dir(path: str, what: str) -> None:
     if (_stat_mod.S_ISLNK(st.st_mode)
             or getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT):
         raise Refused(f"{what} is a link or junction")
-    if not _stat_mod.S_ISDIR(st.st_mode):
+    if directory and not _stat_mod.S_ISDIR(st.st_mode):
         raise Refused(f"{what} is not a directory")
+    if not directory and not _stat_mod.S_ISREG(st.st_mode):
+        raise Refused(f"{what} is not a regular file")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -586,16 +601,31 @@ class _RegistryPlan:
     quarantine_root: str
 
 
+def _lexical_root_problem(root: str) -> Optional[str]:
+    """Checks of the quarantine root that need no filesystem access."""
+    if not elevate.is_local_absolute_path(root):
+        return "the quarantine root is not a path on a local drive"
+    if os.path.normpath(root) != root:
+        return "the quarantine root is not a normalised absolute path"
+    if [p.casefold() for p in Path(root).parts[-2:]] != ["cleanix", "quarantine"]:
+        return "the quarantine root is not a cleanix quarantine"
+    return None
+
+
 def _prepare_registry(req: elevate.RegistryRequest, rdir: elevate.RequestDir) -> _RegistryPlan:
     """Validate the registry action BEFORE anything is deleted (Refused on
     any problem): Windows, allowlisted detectors, an elevated process, and
     the backup run in the INVOKING account's own quarantine root.
 
-    The root is accepted only when it is a normalised absolute path ending
-    in ``cleanix\\quarantine``, equal to its realpath, inside the profile
-    that HKLM ProfileList gives for the owner of the request directory,
-    with no link or junction from the profile down to the run, and owned
-    (root, run directory, manifest) by that same account."""
+    Order matters (C1): every check on the caller-chosen root that needs no
+    filesystem access runs FIRST -- a local-drive path (never UNC, WebDAV,
+    ``\\\\?\\`` or device paths, which an administrator process would
+    open over the network), normalised, ending in ``cleanix\\quarantine``,
+    strictly inside the profile that HKLM ProfileList gives for the owner of
+    the request directory. Only then is the filesystem touched: lstat (never
+    following links) from the profile down to the run, its ``registry``
+    folder and manifest (no link or junction anywhere), the realpath, and
+    the owner of the root, run and manifest (that same account)."""
     from cleanix.core import winenv
 
     if not _registry_supported():
@@ -605,53 +635,35 @@ def _prepare_registry(req: elevate.RegistryRequest, rdir: elevate.RequestDir) ->
         raise Refused("the registry part names a detector the helper does not run")
     if not winenv.is_admin():
         raise Refused("the helper is not elevated; registry entries were not removed")
+    root = req.quarantine_root
+    problem = _lexical_root_problem(root)
+    if problem:
+        raise Refused(problem)
     sid = _invoking_sid(rdir)
     profile = _profile_for_sid(sid)
+    if not _is_under(root, profile) or _is_under(profile, root):
+        raise Refused("the quarantine root is not inside the requesting account's profile")
 
-    root = req.quarantine_root
-    if not os.path.isabs(root) or os.path.normpath(root) != root:
-        raise Refused("the quarantine root is not a normalised absolute path")
+    # From here on only local paths inside the profile are touched.
+    chain = [p for p in Path(root).parents if _is_under(str(p), profile)]
+    for p in reversed(chain):
+        _no_link(str(p), "a directory of the quarantine root")
+    _no_link(root, "the quarantine root")
+    run_dir = os.path.join(root, req.backup_run)
+    _no_link(run_dir, "the backup run")
+    reg_dir = os.path.join(run_dir, "registry")
+    if os.path.lexists(reg_dir):
+        _no_link(reg_dir, "the backup run's registry folder")
+    manifest = os.path.join(run_dir, "manifest.json")
+    _no_link(manifest, "the backup run's manifest", directory=False)
     if os.path.normcase(os.path.realpath(root)) != os.path.normcase(root):
         raise Refused("the quarantine root is reached through a link")
-    real_profile = os.path.realpath(profile)
-    if not _is_under(root, real_profile) or _is_under(real_profile, root):
-        raise Refused("the quarantine root is not inside the requesting account's profile")
-    if [p.casefold() for p in Path(root).parts[-2:]] != ["cleanix", "quarantine"]:
-        raise Refused("the quarantine root is not a cleanix quarantine")
-    chain = [Path(root)] + [p for p in Path(root).parents if _is_under(str(p), real_profile)]
-    for p in chain:
-        _no_link_dir(str(p), "a directory of the quarantine root")
-    run_dir = os.path.join(root, req.backup_run)
-    _no_link_dir(run_dir, "the backup run")
-    manifest = os.path.join(run_dir, "manifest.json")
-    try:
-        st = _lstat(manifest)
-    except OSError:
-        raise Refused("the backup run has no manifest") from None
-    if (not _stat_mod.S_ISREG(st.st_mode)
-            or getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT):
-        raise Refused("the backup run's manifest is not a regular file")
     for path, what in ((root, "the quarantine root"), (run_dir, "the backup run"),
                        (manifest, "the backup run's manifest")):
         if _owner_sid(path) != sid:
             raise Refused(f"{what} does not belong to the requesting account")
     return _RegistryPlan(list(dict.fromkeys(req.only)), list(dict.fromkeys(req.keys)),
                          req.backup_run, root)
-
-
-@contextlib.contextmanager
-def _invoking_quarantine_root(root: str) -> Iterator[None]:
-    """``quarantine.quarantine_root()`` is the INVOKING user's root (not the
-    administrator's %LOCALAPPDATA%) for the duration of the block, so
-    ``VerifyOnlySink`` resolves the backup run there."""
-    from cleanix.core import quarantine
-
-    saved = quarantine.quarantine_root
-    quarantine.quarantine_root = lambda: Path(root)
-    try:
-        yield
-    finally:
-        quarantine.quarantine_root = saved
 
 
 @contextlib.contextmanager
@@ -1146,10 +1158,12 @@ def _execute_registry(session: _Session, plan: _RegistryPlan, config, cancel,
     for item in eligible:
         if deadline - (_monotonic() - start) <= 0 or cancel():
             return True
-        with _helper_registry(guard), _invoking_quarantine_root(plan.quarantine_root):
+        with _helper_registry(guard):
             summary = service.clean([item], config, dry_run=False, use_quarantine=False,
                                     record_history=False, registry_backup_elsewhere=True,
-                                    registry_backup_run=plan.backup_run, cancel=cancel)
+                                    registry_backup_run=plan.backup_run,
+                                    registry_backup_root=Path(plan.quarantine_root),
+                                    cancel=cancel)
         if not summary.result.outcomes:
             return True
         session.record(summary)

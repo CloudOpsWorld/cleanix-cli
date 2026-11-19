@@ -302,6 +302,45 @@ def _str_list(value, name: str, pattern=None, max_len: int = MAX_KEY_LEN) -> Lis
     return list(value)
 
 
+_WIN_DRIVE_ROOT = re.compile(r"[A-Za-z]:\\")
+_WIN_RESERVED = frozenset(
+    {"con", "prn", "aux", "nul", "conin$", "conout$"}
+    | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+)
+
+
+def is_local_absolute_path(path) -> bool:
+    """Purely LEXICAL test (never touches the filesystem): is ``path`` an
+    absolute path on a local drive?
+
+    Windows: ``X:\\...`` only -- no UNC (``\\\\server\\share``, WebDAV
+    ``\\\\host@80\\...``), no ``\\\\?\\`` / ``\\\\.\\`` device or GLOBALROOT
+    paths, no forward slashes, no second ``:`` (alternate data streams),
+    no empty components, no component ending in a dot or a space (Win32
+    strips them, so they alias other names) and no reserved device names
+    (``CON``, ``NUL``, ``COM1`` ...). Opening any of those as an
+    administrator could reach the network (and leak the administrator's
+    NTLM credentials) or a device. POSIX: a ``/`` path that does not start
+    with ``//``."""
+    if not isinstance(path, str) or not path or "\x00" in path:
+        return False
+    if _POSIX:
+        return path.startswith("/") and not path.startswith("//")
+    if not _WIN_DRIVE_ROOT.match(path) or "/" in path:
+        return False
+    rest = path[3:]
+    if not rest:
+        return True
+    if ":" in rest:
+        return False
+    for comp in rest.split("\\"):
+        if not comp or comp.endswith((".", " ")):
+            return False
+        if comp.split(".", 1)[0].rstrip(" ").casefold() in _WIN_RESERVED:
+            return False
+    return True
+
+
 def registry_key_parts(key: str):
     """``(cleaner_id, hive, key, value, fingerprint)`` of a REGISTRY item key
     (``models.item_key``). Raises ValueError for anything else."""
@@ -349,7 +388,7 @@ def _parse_registry(obj) -> RegistryRequest:
         raise ValueError("request field 'registry.backup_run' is invalid")
     root = obj["quarantine_root"]
     if (not isinstance(root, str) or not root or len(root) > MAX_ROOT_LEN
-            or _CONTROL_RE.search(root)):
+            or _CONTROL_RE.search(root) or not is_local_absolute_path(root)):
         raise ValueError("request field 'registry.quarantine_root' is invalid")
     return RegistryRequest(only=only, keys=keys, backup_run=run, quarantine_root=root)
 
