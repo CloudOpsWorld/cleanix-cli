@@ -24,6 +24,7 @@ from cleanix.core import (
     winenv,
     winregistry,
 )
+from cleanix.core import engine as engine_mod
 from cleanix.core.engine import Engine
 from cleanix.core.models import CleanableItem, ItemKind, RegTarget
 from cleanix.core.winregistry import (
@@ -52,6 +53,9 @@ def state(tmp_path, monkeypatch):
     monkeypatch.setattr(history, "state_dir", lambda: tmp_path / "state")
     monkeypatch.setattr(quarantine, "quarantine_root", lambda: tmp_path / "q")
     monkeypatch.setattr(winenv, "is_admin", lambda: False)
+    # On Windows is_root() is winenv.is_admin(); keep that on every OS so the
+    # tests that fake an elevated Windows process behave the same on Linux.
+    monkeypatch.setattr(engine_mod, "is_root", lambda: winenv.is_admin())
     return tmp_path
 
 
@@ -724,12 +728,14 @@ def test_list_runs_registry_counts(state, fake_registry, monkeypatch, tmp_path):
     reg.add_key("HKLM", UNINST + r"\Bar", {"DisplayName": (REG_SZ, "Bar")})
     items = [_item(reg), _item(reg, hive="HKLM"), _item(reg, hive="HKLM", key=UNINST + r"\Bar")]
     p, path_item = _path_item(tmp_path)
+    from cleanix.core.utils import path_size  # allocated bytes: 100 on NTFS, a block on Linux
+    expected_size = path_size(p)
     summary = service.clean(items + [path_item], Config(), dry_run=False,
                             use_quarantine=True)
     assert summary.removed == 4, summary.errors
     row, = quarantine.list_runs()
     assert row["run_id"] == summary.quarantine_run
-    assert row["count"] == 4 and row["size"] == 100
+    assert row["count"] == 4 and row["size"] == expected_size
     assert row["registry"] == 3 and row["registry_admin"] == 2
     # purge is unchanged and removes the whole run.
     quarantine.purge(summary.quarantine_run)
