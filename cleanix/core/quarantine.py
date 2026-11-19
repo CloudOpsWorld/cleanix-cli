@@ -4,6 +4,12 @@
 and writes a manifest. ``cleanix restore`` moves them back; ``cleanix quarantine
 empty`` reclaims the space for good. This makes cleaning undoable — a safety net
 most cleaners don't offer.
+
+Registry entries (``ItemKind.REGISTRY``) are never moved: before each delete
+:meth:`Quarantine.store_registry` writes and verifies a ``.reg`` + JSON
+backup under ``<run>/registry`` and saves the manifest, so the entry is
+recorded before anything is deleted. Manifest entries carry
+``"type": "registry"``; entries without ``"type"`` are files, as before.
 """
 
 from __future__ import annotations
@@ -101,6 +107,8 @@ class Quarantine:
         self.dir = quarantine_root() / run_id
         self.files_dir = self.dir / "files"
         self.items: List[Dict] = []
+        # item_key -> index of its registry entry in ``items`` (this process only)
+        self._reg_index: Dict[str, int] = {}
 
     def store(self, path: os.PathLike | str) -> None:
         """Move ``path`` into this quarantine run, recording its origin."""
@@ -179,6 +187,68 @@ class Quarantine:
             raise
         self.items.append({"original": src_s, "stored": dest_s, "size": size})
 
+    # -- registry backups (RegistryBackupSink) -------------------------------
+    def store_registry(self, item, backend) -> None:
+        """Back up one registry entry before its delete.
+
+        Raises ``regclean.RegistryChanged`` when the entry no longer matches
+        the scan, ``regbackup.BackupError`` (or ``OSError``) when the backup
+        cannot be written, verified and recorded. All or nothing: on any
+        failure no manifest entry and no backup file is left behind."""
+        from cleanix.core import regbackup, regsnap
+        from cleanix.core.models import ItemKind, item_key
+        from cleanix.core.regclean import RegistryChanged
+
+        reg = item.reg
+        if item.kind is not ItemKind.REGISTRY or reg is None:
+            raise ValueError("not a registry item")
+        try:
+            snap = regsnap.snapshot(backend, reg)
+        except regsnap.SnapshotError as exc:
+            raise RegistryChanged(str(exc)) from exc
+        if regsnap.fingerprint(reg, snap) != reg.fingerprint:
+            raise RegistryChanged("the entry differs from the scan")
+        idx = len(self.items)
+        files = regbackup.write_backup(
+            self.dir / "registry", idx, item.cleaner_id, reg, snap
+        )
+        self.items.append({
+            "type": "registry",
+            "original": reg.display,
+            "cleaner_id": item.cleaner_id,
+            "hive": reg.hive,
+            "key": reg.key,
+            "value": reg.value,
+            "json": str(files.json_path),
+            "reg": str(files.reg_path),
+            "size": 0,
+            "deleted": None,
+        })
+        try:
+            self.save()  # durable before the delete
+        except BaseException:
+            self.items.pop()
+            for p in (files.json_path, files.reg_path):
+                try:
+                    os.unlink(str(p))
+                except OSError:
+                    pass
+            raise
+        self._reg_index[item_key(item)] = idx
+
+    def mark_registry(self, item, deleted: bool) -> None:
+        """Record whether the entry was deleted (False: certainly not)."""
+        from cleanix.core.models import item_key
+
+        idx = self._reg_index.get(item_key(item))
+        if idx is None:
+            return
+        self.items[idx]["deleted"] = bool(deleted)
+        self.save()
+
+    before_delete = store_registry
+    after_delete = mark_registry
+
     def save(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
         (self.dir / "manifest.json").write_text(
@@ -218,12 +288,16 @@ def list_runs() -> List[Dict]:
         data = _read_manifest(run_dir)
         if not data:
             continue
+        items = data.get("items", [])
+        reg = [i for i in items if isinstance(i, dict) and i.get("type") == "registry"]
         runs.append(
             {
                 "run_id": data.get("run_id", run_dir.name),
                 "created": data.get("created", 0),
-                "count": len(data.get("items", [])),
-                "size": sum(i.get("size", 0) for i in data.get("items", [])),
+                "count": len(items),
+                "size": sum(i.get("size", 0) for i in items),
+                "registry": len(reg),
+                "registry_admin": sum(1 for i in reg if i.get("hive") == "HKLM"),
             }
         )
     return runs
@@ -243,6 +317,19 @@ def restore(run_id: str) -> Dict:
 
     restored, failed = [], []
     for item in data.get("items", []):
+        kind = item.get("type")
+        if kind == "registry":
+            if item.get("deleted") is False:
+                continue  # never deleted: nothing to restore
+            ok, text = _restore_registry(run_dir, run_id, item)
+            if ok:
+                restored.append(text)
+            else:
+                failed.append((item.get("original", "?"), text))
+            continue
+        if kind is not None:
+            failed.append((item.get("original", "?"), "unknown entry type"))
+            continue
         original = Path(item["original"])
         stored = Path(item["stored"])
         if not stored.exists():
@@ -262,6 +349,28 @@ def restore(run_id: str) -> Dict:
     if not failed:
         shutil.rmtree(run_dir, ignore_errors=True)
     return {"restored": restored, "failed": failed}
+
+
+def _restore_registry(run_dir: Path, run_id: str, item: Dict) -> Tuple[bool, str]:
+    """``(True, display)`` or ``(False, reason)``. The backup is always read
+    from this run's own ``registry`` directory (only the recorded file name
+    is used), so a manifest cannot point restore at a file elsewhere. HKCU
+    entries are restored in-process; HKLM ones only when elevated, else the
+    refusal names the run and the ``reg import`` fallback (ruling R6)."""
+    from cleanix.core import regbackup, winenv, winregistry
+
+    name = Path(str(item.get("json") or "")).name
+    json_path = run_dir / "registry" / name
+    try:
+        shown = regbackup.restore_entry(
+            json_path, winregistry.get_backend(),
+            is_admin=winenv.is_admin(), require_owner=True,
+        )
+    except regbackup.RestoreRefused as exc:
+        return False, exc.message_for(run_id)
+    except Exception as exc:  # noqa: BLE001 - one entry never aborts the rest
+        return False, str(exc) or type(exc).__name__
+    return True, shown
 
 
 def purge_detailed(run_id: str) -> Tuple[int, List[str]]:

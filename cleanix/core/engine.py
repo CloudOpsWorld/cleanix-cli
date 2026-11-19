@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
 from cleanix.cleaners.base import Cleaner
-from cleanix.core import safety
+from cleanix.core import regclean, regsafety, safety, winenv, winregistry
 from cleanix.core.models import (
     CleanableItem,
     CleanerReport,
@@ -21,6 +21,7 @@ from cleanix.core.models import (
     ScanResult,
 )
 from cleanix.core import platform as plat
+from cleanix.core.regclean import RegistryBackupSink
 from cleanix.core.utils import is_root, path_size, run_command
 
 ProgressCB = Optional[Callable[[str], None]]
@@ -101,6 +102,7 @@ class Engine:
         progress: ProgressCB = None,
         quarantine=None,
         cancel: CancelCB = None,
+        registry_backup: Optional[RegistryBackupSink] = None,
     ) -> CleanResult:
         """Remove (or simulate removing) the given items.
 
@@ -108,6 +110,11 @@ class Engine:
         root (or ``allow_root_items`` is forced True). If ``quarantine`` is a
         Quarantine store, path items are *moved* there (reversible) instead of
         being deleted.
+
+        REGISTRY items are removed only through ``registry_backup``, which
+        writes and verifies a backup of each entry first (independent of
+        ``quarantine``); without it they are refused. A dry run touches
+        neither the registry nor the backup location.
         """
         if allow_root_items is None:
             allow_root_items = is_root()
@@ -121,13 +128,14 @@ class Engine:
             result.outcomes.append(
                 self._clean_one(
                     item, dry_run=dry_run, allow_root=allow_root_items,
-                    quarantine=quarantine,
+                    quarantine=quarantine, registry_backup=registry_backup,
                 )
             )
         return result
 
     def _clean_one(
-        self, item: CleanableItem, *, dry_run: bool, allow_root: bool, quarantine=None
+        self, item: CleanableItem, *, dry_run: bool, allow_root: bool, quarantine=None,
+        registry_backup: Optional[RegistryBackupSink] = None,
     ) -> CleanOutcome:
         # Report-only items are never deleted, even if one slips into a clean set.
         if item.report_only:
@@ -152,11 +160,13 @@ class Engine:
         if item.kind is ItemKind.COMMAND:
             return self._clean_command(item, dry_run=dry_run)
         if item.kind is ItemKind.REGISTRY:
-            # Fail closed until the backup-first registry path exists.
-            return CleanOutcome(
-                item=item, removed=False, dry_run=dry_run,
-                error="registry cleaning is not available",
-            )
+            try:
+                return self._clean_registry(item, dry_run=dry_run, sink=registry_backup)
+            except Exception as exc:  # noqa: BLE001 - one item never aborts the rest
+                return CleanOutcome(
+                    item=item, removed=False, dry_run=dry_run,
+                    error=f"registry entry not removed (state unknown, scan again): {exc}",
+                )
         return CleanOutcome(
             item=item, removed=False, dry_run=dry_run, error="unknown item kind"
         )
@@ -216,3 +226,70 @@ class Engine:
                 error=(err.strip() or f"exit code {code}"),
             )
         return CleanOutcome(item=item, removed=True, freed=item.size)
+
+    def _clean_registry(
+        self, item: CleanableItem, *, dry_run: bool, sink: Optional[RegistryBackupSink]
+    ) -> CleanOutcome:
+        """Back up, then delete one registry entry (see :mod:`regclean`).
+
+        Order matters: the pure safety check, the dry run, the sink and the
+        administrator check all come before any registry access."""
+        reg = item.reg
+        assert reg is not None  # guaranteed by CleanableItem.__post_init__
+
+        def fail(error: str) -> CleanOutcome:
+            return CleanOutcome(item=item, removed=False, dry_run=dry_run, error=error)
+
+        reason = regsafety.check_target(item.cleaner_id, reg)
+        if reason is not None:
+            return fail(f"blocked by registry safety rules: {reason}")
+        if dry_run:
+            return CleanOutcome(item=item, removed=False, freed=0, dry_run=True)
+        if sink is None:
+            return fail("registry entries are removed only with a backup")
+        if reg.hive == "HKLM" and not winenv.is_admin():
+            return fail(
+                "machine-wide (HKLM) registry entries are removed only from an "
+                "elevated (Administrator) process; nothing was backed up or deleted"
+            )
+
+        backend = winregistry.get_backend()
+        reason = regsafety.check_target(item.cleaner_id, reg, backend)
+        if reason is not None:
+            return fail(f"blocked by registry safety rules: {reason}")
+
+        try:
+            sink.before_delete(item, backend)
+        except regclean.RegistryChanged:
+            return fail(regclean.CHANGED)
+        except Exception as exc:  # noqa: BLE001 - any failure vetoes the delete
+            return fail(f"backup failed, nothing deleted: {exc or type(exc).__name__}")
+
+        deleted = True
+        error: Optional[str] = None
+        try:
+            regclean.delete_target(backend, item.cleaner_id, reg)
+        except regclean.RegistryChanged:
+            deleted, error = False, regclean.CHANGED
+        except (regclean.RegistryBlocked, regclean.NotRemoved, winregistry.AccessDenied) as exc:
+            deleted, error = False, str(exc) or type(exc).__name__
+        except Exception as exc:  # noqa: BLE001 - PartialDelete or unknown state
+            text = str(exc) or type(exc).__name__
+            if not text.startswith("partially deleted"):
+                text = f"partially deleted or state unknown: {text}; scan again"
+            run = getattr(sink, "run_id", None)
+            if run:
+                text += (
+                    f"; the backup is in quarantine run {run}"
+                    f" (restore with cleanix restore {run})"
+                )
+            error = text
+        try:
+            sink.after_delete(item, deleted)
+        except Exception:  # noqa: BLE001
+            # The manifest already holds the entry with "deleted": None,
+            # which restore treats as restorable; nothing is lost.
+            pass
+        if error is not None:
+            return fail(error)
+        return CleanOutcome(item=item, removed=True, freed=0)

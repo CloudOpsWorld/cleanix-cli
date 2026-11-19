@@ -365,11 +365,13 @@ def test_engine_never_runs_registry_as_command(monkeypatch):
 
     monkeypatch.setattr(eng, "run_command", boom)
     e = eng.Engine([])
-    for dry in (True, False):
-        res = e.clean([reg_item()], dry_run=dry, allow_root_items=True)
-        o = res.outcomes[0]
-        assert o.removed is False
-        assert o.error == "registry cleaning is not available"
+    res = e.clean([reg_item()], dry_run=True, allow_root_items=True)
+    o = res.outcomes[0]
+    assert o.removed is False and o.error is None and o.freed == 0
+    res = e.clean([reg_item()], dry_run=False, allow_root_items=True)
+    o = res.outcomes[0]
+    assert o.removed is False
+    assert o.error == "registry entries are removed only with a backup"
     bogus = reg_item()
     object.__setattr__(bogus, "kind", "weird")  # dataclass is not frozen; plain set
     res = e.clean([bogus], dry_run=False, allow_root_items=True)

@@ -12,7 +12,13 @@ from typing import Callable, List, Optional, Sequence
 from cleanix.config import Config
 from cleanix.core import history, safety
 from cleanix.core.engine import Engine
-from cleanix.core.models import CleanableItem, CleanOutcome, CleanResult, ScanResult
+from cleanix.core.models import (
+    CleanableItem,
+    CleanOutcome,
+    CleanResult,
+    ItemKind,
+    ScanResult,
+)
 from cleanix.core.registry import build_cleaners
 
 CancelCB = Optional[Callable[[], bool]]
@@ -68,6 +74,7 @@ def clean(
     progress: Optional[Callable[[str, int, int], None]] = None,
     cancel: CancelCB = None,
     record_history: bool = True,
+    registry_backup_elsewhere: bool = False,
 ) -> CleanSummary:
     """Clean ``items``. ``cancel`` must be thread-safe: it may be called from
     worker threads.
@@ -76,11 +83,27 @@ def clean(
     helper must write nothing under the user's home; the GUI records history
     itself). It cannot be combined with a real quarantine run, which would
     move files without saving the index needed to restore them.
+
+    REGISTRY items are always backed up first (ruling R5): a real clean with
+    registry items creates a quarantine run for their backups even when
+    ``use_quarantine`` is False (files are then still deleted, not moved).
+    ``registry_backup_elsewhere=True`` (the elevated helper only) means the
+    backup was already written by the GUI as the user; no run is created
+    and :class:`regclean.VerifyOnlySink` is used. Without it, a real registry
+    clean needs ``record_history=True`` because the run must be saved.
     """
+    from cleanix.core import regclean
+
+    items = list(items)
+    has_registry = any(i.kind is ItemKind.REGISTRY for i in items)
     if not record_history and use_quarantine and not dry_run:
         raise ValueError("record_history=False cannot be combined with quarantine")
+    if not record_history and has_registry and not dry_run and not registry_backup_elsewhere:
+        raise ValueError(
+            "record_history=False cannot back up registry entries; "
+            "registry entries are removed only with a backup"
+        )
     safety.set_protected_globs(config.protected_globs)
-    items = list(items)
     total = len(items)
     done = [0]
 
@@ -89,15 +112,20 @@ def clean(
         if progress:
             progress(description, done[0], total)
 
-    quarantine = None
-    if use_quarantine and not dry_run:
+    run = None
+    needs_reg_run = has_registry and not registry_backup_elsewhere
+    if not dry_run and (use_quarantine or needs_reg_run):
         from cleanix.core import quarantine as qmod
 
-        quarantine = qmod.new_run()
+        run = qmod.new_run()
+    quarantine = run if use_quarantine else None
+    registry_backup = None
+    if not dry_run:
+        registry_backup = regclean.VerifyOnlySink() if registry_backup_elsewhere else run
 
     result = Engine([]).clean(
         items, dry_run=dry_run, quarantine=quarantine,
-        progress=on_progress, cancel=cancel,
+        progress=on_progress, cancel=cancel, registry_backup=registry_backup,
     )
 
     manifest: Optional[str] = None
@@ -106,9 +134,9 @@ def clean(
         history.record(result.freed, result.removed_count,
                        mode="quarantine" if quarantine else "delete")
         manifest = history.write_manifest(result) or None
-        if quarantine is not None and quarantine.items:
-            quarantine.save()
-            run_id = quarantine.run_id
+    if run is not None and run.items:
+        run.save()
+        run_id = run.run_id
 
     return CleanSummary(
         result=result,
