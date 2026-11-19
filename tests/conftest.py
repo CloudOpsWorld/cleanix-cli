@@ -68,6 +68,16 @@ def fake_registry():
 
 
 @pytest.fixture(autouse=True)
+def _no_process_helper_mode(monkeypatch):
+    """``cleanix.elevated.main`` switches helper scan mode on for the whole
+    process (it never goes off again); tests that call ``main`` in-process
+    must not leak it into every later scan."""
+    from cleanix.core import scanmode
+
+    monkeypatch.setattr(scanmode, "enable_process_helper_mode", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _fresh_windows_profiles_cache():
     """The guard caches the users-directory listing for a few seconds;
     tests that create or remove profile dirs must always see a fresh one."""
