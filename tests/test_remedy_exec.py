@@ -346,7 +346,7 @@ def test_copy_only_run_is_never_the_run_to_undo(env):
     second = actions.act([item], Config(), dry_run=False, permanent=True)
     assert second.backup_run and second.backup_run != first.quarantine_run
     run = [r for r in quarantine.list_runs() if r["run_id"] == second.backup_run][0]
-    assert run["copies"] == run["count"] == 1 and run["removed_count"] == 0
+    assert run["count"] == 1 and run["removed_count"] == 0
     assert quarantine.latest_run() == first.quarantine_run
 
 

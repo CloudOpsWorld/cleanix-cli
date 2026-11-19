@@ -476,8 +476,6 @@ def list_runs() -> List[Dict]:
                 "size": sum(_size_of(i) for i in good),
                 "registry": len(reg),
                 "registry_admin": sum(1 for i in reg if i.get("hive") == "HKLM"),
-                # Copies of permanent removals (store_copy): never restored.
-                "copies": sum(1 for i in good if i.get("type") == "copy"),
                 # Entries restore would act on: files, and registry entries
                 # not known to be untouched (deleted True, or None = unknown).
                 "removed_count": sum(
@@ -503,8 +501,10 @@ def _size_of(item: Dict) -> int:
 def latest_run() -> Optional[str]:
     """The most recently created run (by the manifest's ``created`` time,
     then the id), never by the lexical order of pid digits. A run holding
-    only copies of permanent removals is never "the run to undo"."""
-    runs = [r for r in list_runs() if not (r["count"] and r["copies"] == r["count"])]
+    only copies of permanent removals (``store_copy``: nothing restore acts
+    on, no registry entry) is never "the run to undo"."""
+    runs = [r for r in list_runs()
+            if not (r["count"] and not r["removed_count"] and not r["registry"])]
     if not runs:
         return None
 
