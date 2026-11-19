@@ -113,6 +113,16 @@ Merge order inside a wave is free. Merge each wave before starting the next.
     - Task 11 must re-verify the fingerprint of the target path immediately before each `delete_key`/`delete_value` call;
     - Task 14 measures what a raw `DeleteKeyEx` on a link path deletes.
   - The T3 tests model this pessimistically: `FakeWinreg(delete_follows_final_link=True)` and `test_r17_link_swapped_in_after_check_deletes_target`.
+  - Task 11 outcome: a link swapped in inside that window is reported as "partially deleted … scan again", never as success. The post-delete check still finds the entry.
+  - Other residuals, accepted:
+    - Values or subkeys written to a leaf key after its pre-delete re-snapshot and before `delete_key` are deleted with it, and they are not in the backup. A subkey makes the backend refuse the non-leaf key instead. The outcome is a success.
+    - An ancestor swapped for a link needs write access to the container's parent: the same user for HKCU, an administrator for HKLM. That writer could already change the entry directly, so this is the accepted threat model.
+  - Detected immediately before each delete call:
+    - the remaining tree changed in any name, type or data;
+    - a key became a link, anywhere from `SOFTWARE\<next>` down to the leaf;
+    - the entry or an ancestor is gone;
+    - any safety rule now fails.
+  - Not detected: changes in the few instructions between that check and the backend call, and inside the backend between its handle check and `DeleteKeyEx`.
 
 ## Risks
 

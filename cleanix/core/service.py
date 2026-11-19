@@ -7,6 +7,7 @@ quarantine behaviour instead of re-implementing it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
 from cleanix.config import Config
@@ -75,6 +76,7 @@ def clean(
     cancel: CancelCB = None,
     record_history: bool = True,
     registry_backup_elsewhere: bool = False,
+    registry_backup_dir: Optional[Path] = None,
 ) -> CleanSummary:
     """Clean ``items``. ``cancel`` must be thread-safe: it may be called from
     worker threads.
@@ -88,9 +90,13 @@ def clean(
     registry items creates a quarantine run for their backups even when
     ``use_quarantine`` is False (files are then still deleted, not moved).
     ``registry_backup_elsewhere=True`` (the elevated helper only) means the
-    backup was already written by the GUI as the user; no run is created
-    and :class:`regclean.VerifyOnlySink` is used. Without it, a real registry
-    clean needs ``record_history=True`` because the run must be saved.
+    backup was already written by the GUI as the user into the quarantine run
+    at ``registry_backup_dir``; no run is created and
+    :class:`regclean.VerifyOnlySink` deletes only HKLM entries for which a
+    validated backup with the same fingerprint exists there (every other
+    registry item fails with "backup is required for this entry"). Without
+    it, a real registry clean needs ``record_history=True`` because the run
+    must be saved.
     """
     from cleanix.core import regclean
 
@@ -121,7 +127,10 @@ def clean(
     quarantine = run if use_quarantine else None
     registry_backup = None
     if not dry_run:
-        registry_backup = regclean.VerifyOnlySink() if registry_backup_elsewhere else run
+        registry_backup = (
+            regclean.VerifyOnlySink(registry_backup_dir)
+            if registry_backup_elsewhere else run
+        )
 
     result = Engine([]).clean(
         items, dry_run=dry_run, quarantine=quarantine,
@@ -137,6 +146,8 @@ def clean(
     if run is not None and run.items:
         run.save()
         run_id = run.run_id
+    elif run is not None:
+        run.discard_if_empty()
 
     return CleanSummary(
         result=result,

@@ -163,9 +163,13 @@ class Engine:
             try:
                 return self._clean_registry(item, dry_run=dry_run, sink=registry_backup)
             except Exception as exc:  # noqa: BLE001 - one item never aborts the rest
+                # Every failure of delete_target and of the sink is handled
+                # inside _clean_registry, so anything escaping happened
+                # before a delete was attempted.
                 return CleanOutcome(
                     item=item, removed=False, dry_run=dry_run,
-                    error=f"registry entry not removed (state unknown, scan again): {exc}",
+                    error=f"registry entry not removed, nothing was deleted: "
+                          f"{exc or type(exc).__name__}",
                 )
         return CleanOutcome(
             item=item, removed=False, dry_run=dry_run, error="unknown item kind"
@@ -254,9 +258,12 @@ class Engine:
             )
 
         backend = winregistry.get_backend()
-        reason = regsafety.check_target(item.cleaner_id, reg, backend)
-        if reason is not None:
-            return fail(f"blocked by registry safety rules: {reason}")
+        try:
+            regclean.check_live(backend, item.cleaner_id, reg)
+        except regclean.RegistryChanged:
+            return fail(regclean.CHANGED)
+        except regclean.RegistryBlocked as exc:
+            return fail(str(exc))
 
         try:
             sink.before_delete(item, backend)
@@ -278,18 +285,28 @@ class Engine:
             if not text.startswith("partially deleted"):
                 text = f"partially deleted or state unknown: {text}; scan again"
             run = getattr(sink, "run_id", None)
+            where = getattr(sink, "backup_dir", None)
             if run:
                 text += (
                     f"; the backup is in quarantine run {run}"
                     f" (restore with cleanix restore {run})"
                 )
+            elif where is not None:
+                text += f"; the backup is in {where}"
             error = text
         try:
             sink.after_delete(item, deleted)
-        except Exception:  # noqa: BLE001
-            # The manifest already holds the entry with "deleted": None,
-            # which restore treats as restorable; nothing is lost.
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # The manifest still holds the entry with "deleted": None, which
+            # restore treats as restorable, so undo stays safe; say so.
+            note = (
+                f"the undo record could not be updated ({exc or type(exc).__name__}); "
+                "cleanix restore is still safe"
+            )
+            if error is None:
+                return CleanOutcome(item=item, removed=True, freed=0,
+                                    error=f"deleted, but {note}")
+            error = f"{error}; {note}"
         if error is not None:
             return fail(error)
         return CleanOutcome(item=item, removed=True, freed=0)

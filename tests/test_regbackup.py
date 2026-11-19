@@ -694,7 +694,13 @@ def test_owner_is_current_user_posix(tmp_path, monkeypatch):
 
 
 def test_owner_is_current_user_windows_unknown(tmp_path, monkeypatch):
+    # Task 11 fix round: Windows ownership is now checked (ctypes); any
+    # failure of the security API still means "unknown".
+    def broken():
+        raise OSError("security API unavailable")
+
     monkeypatch.setattr(regbackup.sys, "platform", "win32")
+    monkeypatch.setattr(regbackup, "_win_security", broken)
     assert regbackup.owner_is_current_user(tmp_path) is None
 
 

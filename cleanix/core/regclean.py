@@ -40,6 +40,24 @@ TARGET leaf is deleted. The post-delete check (step 6) then still finds the
 entry, so the outcome is a :class:`PartialDelete` error, never a success.
 Values are not affected: ``delete_value`` checks and deletes through one
 handle.
+
+Other residuals of having no transactional API (R17, accepted):
+
+* Values or subkeys written to a leaf key AFTER its pre-delete re-snapshot
+  and before ``delete_key`` are deleted with it (a subkey makes the backend
+  refuse the non-leaf key instead). They are not in the backup, and the
+  outcome is a success.
+* An ancestor key replaced by a registry link needs write access to that
+  container's parent (the same user for HKCU, an administrator for HKLM).
+  That is the accepted threat model: such a writer can already change the
+  entry directly.
+
+What is detected, immediately before every delete call: the entry changed
+(any name, type or data in the remaining part of the tree), a key turned
+into a link anywhere from ``SOFTWARE\\<next>`` down to the leaf, the entry
+or an ancestor gone, and every safety rule. What is not: changes inside the
+few instructions between that check and the backend call, and inside the
+backend between its own handle check and ``DeleteKeyEx``.
 """
 
 from __future__ import annotations
@@ -95,16 +113,80 @@ class RegistryBackupSink(Protocol):
         deleted; True when something was (or may have been)."""
 
 
+BACKUP_REQUIRED = "backup is required for this entry"
+MAX_BACKUP_FILES = 10_000
+
+
 class VerifyOnlySink:
     """Sink for the elevated helper: the GUI already wrote the backup as the
-    user (ruling R6), and the helper writes nothing. ``before_delete`` is a
-    no-op because :func:`delete_target` re-verifies the fingerprint anyway."""
+    user into a quarantine run (ruling R6), and the helper writes nothing.
+
+    It is not a blind pass: ``before_delete`` vetoes (raises
+    ``regbackup.BackupError``) unless
+
+    * the item is an HKLM entry (HKCU entries are never cleaned by the
+      helper, and never without a backup the user can restore), and
+    * ``backup_dir`` (the run directory, or its ``registry`` subdirectory)
+      holds a backup JSON that passes the full restore validation and is
+      for exactly this cleaner, hive, key, value and fingerprint.
+    """
+
+    def __init__(self, backup_dir) -> None:
+        from pathlib import Path
+
+        self.backup_dir = Path(backup_dir) if backup_dir is not None else None
+
+    def _directory(self):
+        assert self.backup_dir is not None
+        sub = self.backup_dir / "registry"
+        return sub if sub.is_dir() else self.backup_dir
 
     def before_delete(self, item: CleanableItem, backend) -> None:
-        return None
+        from cleanix.core import regbackup
+
+        reg = item.reg
+        if reg is None or reg.hive != "HKLM":
+            raise regbackup.BackupError(BACKUP_REQUIRED)
+        if self.backup_dir is None:
+            raise regbackup.BackupError(f"{BACKUP_REQUIRED}: no backup location was given")
+        directory = self._directory()
+        try:
+            candidates = sorted(directory.glob("*__registry.json"))[:MAX_BACKUP_FILES]
+        except OSError as exc:
+            raise regbackup.BackupError(f"{BACKUP_REQUIRED}: {exc}") from exc
+        for path in candidates:
+            try:
+                cid, target, snap = regbackup.load_verified(path)
+            except regbackup.RestoreError:
+                continue
+            if (
+                cid == item.cleaner_id
+                and target == reg
+                and regsnap.fingerprint(target, snap) == reg.fingerprint
+            ):
+                return None
+        raise regbackup.BackupError(
+            f"{BACKUP_REQUIRED}: no verified backup of it was found in {directory}"
+        )
 
     def after_delete(self, item: CleanableItem, deleted: bool) -> None:
         return None
+
+
+def check_live(backend: RegistryBackend, cleaner_id: str, target: RegTarget) -> None:
+    """``check_target`` with the backend. A refusal because the entry (or a
+    key above it) is gone is :class:`RegistryChanged`; any other refusal is
+    :class:`RegistryBlocked`."""
+    reason = regsafety.check_target(cleaner_id, target, backend)
+    if reason is None:
+        return
+    try:
+        exists = backend.key_exists(target.hive, target.key)
+    except RegistryError as exc:
+        raise RegistryChanged(f"could not verify the entry: {exc}") from exc
+    if not exists:
+        raise RegistryChanged("the entry is gone")
+    raise RegistryBlocked(f"blocked by registry safety rules: {reason}")
 
 
 # -- helpers ---------------------------------------------------------------------
@@ -198,9 +280,7 @@ def delete_target(
             raise AdminRequired(ADMIN_REQUIRED)
 
     # 1. the safety rules, with the backend (links on the path)
-    reason = regsafety.check_target(cleaner_id, target, backend)
-    if reason is not None:
-        raise RegistryBlocked(f"blocked by registry safety rules: {reason}")
+    check_live(backend, cleaner_id, target)
 
     # 2. the entry is still exactly the scanned one
     try:

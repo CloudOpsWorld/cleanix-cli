@@ -604,15 +604,175 @@ def _reg_matches(reg_path: Path, expected: bytes) -> bool:
         return False
 
 
+def load_verified(json_path: Path) -> Tuple[str, RegTarget, Snapshot]:
+    """``(cleaner_id, target, snapshot)`` of a backup file after the full
+    restore validation (regular non-link file, format, shapes, sizes, the
+    safety rules and the digest). Raises :class:`RestoreError`. No registry
+    access."""
+    raw, _reg = _read_entry_file(json_path)
+    try:
+        entry = _load(raw)
+    except _Invalid as exc:
+        raise RestoreError(f"refused: {exc}") from exc
+    return entry.cleaner_id, entry.target, entry.snap
+
+
+def describe_backup(json_path: Path) -> List[str]:
+    """Human-readable lines for every key and value a restore of this
+    (validated) backup would write. Raises :class:`RestoreError`."""
+    _cid, target, snap = load_verified(json_path)
+    hive = target.hive
+    if isinstance(snap, RegValue):
+        return [f"{hive}\\{target.key} [{snap.name}]"]
+    lines: List[str] = []
+
+    def walk(path: str, ks: KeySnap) -> None:
+        lines.append(f"{hive}\\{path}")
+        for v in ks.values:
+            lines.append(f"{hive}\\{path} [{v.name or '(Default)'}]")
+        for sub in ks.subkeys:
+            walk(path + "\\" + sub.name, sub)
+
+    walk(target.key, snap)
+    return lines
+
+
 def _lstat(path):
     return os.lstat(path)
 
 
+class _WinSecurity:
+    """The ctypes calls behind :func:`owner_is_current_user` on Windows,
+    behind one small interface so tests can replace it. SIDs are compared
+    as their canonical string form (``ConvertSidToStringSidW``), which is
+    equivalent to ``EqualSid``."""
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        c, wt = ctypes, wintypes
+        self.ctypes = ctypes
+        self.wt = wintypes
+        # Private DLL objects: the prototypes below never leak into
+        # ctypes.windll used elsewhere.
+        a = self.advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        k = self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        PV = c.c_void_p
+        a.GetNamedSecurityInfoW.argtypes = [wt.LPCWSTR, c.c_int, wt.DWORD, c.POINTER(PV),
+                                            PV, PV, PV, c.POINTER(PV)]
+        a.GetNamedSecurityInfoW.restype = wt.DWORD
+        a.ConvertSidToStringSidW.argtypes = [PV, c.POINTER(PV)]
+        a.ConvertSidToStringSidW.restype = wt.BOOL
+        a.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD, c.POINTER(wt.HANDLE)]
+        a.OpenProcessToken.restype = wt.BOOL
+        a.GetTokenInformation.argtypes = [wt.HANDLE, c.c_int, PV, wt.DWORD,
+                                          c.POINTER(wt.DWORD)]
+        a.GetTokenInformation.restype = wt.BOOL
+        a.CreateWellKnownSid.argtypes = [c.c_int, PV, PV, c.POINTER(wt.DWORD)]
+        a.CreateWellKnownSid.restype = wt.BOOL
+        a.CheckTokenMembership.argtypes = [wt.HANDLE, PV, c.POINTER(wt.BOOL)]
+        a.CheckTokenMembership.restype = wt.BOOL
+        k.GetCurrentProcess.argtypes = []
+        k.GetCurrentProcess.restype = wt.HANDLE
+        k.CloseHandle.argtypes = [wt.HANDLE]
+        k.CloseHandle.restype = wt.BOOL
+        k.LocalFree.argtypes = [PV]
+        k.LocalFree.restype = PV
+
+    def _sid_str(self, psid) -> Optional[str]:
+        c = self.ctypes
+        out = c.c_void_p()
+        if not self.advapi.ConvertSidToStringSidW(psid, c.byref(out)):
+            return None
+        try:
+            return c.wstring_at(out.value)
+        finally:
+            self.kernel.LocalFree(out)
+
+    def file_owner(self, path: str) -> Optional[str]:
+        c = self.ctypes
+        owner = c.c_void_p()
+        sd = c.c_void_p()
+        # SE_FILE_OBJECT = 1, OWNER_SECURITY_INFORMATION = 1
+        rc = self.advapi.GetNamedSecurityInfoW(
+            str(path), 1, 1, c.byref(owner), None, None, None, c.byref(sd)
+        )
+        if rc != 0 or not owner.value:
+            return None
+        try:
+            return self._sid_str(owner)
+        finally:
+            self.kernel.LocalFree(sd)
+
+    def user_sid(self) -> Optional[str]:
+        c, wt = self.ctypes, self.wt
+        token = wt.HANDLE()
+        if not self.advapi.OpenProcessToken(
+            self.kernel.GetCurrentProcess(), 0x0008, c.byref(token)  # TOKEN_QUERY
+        ):
+            return None
+        try:
+            size = wt.DWORD(0)
+            self.advapi.GetTokenInformation(token, 1, None, 0, c.byref(size))  # TokenUser
+            if not size.value:
+                return None
+            buf = c.create_string_buffer(size.value)
+            if not self.advapi.GetTokenInformation(token, 1, buf, size, c.byref(size)):
+                return None
+            psid = c.c_void_p.from_buffer(buf).value  # TOKEN_USER.User.Sid
+            return self._sid_str(c.c_void_p(psid))
+        finally:
+            self.kernel.CloseHandle(token)
+
+    def admins_sid_if_member(self) -> Optional[str]:
+        """``S-1-5-32-544`` when this process's token has the Administrators
+        group enabled (elevated), else None."""
+        c, wt = self.ctypes, self.wt
+        size = wt.DWORD(68)  # SECURITY_MAX_SID_SIZE
+        buf = c.create_string_buffer(size.value)
+        # WinBuiltinAdministratorsSid = 26
+        if not self.advapi.CreateWellKnownSid(26, None, buf, c.byref(size)):
+            return None
+        member = wt.BOOL(False)
+        if not self.advapi.CheckTokenMembership(None, buf, c.byref(member)):
+            return None
+        return self._sid_str(buf) if member.value else None
+
+
+def _win_security() -> "_WinSecurity":
+    return _WinSecurity()
+
+
+def _owner_is_current_user_windows(path) -> Optional[bool]:
+    try:
+        sec = _win_security()
+        owner = sec.file_owner(str(path))
+        if owner is None:
+            return None
+        user = sec.user_sid()
+        if user is None:
+            return None
+        if owner == user:
+            return True
+        # Files an elevated process creates are owned by Administrators.
+        admins = sec.admins_sid_if_member()
+        return owner == admins if admins is not None else False
+    except Exception:  # noqa: BLE001 - any failure means "unknown"
+        return None
+
+
 def owner_is_current_user(path) -> Optional[bool]:
     """``True``/``False`` when the file's owner can be compared with the
-    current user (POSIX: ``st_uid`` vs the effective uid), ``None`` when it
-    cannot be determined cheaply (Windows, where ownership is a SID)."""
-    if sys.platform == "win32" or not hasattr(os, "geteuid"):
+    current user, ``None`` when it cannot be determined.
+
+    * POSIX: ``st_uid`` vs the effective uid (an lstat failure is False).
+    * Windows: the file's owner SID vs the process token's user SID, or the
+      Administrators SID when the process is elevated (ctypes; any failure
+      is ``None``)."""
+    if sys.platform == "win32":
+        return _owner_is_current_user_windows(path)
+    if not hasattr(os, "geteuid"):
         return None
     try:
         return _lstat(str(path)).st_uid == os.geteuid()
@@ -736,9 +896,11 @@ def restore_entry(
     """Restore one backed-up entry; return its display string or raise
     :class:`RestoreError`. Safe to run again (an identical entry is left as
     is). With ``require_owner`` a file known to belong to another user is
-    refused (unknown ownership, e.g. on Windows, is not refused)."""
+    refused; for an HKLM entry unknown ownership is refused too (an HKCU
+    entry with unknown ownership is not)."""
     raw, reg_path = _read_entry_file(json_path)
-    if require_owner and owner_is_current_user(json_path) is False:
+    owner = owner_is_current_user(json_path) if require_owner else None
+    if require_owner and owner is False:
         raise RestoreError("refused: the backup file is not owned by the current user")
     try:
         entry = _load(raw)
@@ -756,6 +918,10 @@ def restore_entry(
         raise RestoreRefused(
             "needs administrator: from an Administrator terminal run cleanix restore ",
             ' or reg import "' + str(reg_path) + '" /reg:64',
+        )
+    if target.hive == "HKLM" and require_owner and owner is not True:
+        raise RestoreError(
+            "refused: the owner of this machine-wide backup cannot be verified"
         )
 
     try:
