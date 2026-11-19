@@ -109,6 +109,9 @@ jobs:
               chmod +x "release/$name"
             fi
           done
+          if [ -f artifacts/cleanix-windows-amd64/cleanix-windows-amd64.exe ]; then
+            cp artifacts/cleanix-windows-amd64/cleanix-windows-amd64.exe release/
+          fi
           cp artifacts/python-package/* release/ || true
           ls -l release
 
@@ -127,6 +130,7 @@ jobs:
           subject-path: |
             release/cleanix-linux-amd64
             release/cleanix-macos-arm64
+            release/cleanix-windows-amd64.exe
             release/*.whl
             release/*.tar.gz
 
@@ -139,6 +143,7 @@ jobs:
           files: |
             release/cleanix-linux-amd64
             release/cleanix-macos-arm64
+            release/cleanix-windows-amd64.exe
             release/*.whl
             release/*.tar.gz
             release/SHA256SUMS
