@@ -12,6 +12,22 @@ the whole document is validated (format, shapes, types, sizes, names) and
 the target is re-judged by :func:`regsafety.check_target` before any
 registry call. It is then an additive merge (Ruling R7): anything that
 exists but differs fails the whole entry before anything is written.
+
+What this does and does NOT guarantee:
+
+* The validation limits WHERE a restore may write: only an entry an
+  allowlisted detector could have deleted (the guard), never outside it,
+  never into denied keys, never through a registry link.
+* The additive pre-check means a restore never overwrites or removes
+  anything that exists.
+* The fingerprint is an unkeyed sha256: it detects accidental corruption,
+  not forgery. Anyone who can edit the JSON can recompute it. Nothing here
+  limits WHAT a forged backup ADDS inside an allowlisted container (for
+  example an HKLM Run value, a ``SOFTWARE\\Classes\\<type>\\shell\\open\\command``
+  handler, an App Paths or Uninstall entry). Provenance is therefore the
+  caller's job: Tasks 12/13 (GUI and CLI restore) must restore only runs
+  under the invoking account's own quarantine root, and may additionally
+  pass ``require_owner=True`` (see :func:`owner_is_current_user`).
 """
 
 from __future__ import annotations
@@ -26,11 +42,16 @@ import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from cleanix.core import regsafety
 from cleanix.core.models import RegTarget
 from cleanix.core.regsafety import check_target
+
+# Coupling note: ``regsafety._strip_wow`` (deny-prefix matching) and
+# ``regsnap._data_size`` (size budget) are deliberately reused, not copied,
+# so the restore validator can never drift from the scan-time rules. Renaming
+# either breaks this module's import, which the test suite catches.
 from cleanix.core.regsnap import (
     MAX_BYTES,
     MAX_KEYS,
@@ -83,6 +104,23 @@ class BackupError(Exception):
 
 class RestoreError(Exception):
     """The entry was not (fully) restored; the message says why."""
+
+
+RUN_PLACEHOLDER = "{run}"
+
+
+class RestoreRefused(RestoreError):
+    """An HKLM entry in a non-elevated process. ``str()`` is the message with
+    a literal ``{run}``; :meth:`message_for` fills in the run id without
+    ``str.format`` (the path may contain braces, even ``{run}`` itself)."""
+
+    def __init__(self, before: str, after: str) -> None:
+        self.before = before
+        self.after = after
+        super().__init__(before + RUN_PLACEHOLDER + after)
+
+    def message_for(self, run: str) -> str:
+        return self.before + str(run) + self.after
 
 
 @dataclass(frozen=True)
@@ -180,6 +218,12 @@ def _is_int(x: Any) -> bool:
     return type(x) is int
 
 
+def _forms(name: str) -> Set[str]:
+    """Both comparison forms of a name: Python's casefold, and Windows'
+    upper-casing (dotless i, long s and friends fold differently)."""
+    return {name.casefold(), name.upper().casefold()}
+
+
 def _bad_chars(text: str) -> bool:
     return any(ord(c) < 32 or ord(c) == 127 for c in text)
 
@@ -197,7 +241,7 @@ def _check_value(obj: Any, *, root_value: bool) -> RegValue:
         or any(c in name for c in "\0\r\n")
     ):
         raise _Invalid("invalid value name")
-    if name.casefold() == "symboliclinkvalue":
+    if "symboliclinkvalue" in _forms(name):
         raise _Invalid("registry link value")
     if not _is_int(typ) or not 0 <= typ <= 0xFFFFFFFF:
         raise _Invalid("unknown value type")
@@ -262,12 +306,12 @@ def _check_key(obj: Any, hive: str, path: str, base: Tuple[str, ...], b: _Budget
         raise _Invalid("key outside the backed-up entry")
     if len(comps) > len(base) and _component_denied(comps):
         raise _Invalid("Windows-owned key")
-    seen = set()
+    seen: Set[str] = set()
     for v in obj["values"]:
         rv = _check_value(v, root_value=False)
-        if rv.name.casefold() in seen:
+        if _forms(rv.name) & seen:
             raise _Invalid("duplicate value name")
-        seen.add(rv.name.casefold())
+        seen |= _forms(rv.name)
         b.values += 1
         b.bytes += _data_size(rv.data) + len(rv.name) * 2
         if b.values > MAX_VALUES:
@@ -287,9 +331,9 @@ def _check_key(obj: Any, hive: str, path: str, base: Tuple[str, ...], b: _Budget
             or name != name.strip()
         ):
             raise _Invalid("invalid subkey name")
-        if name.casefold() in seen:
+        if _forms(name) & seen:
             raise _Invalid("duplicate subkey name")
-        seen.add(name.casefold())
+        seen |= _forms(name)
         _check_key(sub, hive, path + "\\" + name, base, b)
 
 
@@ -303,7 +347,7 @@ class _Entry:
 def _load(raw: bytes) -> _Entry:
     """Parse and fully validate one backup document (no registry access)."""
     if len(raw) > MAX_FILE_BYTES:
-        raise _Invalid("backup file is too large")
+        raise _Invalid("backup file too large")
     try:
         doc = json.loads(
             raw.decode("utf-8"),
@@ -395,7 +439,9 @@ def _write_atomic(path: Path, data: bytes) -> None:
     _fsync_dir(path.parent)
 
 
-def _read_limited(path: Path) -> bytes:
+def _read_limited(path: Path, limit: Optional[int] = None) -> bytes:
+    """Read at most ``limit`` (default MAX_FILE_BYTES) plus one chunk."""
+    limit = MAX_FILE_BYTES if limit is None else limit
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(str(path), flags)
     try:
@@ -407,11 +453,49 @@ def _read_limited(path: Path) -> bytes:
                 break
             chunks.append(chunk)
             total += len(chunk)
-            if total > MAX_FILE_BYTES:
+            if total > limit:
                 break
         return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+def _document(cleaner_id: str, target: RegTarget, snap: Snapshot, digest: str) -> bytes:
+    doc = {
+        "format": FORMAT,
+        "cleaner_id": cleaner_id,
+        "hive": target.hive,
+        "key": target.key,
+        "value": target.value,
+        "fingerprint": digest,
+        "snapshot": to_jsonable(snap),
+    }
+    return json.dumps(doc, ensure_ascii=True).encode("ascii")
+
+
+def backup_problem(cleaner_id: str, target: RegTarget, snap: Snapshot) -> Optional[str]:
+    """Why ``snap`` of ``target`` could never be backed up and restored, or
+    ``None``. Detectors call this at scan time to skip such entries (a
+    ``Policies`` subkey, a value name with CR/LF/NUL, a REG_LINK value, a
+    subkey name with control characters or surrounding spaces, more keys,
+    values or data than the snapshot limits, a document over
+    MAX_FILE_BYTES). It runs exactly the validation restore applies. The
+    target's own fingerprint is not compared here."""
+    try:
+        raw = _document(cleaner_id, target, snap, fingerprint(target, snap))
+    except (TypeError, ValueError, KeyError, AttributeError) as exc:
+        return f"cannot be serialized: {exc}"
+    if len(raw) > MAX_FILE_BYTES:
+        return "backup file too large"
+    try:
+        _load(raw)
+    except _Invalid as exc:
+        return str(exc)
+    try:
+        _reg_bytes(target, snap)
+    except (TypeError, ValueError, KeyError) as exc:
+        return f"cannot be written as .reg: {exc}"
+    return None
 
 
 def write_backup(
@@ -432,19 +516,13 @@ def write_backup(
     )
     written: List[Path] = []
     try:
+        problem = backup_problem(cleaner_id, target, snap)
+        if problem is not None:
+            raise BackupError(f"this entry cannot be backed up: {problem}")
         if fingerprint(target, snap) != target.fingerprint:
             raise BackupError("the snapshot does not match the scanned entry")
         reg_data = _reg_bytes(target, snap)
-        doc = {
-            "format": FORMAT,
-            "cleaner_id": cleaner_id,
-            "hive": target.hive,
-            "key": target.key,
-            "value": target.value,
-            "fingerprint": target.fingerprint,
-            "snapshot": to_jsonable(snap),
-        }
-        json_data = json.dumps(doc, ensure_ascii=True, indent=2).encode("ascii")
+        json_data = _document(cleaner_id, target, snap, target.fingerprint)
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         for p in (files.reg_path, files.json_path):
             if os.path.lexists(p):
@@ -469,7 +547,7 @@ def write_backup(
     except BackupError:
         _remove(written)
         raise
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, TypeError, KeyError) as exc:
         _remove(written)
         raise BackupError(f"could not write the registry backup: {exc}") from exc
     return files
@@ -484,6 +562,27 @@ def _remove(paths: List[Path]) -> None:
 
 
 # -- restore ----------------------------------------------------------------------
+def _read_checked(path: Path, limit: int) -> bytes:
+    """Read a regular, non-link file of at most ``limit`` bytes, or raise
+    ``_Invalid``."""
+    try:
+        st = os.lstat(str(path))
+    except OSError as exc:
+        raise _Invalid(f"backup file not readable: {exc}") from exc
+    if (
+        stat.S_ISLNK(st.st_mode)
+        or not stat.S_ISREG(st.st_mode)
+        or getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        raise _Invalid("backup file is a link or not a regular file")
+    if st.st_size > limit:
+        raise _Invalid("backup file too large")
+    try:
+        return _read_limited(path, limit)
+    except OSError as exc:
+        raise _Invalid(f"backup file not readable: {exc}") from exc
+
+
 def _read_entry_file(json_path: Path) -> Tuple[bytes, Path]:
     json_path = Path(json_path)
     m = _JSON_NAME.match(json_path.name)
@@ -491,21 +590,34 @@ def _read_entry_file(json_path: Path) -> Tuple[bytes, Path]:
         raise RestoreError(f"not a registry backup file: {json_path.name}")
     reg_path = Path(os.path.abspath(json_path.with_name(f"{m.group(1)}__registry.reg")))
     try:
-        st = os.lstat(str(json_path))
-    except OSError as exc:
-        raise RestoreError(f"backup file not readable: {exc}") from exc
-    if (
-        stat.S_ISLNK(st.st_mode)
-        or not stat.S_ISREG(st.st_mode)
-        or getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
-    ):
-        raise RestoreError("backup file is a link or not a regular file")
-    if st.st_size > MAX_FILE_BYTES:
-        raise RestoreError("backup file is too large")
+        return _read_checked(json_path, MAX_FILE_BYTES), reg_path
+    except _Invalid as exc:
+        raise RestoreError(f"refused: {exc}") from exc
+
+
+def _reg_matches(reg_path: Path, expected: bytes) -> bool:
+    """The sibling ``.reg`` is a regular file whose bytes are exactly what
+    the validated JSON produces (so advising ``reg import`` is safe)."""
     try:
-        return _read_limited(json_path), reg_path
-    except OSError as exc:
-        raise RestoreError(f"backup file not readable: {exc}") from exc
+        return _read_checked(reg_path, len(expected)) == expected
+    except _Invalid:
+        return False
+
+
+def _lstat(path):
+    return os.lstat(path)
+
+
+def owner_is_current_user(path) -> Optional[bool]:
+    """``True``/``False`` when the file's owner can be compared with the
+    current user (POSIX: ``st_uid`` vs the effective uid), ``None`` when it
+    cannot be determined cheaply (Windows, where ownership is a SID)."""
+    if sys.platform == "win32" or not hasattr(os, "geteuid"):
+        return None
+    try:
+        return _lstat(str(path)).st_uid == os.geteuid()
+    except OSError:
+        return False
 
 
 def _check_ancestors(backend: RegistryBackend, hive: str, parts: List[str]) -> None:
@@ -516,6 +628,10 @@ def _check_ancestors(backend: RegistryBackend, hive: str, parts: List[str]) -> N
         path = "\\".join(parts[:depth])
         if backend.key_exists(hive, path) and backend.is_link(hive, path):
             raise RestoreError("refused: registry link (symbolic link) in the path")
+
+
+_CONFLICT = "; nothing was changed; the entry was re-created since the clean"
+_WRITE_ERRORS = (RegistryError, OSError, TypeError, ValueError, OverflowError)
 
 
 def _plan_key(
@@ -540,7 +656,7 @@ def _plan_key(
     for fold, cur in have.items():
         if fold not in want:
             raise RestoreError(
-                f"not restored: the entry exists with an extra value {cur.name!r}"
+                f"not restored: the entry exists with an extra value {cur.name!r}" + _CONFLICT
             )
     for fold, v in want.items():
         cur = have.get(fold)
@@ -548,14 +664,14 @@ def _plan_key(
             plan.append(("set", path, v))
         elif cur != v:
             raise RestoreError(
-                f"not restored: the value {v.name!r} exists with different content"
+                f"not restored: the value {v.name!r} exists with different content" + _CONFLICT
             )
     existing = {s.casefold(): s for s in backend.subkeys(hive, path)}
     wanted = {s.name.casefold(): s for s in snap.subkeys}
     for fold, name in existing.items():
         if fold not in wanted or wanted[fold].name != name:
             raise RestoreError(
-                f"not restored: the entry exists with a different subkey {name!r}"
+                f"not restored: the entry exists with a different subkey {name!r}" + _CONFLICT
             )
     for sub in snap.subkeys:
         sub_exists = sub.name.casefold() in existing
@@ -575,7 +691,7 @@ def _plan(backend: RegistryBackend, target: RegTarget, snap: Snapshot) -> List[T
             return [("set", target.key, snap)]
         if cur != snap:
             raise RestoreError(
-                f"not restored: the value {snap.name!r} exists with different content"
+                f"not restored: the value {snap.name!r} exists with different content" + _CONFLICT
             )
         return []
     _check_ancestors(backend, hive, parts[:-1])
@@ -602,7 +718,7 @@ def _apply(backend: RegistryBackend, hive: str, plan: List[Tuple]) -> List[str]:
                 backend.create_key(hive, path)
             else:
                 backend.set_value(hive, path, op[2])
-        except RegistryError as exc:
+        except _WRITE_ERRORS as exc:
             what = f"{hive}\\{path}" + (f" [{op[2].name}]" if op[0] == "set" else "")
             errors.append(f"{what}: {exc or type(exc).__name__}")
             if op[0] == "create":
@@ -610,11 +726,20 @@ def _apply(backend: RegistryBackend, hive: str, plan: List[Tuple]) -> List[str]:
     return errors
 
 
-def restore_entry(json_path: Path, backend: RegistryBackend, *, is_admin: bool) -> str:
+def restore_entry(
+    json_path: Path,
+    backend: RegistryBackend,
+    *,
+    is_admin: bool,
+    require_owner: bool = False,
+) -> str:
     """Restore one backed-up entry; return its display string or raise
     :class:`RestoreError`. Safe to run again (an identical entry is left as
-    is)."""
+    is). With ``require_owner`` a file known to belong to another user is
+    refused (unknown ownership, e.g. on Windows, is not refused)."""
     raw, reg_path = _read_entry_file(json_path)
+    if require_owner and owner_is_current_user(json_path) is False:
+        raise RestoreError("refused: the backup file is not owned by the current user")
     try:
         entry = _load(raw)
     except _Invalid as exc:
@@ -622,14 +747,20 @@ def restore_entry(json_path: Path, backend: RegistryBackend, *, is_admin: bool) 
     target, snap = entry.target, entry.snap
 
     if target.hive == "HKLM" and not is_admin:
-        raise RestoreError(
-            f"needs administrator: from an Administrator terminal run cleanix restore "
-            f'{{run}} or reg import "{reg_path}"'
+        if not _reg_matches(reg_path, _reg_bytes(target, snap)):
+            raise RestoreError(
+                "needs administrator, and the .reg file does not match the backup; "
+                "do not import it"
+            )
+        # /reg:64: a 32-bit reg.exe would otherwise import into WOW6432Node.
+        raise RestoreRefused(
+            "needs administrator: from an Administrator terminal run cleanix restore ",
+            ' or reg import "' + str(reg_path) + '" /reg:64',
         )
 
     try:
         plan = _plan(backend, target, snap)
-    except RegistryError as exc:
+    except _WRITE_ERRORS as exc:
         raise RestoreError(f"not restored: could not read the registry: {exc}") from exc
     if plan:
         errors = _apply(backend, target.hive, plan)

@@ -15,6 +15,8 @@ from cleanix.core.models import RegTarget
 from cleanix.core.regbackup import (
     BackupError,
     RestoreError,
+    RestoreRefused,
+    backup_problem,
     restore_entry,
     to_reg_text,
     write_backup,
@@ -42,6 +44,16 @@ WRITES = ("set_value", "create_key", "delete_key", "delete_value")
 
 def _writes(reg: FakeRegistry):
     return [c for c in reg.calls if c[0] in WRITES]
+
+
+def _set(path, value):
+    """A JSON-document edit setting ``doc[path...] = value``."""
+    def edit(doc):
+        obj = doc
+        for p in path[:-1]:
+            obj = obj[p]
+        obj[path[-1]] = value
+    return edit
 
 
 # -- fixtures -------------------------------------------------------------------
@@ -404,21 +416,304 @@ def test_restore_reports_partial_failure(tmp_path, fake_registry):
     assert fingerprint(t, snapshot(fake_registry, t)) == t.fingerprint
 
 
-def test_restore_hklm_needs_admin(tmp_path, fake_registry):
+def _hklm_backup(directory, reg):
     name = "C:\\Program Files\\X\\a.dll"
-    fake_registry.add_key("HKLM", SHARED, {name: (REG_DWORD, 2)})
-    t = _target_for(fake_registry, "HKLM", SHARED, name)
-    files = _backup(tmp_path, fake_registry, t, cleaner="win_reg_shared_dlls")
-    fake_registry.delete_value("HKLM", SHARED, name)
-    fake_registry.calls.clear()
-    with pytest.raises(RestoreError) as ei:
+    reg.add_key("HKLM", SHARED, {name: (REG_DWORD, 2)})
+    t = _target_for(reg, "HKLM", SHARED, name)
+    files = write_backup(directory, 1, "win_reg_shared_dlls", t, snapshot(reg, t))
+    reg.delete_value("HKLM", SHARED, name)
+    reg.calls.clear()
+    return files, name
+
+
+def test_restore_hklm_needs_admin(tmp_path, fake_registry):
+    files, name = _hklm_backup(tmp_path / "run", fake_registry)
+    with pytest.raises(RestoreRefused) as ei:
         restore_entry(files.json_path, fake_registry, is_admin=False)
     msg = str(ei.value)
     assert fake_registry.calls == []
     assert "reg import" in msg and "{run}" in msg
-    assert f'"{os.path.abspath(files.reg_path)}"' in msg
+    assert f'reg import "{os.path.abspath(files.reg_path)}" /reg:64' in msg
+    filled = ei.value.message_for("20261119-1")
+    assert "cleanix restore 20261119-1 " in filled and "{run}" not in filled
     restore_entry(files.json_path, fake_registry, is_admin=True)
     assert fake_registry.tree("HKLM", SHARED)["values"][name] == (REG_DWORD, 2)
+
+
+def test_restore_hklm_message_with_braces_in_path(tmp_path, fake_registry):
+    files, _ = _hklm_backup(tmp_path / "C{x}" / "{run}", fake_registry)
+    with pytest.raises(RestoreRefused) as ei:
+        restore_entry(files.json_path, fake_registry, is_admin=False)
+    filled = ei.value.message_for("RUN1")
+    assert "cleanix restore RUN1 or" in filled
+    assert f'"{os.path.abspath(files.reg_path)}"' in filled  # path left intact
+    assert "C{x}" in filled and "{run}" in filled.split("reg import", 1)[1]
+
+
+@pytest.mark.parametrize(
+    "spoil",
+    [
+        lambda p: p.write_bytes(
+            b"\xff\xfe" + "Windows Registry Editor Version 5.00\r\n\r\n"
+            "[-HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft]\r\n\r\n".encode("utf-16-le")
+        ),
+        lambda p: p.write_bytes(p.read_bytes() + '"x"=-\r\n'.encode("utf-16-le")),
+        lambda p: p.unlink(),
+    ],
+    ids=["rewritten", "appended", "missing"],
+)
+def test_restore_hklm_refuses_to_advise_a_spoiled_reg(tmp_path, fake_registry, spoil):
+    files, _ = _hklm_backup(tmp_path / "run", fake_registry)
+    spoil(files.reg_path)
+    with pytest.raises(RestoreError) as ei:
+        restore_entry(files.json_path, fake_registry, is_admin=False)
+    msg = str(ei.value)
+    assert "the .reg file does not match the backup; do not import it" in msg
+    assert "reg import" not in msg
+    assert not isinstance(ei.value, RestoreRefused)
+    assert fake_registry.calls == []
+
+
+def test_restore_hklm_refuses_linked_reg(tmp_path, fake_registry):
+    files, _ = _hklm_backup(tmp_path / "run", fake_registry)
+    real = files.reg_path.with_name("real.reg")
+    files.reg_path.rename(real)
+    try:
+        os.symlink(real, files.reg_path)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available")
+    with pytest.raises(RestoreError) as ei:
+        restore_entry(files.json_path, fake_registry, is_admin=False)
+    assert "do not import it" in str(ei.value)
+
+
+def test_restore_final_check_catches_a_lossy_backend(tmp_path):
+    class Lossy(FakeRegistry):
+        def set_value(self, hive, key, value):
+            if value.name == "dw":
+                value = RegValue(value.name, value.type, 0)
+            super().set_value(hive, key, value)
+
+    reg = Lossy()
+    t = _odd_tree(reg)
+    files = _backup(tmp_path, reg, t)
+    _delete_tree(reg, "HKCU", APP)
+    with pytest.raises(RestoreError) as ei:
+        restore_entry(files.json_path, reg, is_admin=False)
+    assert str(ei.value) == "restored, but the result differs from the backup"
+
+
+@pytest.mark.parametrize("exc", [OverflowError("big"), TypeError("t"), ValueError("v")])
+def test_restore_backend_non_registry_errors_become_restore_error(tmp_path, fake_registry, exc):
+    t = _odd_tree(fake_registry)
+    files = _backup(tmp_path, fake_registry, t)
+    _delete_tree(fake_registry, "HKCU", APP)
+    fake_registry.fail_next("set_value", exc)
+    with pytest.raises(RestoreError) as ei:
+        restore_entry(files.json_path, fake_registry, is_admin=False)
+    assert "partially restored" in str(ei.value)
+
+
+def test_restore_skips_subtree_of_failed_create(tmp_path, fake_registry):
+    t = _odd_tree(fake_registry)
+    files = _backup(tmp_path, fake_registry, t)
+    _delete_tree(fake_registry, "HKCU", APP)
+    fake_registry.calls.clear()
+    fake_registry.fail_next("create_key", AccessDenied("nope"))
+    with pytest.raises(RestoreError) as ei:
+        restore_entry(files.json_path, fake_registry, is_admin=False)
+    assert "skipped" in str(ei.value)
+    assert [c[0] for c in _writes(fake_registry)] == ["create_key"]
+    assert not fake_registry.key_exists("HKCU", APP)
+
+
+@pytest.mark.parametrize(
+    "hive,link,key,cleaner",
+    [
+        ("HKCU", r"SOFTWARE\Microsoft", APP, "win_reg_uninstall"),
+        ("HKLM", r"SOFTWARE\Classes", r"SOFTWARE\Classes\myapp.doc", "win_reg_file_assoc"),
+    ],
+)
+def test_restore_depth2_link_refused_except_hkcu_classes(tmp_path, fake_registry, hive, link, key, cleaner):
+    fake_registry.add_key(hive, key, {"": (REG_SZ, "x")})
+    t = _target_for(fake_registry, hive, key)
+    files = write_backup(tmp_path, 1, cleaner, t, snapshot(fake_registry, t))
+    _delete_tree(fake_registry, hive, key)
+    fake_registry.add_key(hive, link, link=True)
+    fake_registry.calls.clear()
+    with pytest.raises(RestoreError) as ei:
+        restore_entry(files.json_path, fake_registry, is_admin=True)
+    assert "registry link" in str(ei.value)
+    assert _writes(fake_registry) == []
+
+
+# -- value-target tampering ------------------------------------------------------
+def _tampered_value(tmp_path, reg, edit, *, link_run=False):
+    reg.add_key("HKCU", RUN, {"MyApp": (REG_SZ, "C:\\gone\\a.exe"), "Keep": (REG_SZ, "k")})
+    t = _target_for(reg, "HKCU", RUN, "MyApp")
+    files = _backup(tmp_path, reg, t, cleaner="win_reg_startup")
+    reg.delete_value("HKCU", RUN, "MyApp")
+    if link_run:
+        reg.add_key("HKCU", RUN, link=True)
+    doc = json.loads(files.json_path.read_text(encoding="utf-8"))
+    edit(doc)
+    tt = RegTarget(doc["hive"], doc["key"], doc["value"])
+    doc["fingerprint"] = fingerprint(tt, from_jsonable(doc["snapshot"]))
+    files.json_path.write_text(json.dumps(doc), encoding="utf-8")
+    reg.calls.clear()
+    return files
+
+
+VALUE_TAMPER = {
+    "name-mismatch": (_set(["snapshot", "name"], "Other"), "snapshot does not match the target"),
+    "oversized": (_set(["snapshot", "data"], "x" * 600_000), "too much data"),
+    "kind-key": (lambda d: d.update(snapshot={"kind": "key", "name": "Run", "values": [], "subkeys": []}),
+                 "snapshot does not match the target"),
+    "qword-2-64": (lambda d: d.update(snapshot={"kind": "value", "name": "MyApp", "type": REG_QWORD,
+                                                 "data": 2 ** 64}), "does not match its type"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(VALUE_TAMPER))
+def test_restore_refuses_tampered_value_target(tmp_path, fake_registry, case):
+    edit, reason = VALUE_TAMPER[case]
+    files = _tampered_value(tmp_path, fake_registry, edit)
+    with pytest.raises(RestoreError) as ei:
+        restore_entry(files.json_path, fake_registry, is_admin=True)
+    assert reason in str(ei.value)
+    assert _writes(fake_registry) == []
+
+
+def test_restore_value_target_refuses_link_key(tmp_path, fake_registry):
+    files = _tampered_value(tmp_path, fake_registry, lambda d: None, link_run=True)
+    with pytest.raises(RestoreError) as ei:
+        restore_entry(files.json_path, fake_registry, is_admin=True)
+    assert "registry link" in str(ei.value)
+    assert _writes(fake_registry) == []
+
+
+def test_qword_max_is_accepted(tmp_path, fake_registry):
+    fake_registry.add_key("HKCU", APP, {"q": (REG_QWORD, 2 ** 64 - 1)})
+    t = _target_for(fake_registry, "HKCU", APP)
+    files = _backup(tmp_path, fake_registry, t)
+    _delete_tree(fake_registry, "HKCU", APP)
+    restore_entry(files.json_path, fake_registry, is_admin=False)
+    assert fake_registry.tree("HKCU", APP)["values"]["q"] == (REG_QWORD, 2 ** 64 - 1)
+
+
+# -- backup_problem / write failures / provenance -----------------------------------
+@pytest.mark.parametrize(
+    "values,subkeys,reason",
+    [
+        ({"a\r\nb": (REG_SZ, "x")}, (), "invalid value name"),
+        ({"a\0b": (REG_SZ, "x")}, (), "invalid value name"),
+        ({"l": (6, b"")}, (), "registry link value"),
+        ({}, ("Policies",), "Windows-owned key"),
+        ({}, ("sub ",), "invalid subkey name"),
+        ({}, tuple(f"k{i}" for i in range(300)), "too many subkeys"),
+    ],
+    ids=["crlf", "nul", "reg-link", "policies", "trailing-space", "too-many-keys"],
+)
+def test_backup_problem_reports_unbackupable_entries(values, subkeys, reason):
+    snap = KeySnap("MyApp", tuple(RegValue(n, ty, d) for n, (ty, d) in values.items()),
+                   tuple(KeySnap(s, (), ()) for s in subkeys))
+    t = RegTarget("HKCU", APP)
+    problem = backup_problem("win_reg_uninstall", t, snap)
+    assert problem is not None and reason in problem
+
+
+def test_backup_problem_none_for_good_entry_and_reasons_for_bad_targets(fake_registry):
+    t = _odd_tree(fake_registry)
+    snap = snapshot(fake_registry, t)
+    assert backup_problem("win_reg_uninstall", t, snap) is None
+    assert backup_problem("win_reg_uninstall", RegTarget("HKCU", APP), snap) is None
+    assert "not inside" in backup_problem("win_reg_startup", t, snap)
+    bad_hive = RegTarget("HKEY_CURRENT_USER", APP, None, t.fingerprint)
+    assert backup_problem("win_reg_uninstall", bad_hive, snap)
+
+
+def test_backup_problem_document_too_large(monkeypatch):
+    monkeypatch.setattr(regbackup, "MAX_FILE_BYTES", 100)
+    snap = KeySnap("MyApp", (RegValue("a", REG_SZ, "x" * 200),), ())
+    assert backup_problem("win_reg_uninstall", RegTarget("HKCU", APP), snap) == "backup file too large"
+
+
+def test_write_backup_bad_hive_is_backup_error(tmp_path):
+    with pytest.raises(BackupError):
+        write_backup(tmp_path, 1, "win_reg_uninstall",
+                     RegTarget("HKEY_CURRENT_USER", APP, None, "0" * 64), KeySnap("MyApp", (), ()))
+
+
+def test_write_backup_mid_write_oserror_leaves_no_files(tmp_path, fake_registry, monkeypatch):
+    t = _odd_tree(fake_registry)
+    real_replace = os.replace
+
+    def failing(src, dst):
+        if str(dst).endswith(".json"):
+            raise OSError(28, "No space left on device")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(regbackup.os, "replace", failing)
+    with pytest.raises(BackupError):
+        _backup(tmp_path, fake_registry, t)
+    monkeypatch.undo()
+    assert list((tmp_path / "run").iterdir()) == []
+
+
+def test_oversized_file_message(tmp_path, fake_registry):
+    t = _odd_tree(fake_registry)
+    files = _backup(tmp_path, fake_registry, t)
+    files.json_path.write_bytes(b" " * (regbackup.MAX_FILE_BYTES + 1))
+    with pytest.raises(RestoreError) as ei:
+        restore_entry(files.json_path, fake_registry, is_admin=True)
+    assert "backup file too large" in str(ei.value)
+    with pytest.raises(regbackup._Invalid, match="backup file too large"):
+        regbackup._load(b" " * (regbackup.MAX_FILE_BYTES + 1))
+
+
+def test_conflict_message_says_nothing_changed(tmp_path, fake_registry):
+    t = _odd_tree(fake_registry)
+    files = _backup(tmp_path, fake_registry, t)
+    fake_registry.set_value("HKCU", APP, RegValue("dw", REG_DWORD, 7))
+    with pytest.raises(RestoreError) as ei:
+        restore_entry(files.json_path, fake_registry, is_admin=False)
+    assert "nothing was changed; the entry was re-created since the clean" in str(ei.value)
+
+
+def test_owner_is_current_user_posix(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    p = tmp_path / "f"
+    p.write_bytes(b"x")
+    monkeypatch.setattr(regbackup.sys, "platform", "linux")
+    monkeypatch.setattr(regbackup.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(regbackup, "_lstat", lambda path: SimpleNamespace(st_uid=1000))
+    assert regbackup.owner_is_current_user(p) is True
+    monkeypatch.setattr(regbackup, "_lstat", lambda path: SimpleNamespace(st_uid=0))
+    assert regbackup.owner_is_current_user(p) is False
+
+
+def test_owner_is_current_user_windows_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(regbackup.sys, "platform", "win32")
+    assert regbackup.owner_is_current_user(tmp_path) is None
+
+
+def test_restore_require_owner(tmp_path, fake_registry, monkeypatch):
+    t = _odd_tree(fake_registry)
+    files = _backup(tmp_path, fake_registry, t)
+    _delete_tree(fake_registry, "HKCU", APP)
+    fake_registry.calls.clear()
+    monkeypatch.setattr(regbackup, "owner_is_current_user", lambda p: False)
+    # Off by default.
+    restore_entry(files.json_path, fake_registry, is_admin=False)
+    _delete_tree(fake_registry, "HKCU", APP)
+    fake_registry.calls.clear()
+    with pytest.raises(RestoreError) as ei:
+        restore_entry(files.json_path, fake_registry, is_admin=False, require_owner=True)
+    assert "not owned by the current user" in str(ei.value)
+    assert fake_registry.calls == []
+    monkeypatch.setattr(regbackup, "owner_is_current_user", lambda p: None)
+    restore_entry(files.json_path, fake_registry, is_admin=False, require_owner=True)
 
 
 def test_restore_hkcu_classes_anchor_link_is_trusted(tmp_path, fake_registry):
@@ -457,15 +752,6 @@ def _expect_refused(fake_registry, files, **kw):
     with pytest.raises(RestoreError):
         restore_entry(files.json_path, fake_registry, is_admin=kw.get("admin", True))
     assert _writes(fake_registry) == []
-
-
-def _set(path, value):
-    def edit(doc):
-        obj = doc
-        for p in path[:-1]:
-            obj = obj[p]
-        obj[path[-1]] = value
-    return edit
 
 
 def _sub(i):
@@ -537,6 +823,19 @@ TAMPER = {
         {"name": "big", "type": REG_SZ, "data": "x" * 600_000}), True),
     "value-name-crlf": (lambda d: d["snapshot"]["values"].append(
         {"name": "a\r\nb", "type": REG_SZ, "data": "x"}), True),
+    "qword-2-64": (lambda d: d["snapshot"]["values"].append(
+        {"name": "zz", "type": REG_QWORD, "data": 2 ** 64}), True),
+    # Windows compares names by upper-casing: dotless i (U+0131) upcases to I.
+    "subkey-policies-dotless": (_set(_sub(0) + ["name"], "Polıcies"), True),
+    "value-symlink-dotless": (lambda d: d["snapshot"]["values"].append(
+        {"name": "SymbolıcLinkValue", "type": REG_SZ, "data": "x"}), True),
+    "value-dup-upcase": (lambda d: d["snapshot"]["values"].extend(
+        [{"name": "ı", "type": REG_SZ, "data": "1"},
+         {"name": "I", "type": REG_SZ, "data": "2"}]), True),
+    "subkey-dup-upcase": (lambda d: d["snapshot"]["subkeys"].extend(
+        [{"kind": "key", "name": "ıx", "values": [], "subkeys": []},
+         {"kind": "key", "name": "Ix", "values": [], "subkeys": []}]), True),
+    "key-dotless-microsoft": (_set(["key"], UNINST.replace("Microsoft", "Mıcrosoft") + r"\MyApp"), True),
 }
 
 # The reason each case must be refused for; a regression that leaves only
@@ -590,6 +889,12 @@ REASONS = {
     "too-many-keys": "too many subkeys",
     "too-many-values": "too many values",
     "too-much-data": "too much data",
+    "qword-2-64": "does not match its type",
+    "subkey-policies-dotless": "Windows-owned key",
+    "value-symlink-dotless": "registry link value",
+    "value-dup-upcase": "duplicate value name",
+    "subkey-dup-upcase": "duplicate subkey name",
+    "key-dotless-microsoft": "non-ASCII",
 }
 
 
