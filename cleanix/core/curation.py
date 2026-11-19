@@ -155,6 +155,12 @@ _RAW = {
     "device_backups": ("Phone and tablet backups", "iOS and Android device backups, often irreplaceable. " + _REVIEW_TAIL),
     "libvirt_saves": ("Saved virtual machine states", "Suspended VM memory images with real state. " + _REVIEW_TAIL),
     "macos_sleepimage": ("Mac sleep image", "Hibernation file recreated by macOS. " + _REVIEW_TAIL),
+    # --- Windows registry leftovers (opt-in; always backed up first)
+    "win_reg_uninstall": ("Dead uninstall entries", "Apps & Features entries whose program folder and uninstaller are gone. Removing them only tidies the list; a backup is kept."),
+    "win_reg_app_paths": ("Dead program shortcuts (App Paths)", "Run-dialog shortcuts to programs that no longer exist. Removing them has no effect on working software; a backup is kept."),
+    "win_reg_file_assoc": ("Dead file-type handlers", "Open-with handlers pointing at deleted programs. Affected files fall back to 'choose an app'; a backup is kept."),
+    "win_reg_startup": ("Dead startup entries", "Startup entries for programs that no longer exist. Nothing starts from them today; a backup is kept."),
+    "win_reg_shared_dlls": ("Stale shared-file counters", "Install counters for shared files that no longer exist. Uninstallers no longer need them; a backup is kept."),
 }
 
 COPY: Dict[str, Copy] = {k: Copy(*v) for k, v in _RAW.items()}
@@ -167,6 +173,8 @@ def copy_for(cleaner_id: str, name: str, description: str) -> Copy:
 
 def safety_of(item: CleanableItem, info: Optional[CleanerInfo]) -> Safety:
     if info is None:
+        return Safety.REVIEW
+    if item.kind is ItemKind.REGISTRY:
         return Safety.REVIEW
     if item.report_only:
         return Safety.REVIEW
@@ -211,6 +219,8 @@ def display_label(item: CleanableItem, home: Optional[str]) -> str:
         return cleaned
     if item.path:
         return shorten_path(item.path, home)
+    if item.kind is ItemKind.REGISTRY and item.reg is not None:
+        return item.reg.display
     return desc
 
 
@@ -238,8 +248,9 @@ class Group:
 
 def is_empty(item: CleanableItem) -> bool:
     """True for items with nothing to show. A COMMAND item's size is unknown
-    (best effort, often 0), so it is never treated as empty."""
-    return item.size <= 0 and item.kind is not ItemKind.COMMAND
+    (best effort, often 0), so it is never treated as empty. Registry items
+    always have size 0 and are never hidden."""
+    return item.size <= 0 and item.kind not in (ItemKind.COMMAND, ItemKind.REGISTRY)
 
 
 def build_groups(

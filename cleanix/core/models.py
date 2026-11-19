@@ -8,6 +8,7 @@ easy to serialize (for JSON reports and scheduled runs) and easy to test.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Sequence
@@ -18,6 +19,29 @@ class ItemKind(str, Enum):
 
     PATH = "path"          # a file or directory to delete
     COMMAND = "command"    # an external command to run (e.g. `apt-get clean`)
+    REGISTRY = "registry"  # a Windows registry key or value (backed up first)
+
+
+@dataclass(frozen=True)
+class RegTarget:
+    """A registry key (``value is None``) or one value inside a key.
+
+    ``key`` is the physical path below the hive (literal ``WOW6432Node``
+    where it applies). ``fingerprint`` pins the exact content seen at scan
+    time: a changed entry no longer matches.
+    """
+
+    hive: str
+    key: str
+    value: Optional[str] = None
+    fingerprint: str = ""
+
+    @property
+    def display(self) -> str:
+        text = f"{self.hive}\\{self.key}"
+        if self.value is not None:
+            text += f" [{self.value}]"
+        return text
 
 
 @dataclass
@@ -44,19 +68,47 @@ class CleanableItem:
     # COMMAND items only: seconds before the command is killed. ``None`` keeps
     # run_command's default (120 s); long jobs such as DISM set their own.
     timeout: Optional[int] = None
+    # REGISTRY items only: the key or value to remove.
+    reg: Optional[RegTarget] = None
 
     def __post_init__(self) -> None:
         if self.kind is ItemKind.PATH and not self.path:
             raise ValueError("PATH item requires a path")
         if self.kind is ItemKind.COMMAND and not self.command:
             raise ValueError("COMMAND item requires a command")
+        if self.kind is ItemKind.REGISTRY:
+            reg = self.reg
+            if reg is None:
+                raise ValueError("REGISTRY item requires reg")
+            if reg.hive not in ("HKCU", "HKLM"):
+                raise ValueError("REGISTRY item hive must be HKCU or HKLM")
+            if not reg.key or not reg.fingerprint:
+                raise ValueError("REGISTRY item requires a key and a fingerprint")
+            if self.path is not None or self.command is not None:
+                raise ValueError("REGISTRY item must not set path or command")
+        elif self.reg is not None:
+            raise ValueError("reg is only valid on REGISTRY items")
 
 
 def item_key(item: CleanableItem) -> str:
     """A stable, unique key for an item (used by UIs to track selection)."""
     if item.kind is ItemKind.COMMAND:
         return f"{item.cleaner_id}|cmd|" + "\x1f".join(item.command or [])
+    if item.kind is ItemKind.REGISTRY and item.reg is not None:
+        r = item.reg
+        return f"{item.cleaner_id}|reg|" + json.dumps(
+            [r.hive, r.key, r.value, r.fingerprint], ensure_ascii=True
+        )
     return f"{item.cleaner_id}|path|{item.path}"
+
+
+def item_target(item: CleanableItem) -> str:
+    """What the item acts on as text: a path, a command line or a registry path."""
+    if item.reg is not None:
+        return item.reg.display
+    if item.path:
+        return item.path
+    return " ".join(item.command or [])
 
 
 @dataclass

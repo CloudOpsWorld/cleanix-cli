@@ -36,6 +36,33 @@ def fake_win(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_registry():
+    """Tests never touch the real registry: any call to the default backend
+    is recorded and raises, and a recorded call fails the test at teardown
+    (a cleaner's scan would otherwise swallow the error)."""
+    from _fakereg import ForbiddenBackend
+    from cleanix.core import winregistry
+
+    forbidden = ForbiddenBackend()
+    winregistry.set_backend(forbidden)
+    yield forbidden
+    winregistry.set_backend(None)
+    if forbidden.calls:
+        pytest.fail(f"test touched the real registry: {forbidden.calls[:3]}")
+
+
+@pytest.fixture
+def fake_registry():
+    """An in-memory registry installed as the backend for the test."""
+    from _fakereg import FakeRegistry
+    from cleanix.core import winregistry
+
+    reg = FakeRegistry()
+    winregistry.set_backend(reg)
+    return reg
+
+
+@pytest.fixture(autouse=True)
 def _fresh_windows_profiles_cache():
     """The guard caches the users-directory listing for a few seconds;
     tests that create or remove profile dirs must always see a fresh one."""

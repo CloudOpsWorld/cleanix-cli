@@ -149,7 +149,17 @@ class Engine:
 
         if item.kind is ItemKind.PATH:
             return self._clean_path(item, dry_run=dry_run, quarantine=quarantine)
-        return self._clean_command(item, dry_run=dry_run)
+        if item.kind is ItemKind.COMMAND:
+            return self._clean_command(item, dry_run=dry_run)
+        if item.kind is ItemKind.REGISTRY:
+            # Fail closed until the backup-first registry path exists.
+            return CleanOutcome(
+                item=item, removed=False, dry_run=dry_run,
+                error="registry cleaning is not available",
+            )
+        return CleanOutcome(
+            item=item, removed=False, dry_run=dry_run, error="unknown item kind"
+        )
 
     def _clean_path(
         self, item: CleanableItem, *, dry_run: bool, quarantine=None
