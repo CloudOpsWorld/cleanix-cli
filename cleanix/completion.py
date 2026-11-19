@@ -16,7 +16,7 @@ SUBCOMMANDS = [
 SCAN_CLEAN_OPTS = [
     "--only", "--exclude", "--json", "--output", "--quiet", "--summary",
     "--sort", "--top", "--all-users", "--current-user", "--min-uid",
-    "--execute", "--yes", "--quarantine",
+    "--execute", "--yes", "--quarantine", "--registry",
 ]
 
 
@@ -58,6 +58,8 @@ _cleanix() {{
             fi;;
         quarantine)
             COMPREPLY=( $(compgen -W "list empty" -- "$cur") );;
+        restore)
+            COMPREPLY=( $(compgen -W "--yes" -- "$cur") );;
         schedule)
             COMPREPLY=( $(compgen -W "install uninstall status --frequency" -- "$cur") );;
         factory-reset)
@@ -93,6 +95,7 @@ _cleanix() {{
             if (( CURRENT == 3 )); then _values 'action' list get set unset path
             else _values 'key' $cfgkeys; fi;;
         quarantine) _values 'action' list empty;;
+        restore) _values 'option' --yes;;
         schedule) _values 'action' install uninstall status;;
         completion) _values 'shell' bash zsh fish;;
     esac

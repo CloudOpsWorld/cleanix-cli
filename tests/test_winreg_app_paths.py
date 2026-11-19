@@ -265,18 +265,6 @@ def test_owner_mismatch_makes_per_user_vars_unknown(fake_registry, monkeypatch):
     assert _scan(monkeypatch, other) == []
 
 
-def test_owner_wiring_not_the_hive_owner(fake_registry, monkeypatch):
-    import cleanix.cleaners.winreg_app_paths as mod
-
-    fake_registry.add_key(
-        "HKCU", AP + r"\foo.exe", {"": (REG_EXPAND_SZ, r"%LOCALAPPDATA%\Gone\foo.exe")}
-    )
-    monkeypatch.setattr(mod, "_scan_is_for_hive_owner", lambda: True)
-    assert len(_scan(monkeypatch, _fs_ctx())) == 1
-    monkeypatch.setattr(mod, "_scan_is_for_hive_owner", lambda: False)
-    assert _scan(monkeypatch, _fs_ctx()) == []
-
-
 def test_win_reg_app_paths_never_touches_unlisted_containers(fake_registry, monkeypatch):
     fake_registry.add_key("HKCU", AP + r"\foo.exe", {"": (REG_SZ, r"C:\Gone\foo.exe")})
     fake_registry.add_key("HKLM", AP + r"\bar.exe", {"": (REG_SZ, r"C:\Gone\bar.exe")})

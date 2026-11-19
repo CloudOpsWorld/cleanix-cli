@@ -40,8 +40,8 @@ class DetectorContext:
     system_root: str
     # False when the entries belong to someone other than the process owner
     # (helper, another user's hive): per-user variables are then UNKNOWN.
-    # NOTE: default_context() never sets this to False; detector code must
-    # pass owner_matches=False whenever the helper or another user is scanning.
+    # The single policy is scan_owner_matches(); RegistryDetector.context()
+    # applies it, so detectors never decide this themselves.
     owner_matches: bool = True
 
 
@@ -484,7 +484,36 @@ def _profiles_root(env: Mapping[str, str], system_drive: str) -> str:
     return profiles
 
 
-def default_context() -> DetectorContext:
+def scan_owner_matches() -> bool:
+    """Whether HKCU and the process environment belong to the user being scanned.
+
+    The one policy for every registry detector, evaluated at scan time. False
+    (per-user variables UNKNOWN, HKCU containers not judged) when:
+
+    * helper mode is active (the elevated helper never trusts HKCU/env);
+    * the scan is bound to a user other than the process's own (invoking) user;
+    * the process is elevated. winenv exposes no way to tell a same-account UAC
+      elevation from elevation under another administrator account, so an
+      elevated process is treated as a mismatch (conservative, as the
+      detectors did before);
+    * anything cannot be determined (fail closed).
+
+    True only for a normal, non-elevated user scanning their own HKCU.
+    """
+    from cleanix.core import context, scanmode
+
+    try:
+        if scanmode.is_helper_mode():
+            return False
+        if context.is_effective_root():
+            return False
+        user = context.current_user()
+        return bool(user.is_invoker) and user == context.invoking_user()
+    except Exception:
+        return False
+
+
+def default_context(owner_matches: bool = True) -> DetectorContext:
     if sys.platform != "win32":
         raise RegistryUnavailable("target evidence needs Windows")
     from cleanix.core import winenv
@@ -510,4 +539,5 @@ def default_context() -> DetectorContext:
         prober=prober,
         profiles_root=_profiles_root(env, sd),
         system_root=system_root,
+        owner_matches=owner_matches,
     )

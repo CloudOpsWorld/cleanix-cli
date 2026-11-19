@@ -68,13 +68,15 @@ def fake_registry():
 
 
 @pytest.fixture(autouse=True)
-def _no_process_helper_mode(monkeypatch):
+def _no_process_helper_mode():
     """``cleanix.elevated.main`` switches helper scan mode on for the whole
-    process (it never goes off again); tests that call ``main`` in-process
-    must not leak it into every later scan."""
+    process (it never goes off again in production); tests that call
+    ``main`` in-process must not leak it into later tests."""
     from cleanix.core import scanmode
 
-    monkeypatch.setattr(scanmode, "enable_process_helper_mode", lambda: None)
+    scanmode._reset_for_tests()
+    yield
+    scanmode._reset_for_tests()
 
 
 @pytest.fixture(autouse=True)

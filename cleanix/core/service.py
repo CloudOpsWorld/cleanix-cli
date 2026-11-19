@@ -156,8 +156,12 @@ def clean(
     manifest: Optional[str] = None
     run_id: Optional[str] = None
     if not dry_run and record_history and result.outcomes:
-        history.record(result.freed, result.removed_count,
-                       mode="quarantine" if quarantine else "delete")
+        history.record(
+            result.freed, result.removed_count,
+            mode="quarantine" if quarantine else "delete",
+            registry=sum(1 for o in result.outcomes
+                         if o.removed and o.item.kind is ItemKind.REGISTRY),
+        )
         manifest = history.write_manifest(result) or None
     undo_error: Optional[str] = None
     if run is not None and run.items:

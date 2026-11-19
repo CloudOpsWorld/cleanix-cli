@@ -6,6 +6,7 @@ root checks are enforced in one auditable place.
 
 from __future__ import annotations
 
+import contextvars
 import os
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
@@ -77,7 +78,10 @@ class Engine:
                     if cancel is not None and cancel():
                         next_idx = n
                         break
-                    pending[pool.submit(run, next_idx)] = next_idx
+                    # Each worker runs in a copy of the caller's context so
+                    # contextvars (scanmode helper flag, use_user) propagate.
+                    cvctx = contextvars.copy_context()
+                    pending[pool.submit(cvctx.run, run, next_idx)] = next_idx
                     next_idx += 1
                 if not pending:
                     break

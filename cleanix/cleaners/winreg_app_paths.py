@@ -11,7 +11,6 @@ Alias location, or any read error leaves the entry alone.
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 from typing import Iterable
 
@@ -34,22 +33,6 @@ _log = logging.getLogger(__name__)
 _INDIRECT_VALUES = frozenset({"delegateexecute"})
 
 
-def _scan_is_for_hive_owner() -> bool:
-    """True when HKCU (and the environment used to expand variables) belong to
-    the user being scanned. An elevated process may run as another account
-    than the invoking user, and ``--all-users`` scans bind another user, so
-    per-user variables are not trusted in those cases."""
-    try:
-        from cleanix.core import context
-
-        if context.is_effective_root():
-            return False
-        user = context.current_user()
-        return bool(user.is_invoker) and user == context.invoking_user()
-    except Exception:
-        return False
-
-
 class WinRegAppPaths(RegistryDetector):
     id = "win_reg_app_paths"
     name = "Registry: dead App Paths"
@@ -63,8 +46,6 @@ class WinRegAppPaths(RegistryDetector):
         except RegistryError:
             return
         machine = container.hive == "HKLM"
-        if not machine and ctx.owner_matches and not _scan_is_for_hive_owner():
-            ctx = dataclasses.replace(ctx, owner_matches=False)
         for name in names:
             if not name.casefold().endswith(".exe"):
                 continue
