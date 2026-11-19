@@ -20,7 +20,21 @@ jobs:
         # installs the base package only (no PySide6): the GUI tests skip
         # here and run in the gui-test job below.
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        exclude:
+          # No Python 3.8 build for the arm64 macOS runners, and none for 3.8/3.9
+          # on ubuntu-latest (Ubuntu 26.04): those run on ubuntu-22.04 below.
+          - os: macos-latest
+            python-version: "3.8"
+          - os: ubuntu-latest
+            python-version: "3.8"
+          - os: ubuntu-latest
+            python-version: "3.9"
+        include:
+          - os: ubuntu-22.04
+            python-version: "3.8"
+          - os: ubuntu-22.04
+            python-version: "3.9"
 
     steps:
       - name: Checkout code
