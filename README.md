@@ -649,11 +649,12 @@ another user's per-user install).
 - `win_reg_shared_dlls`: `SharedDLLs` counters for files that no longer exist.
 
 They never claim to speed up Windows or free space (registry items have size 0
-and are never counted in "freed"), never delete a live entry, never touch
-`HKEY_CLASSES_ROOT`, `HKEY_USERS`, `HKEY_CURRENT_CONFIG`, Windows Installer,
-policy or Explorer keys, and open only the 64-bit registry view
-(`KEY_WOW64_64KEY`; the 32-bit view is reached only through explicit
-`WOW6432Node` paths, also from a 32-bit Python). The findings are always
+and are never counted in "freed"), never delete a live entry, never open
+the merged `HKEY_CLASSES_ROOT` view (file-type handlers are read and removed
+under the two real `Software\Classes` keys), `HKEY_USERS`,
+`HKEY_CURRENT_CONFIG`, Windows Installer, policy or Explorer keys, and open only
+the 64-bit registry view (`KEY_WOW64_64KEY`; the 32-bit view is reached only
+through explicit `WOW6432Node` paths, also from a 32-bit Python). The findings are always
 labelled **Review** in the GUI. `--all-users` does not load other users'
 hives: `HKCU` is the registry of the account running Cleanix (in an elevated
 terminal that is the administrator's, which is why elevated scans do not judge
@@ -674,7 +675,9 @@ are not backed up: a restored key inherits its parent's permissions.
 **Undo status (gated).** The backup code is shipped and unit-tested against an
 in-memory registry, but several Windows behaviours it relies on can only be
 confirmed on a real machine (registry link handling, `REG_MULTI_SZ` with empty
-strings, the 64-bit view, `reg export`/`reg import` agreement). Until the manual
+strings, `reg export`/`reg import` agreement). The 64-bit-view behaviour for
+`HKLM\SOFTWARE` cannot be exercised safely and is covered only by unit tests
+that pin the `KEY_WOW64_64KEY` flag. Until the manual
 verification in
 [docs/registry-cleanup-verification.md](docs/registry-cleanup-verification.md)
 has passed, the switch `UNDO_SHIPPED` in `cleanix/core/regpromises.py` stays

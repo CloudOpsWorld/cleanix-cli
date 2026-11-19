@@ -13,6 +13,7 @@ import pytest
 
 from cleanix import cli, completion
 from cleanix.core import catalog, history, quarantine, regpromises, regsnap, winenv
+from cleanix.core import engine as engine_mod
 from cleanix.core import platform as plat
 from cleanix.core.models import (
     CleanableItem,
@@ -38,6 +39,8 @@ def env(tmp_path, monkeypatch, fake_win, fake_registry):
     monkeypatch.setattr(history, "state_dir", lambda: tmp_path / "state")
     monkeypatch.setattr(quarantine, "quarantine_root", lambda: tmp_path / "q")
     monkeypatch.setattr(winenv, "is_admin", lambda: False)
+    # On Windows is_root() is winenv.is_admin(); keep that on every OS.
+    monkeypatch.setattr(engine_mod, "is_root", lambda: winenv.is_admin())
     monkeypatch.setattr(regpromises, "UNDO_SHIPPED", False)
     monkeypatch.setenv("COLUMNS", "400")
     return fake_registry
