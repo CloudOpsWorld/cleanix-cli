@@ -3,7 +3,12 @@
 Only administrator-owned directories are scanned (vendor directories are never
 reported). Anything that cannot be judged with certainty is left alone:
 unresolvable or templated ExecStart values, removable/network locations,
-generator output, masked units.
+generator output, masked units, units whose drop-ins touch ExecStart or
+Condition*/Assert*.
+
+Known limitation: only the directories listed below are scanned. Unit
+directories such as ``/etc/xdg/systemd/user`` are used for existence lookups
+only, never reported.
 """
 
 from __future__ import annotations
@@ -40,8 +45,16 @@ _USER_LOOKUP_SYSTEM_PART = (
     "/usr/local/lib/systemd/user",
     "/usr/lib/systemd/user",
     "/lib/systemd/user",
+    "/etc/xdg/systemd/user",
+    "/run/systemd/user",
+    "/usr/share/systemd/user",
+    "/var/lib/flatpak/exports/share/systemd/user",
 )
-_USER_LOOKUP_HOME = (".config/systemd/user", ".local/share/systemd/user")
+_USER_LOOKUP_HOME = (
+    ".config/systemd/user",
+    ".local/share/systemd/user",
+    ".local/share/flatpak/exports/share/systemd/user",
+)
 _BIN_DIRS = (
     "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin",
 )
@@ -104,7 +117,7 @@ class StaleSystemdUnitReporter(OrphanReporter):
             if stat.S_ISLNK(mode):
                 yield from self._check_link(entry, user)
             elif stat.S_ISREG(mode) and name.endswith(".service"):
-                yield from self._check_unit(entry, user)
+                yield from self._check_unit(entry, lookup, user)
             elif stat.S_ISDIR(mode):
                 if name.endswith(_LINK_SUBDIRS):
                     yield from self._scan_links_dir(entry, user)
@@ -168,7 +181,7 @@ class StaleSystemdUnitReporter(OrphanReporter):
         )
 
     # ------------------------------------------------------ (a) unit file
-    def _check_unit(self, path: Path, user: bool) -> Iterator[Finding]:
+    def _check_unit(self, path: Path, lookup: list, user: bool) -> Iterator[Finding]:
         try:
             with open(path, "rb") as fh:
                 text = fh.read(_MAX_UNIT_BYTES).decode("utf-8", errors="replace")
@@ -177,6 +190,8 @@ class StaleSystemdUnitReporter(OrphanReporter):
         execs, conds = _parse_unit(text)
         if not execs:
             return
+        if _dropins_override(path.name, lookup):
+            return  # drop-ins may repoint ExecStart or add conditions
         binaries = []
         for value in execs:
             value = value.lstrip(_STRIP)
@@ -195,7 +210,7 @@ class StaleSystemdUnitReporter(OrphanReporter):
             found = self._binary_present(binary)
             if found is None or found:
                 return
-            if raw.startswith("-"):
+            if "-" in raw[: len(raw) - len(raw.lstrip(_STRIP))]:
                 return  # missing binary is explicitly tolerated by the unit
             if any(binary in c for c in conds):
                 return
@@ -262,6 +277,38 @@ def _unit_known(unit: str, lookup: list) -> bool:
             continue
         except OSError:
             return True  # unreadable: unknown, so treat as present
+    return False
+
+
+def _dropin_dir_names(unit: str) -> list:
+    stem, _, typ = unit.rpartition(".")
+    names = [f"{unit}.d", f"{typ}.d"]
+    parts = stem.split("-")
+    for i in range(1, len(parts)):
+        names.append("-".join(parts[:i]) + f"-.{typ}.d")
+    if "@" in stem:
+        names.append(f"{stem.split('@', 1)[0]}@.{typ}.d")
+    return names
+
+
+def _dropins_override(unit: str, lookup: list) -> bool:
+    """True if any relevant drop-in mentions ExecStart/Condition/Assert, or
+    cannot be read (unknown)."""
+    for d in lookup:
+        for name in _dropin_dir_names(unit):
+            files = oc.list_dir(Path(d) / name)
+            if files is None:
+                return True
+            for f in files:
+                if not f.name.endswith(".conf"):
+                    continue
+                try:
+                    with open(f, "rb") as fh:
+                        text = fh.read(_MAX_UNIT_BYTES).decode("utf-8", "replace")
+                except OSError:
+                    return True
+                if any(k in text for k in ("ExecStart", "Condition", "Assert")):
+                    return True
     return False
 
 

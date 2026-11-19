@@ -228,6 +228,66 @@ def test_unreadable_dir_yields_note(orphan_env, monkeypatch):
     assert f.note and f.hint
 
 
+def test_dropin_execstart_override_skips_unit(orphan_env):
+    e = orphan_env
+    put(e, "/usr/bin/real", "")
+    put(e, f"{ETC}/foo.service", svc("/opt/gone/y"))
+    put(e, f"{ETC}/foo.service.d/override.conf",
+        "[Service]\nExecStart=\nExecStart=/usr/bin/real\n")
+    assert descs(sysf(e)) == []
+
+
+@pytest.mark.parametrize("where", [
+    "/run/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system",
+])
+def test_dropin_in_other_lookup_dirs_skips_unit(orphan_env, where):
+    e = orphan_env
+    put(e, f"{ETC}/foo.service", svc("/opt/gone/y"))
+    put(e, f"{where}/foo.service.d/o.conf", "[Service]\nExecStart=/usr/bin/z\n")
+    assert descs(sysf(e)) == []
+
+
+def test_dropin_condition_skips_unit(orphan_env):
+    e = orphan_env
+    put(e, f"{ETC}/foo.service", svc("/opt/gone/y"))
+    put(e, f"{ETC}/foo.service.d/o.conf",
+        "[Unit]\nConditionPathExists=/opt/gone/y\n")
+    assert descs(sysf(e)) == []
+
+
+def test_prefix_dropin_skips_unit(orphan_env):
+    e = orphan_env
+    put(e, f"{ETC}/foo-bar.service", svc("/opt/gone/y"))
+    put(e, f"{ETC}/foo-.service.d/o.conf", "[Service]\nExecStart=/usr/bin/z\n")
+    assert descs(sysf(e)) == []
+
+
+def test_dropin_without_execstart_still_reported(orphan_env):
+    e = orphan_env
+    put(e, f"{ETC}/foo.service", svc("/opt/gone/y"))
+    put(e, f"{ETC}/foo.service.d/o.conf", "[Service]\nNice=5\n")
+    assert len(sysf(e)) == 1
+
+
+@pytest.mark.parametrize("prefix", ["+-", ":-", "@-", "!-", "-", "-+", "-@"])
+def test_every_dash_prefix_combination_tolerated(orphan_env, prefix):
+    put(orphan_env, f"{ETC}/foo.service", svc(f"{prefix}/opt/gone/x"))
+    assert descs(sysf(orphan_env)) == []
+
+
+@pytest.mark.parametrize("prefix", ["+", "@", ":", "!"])
+def test_non_dash_prefix_still_reported(orphan_env, prefix):
+    put(orphan_env, f"{ETC}/foo.service", svc(f"{prefix}/opt/gone/x"))
+    assert len(sysf(orphan_env)) == 1
+
+
+def test_user_dropin_in_xdg_dir_not_orphan(orphan_env):
+    e = orphan_env
+    put(e, "/.config/systemd/user/a.service.d/o.conf", "", home=True)
+    put(e, "/usr/share/systemd/user/a.service", svc("/usr/bin/x"))
+    assert descs(list(reporter().user_findings())) == []
+
+
 def test_control_char_names_skipped(orphan_env):
     try:
         put(orphan_env, f"{ETC}/a\nb.service", svc("/opt/gone/x"))
