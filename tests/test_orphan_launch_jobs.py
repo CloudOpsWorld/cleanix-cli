@@ -219,7 +219,12 @@ def test_plist_symlink_with_target_read_normally(orphan_env, tmp_path):
     )
     d = _user_dir(orphan_env)
     d.mkdir(parents=True)
-    (d / "t.plist").symlink_to(real)
+    # Relative target: link_target_exists remaps absolute targets into the
+    # fake sysroot, while the real open() follows the OS link; only a
+    # relative link resolves identically in both.
+    import os
+
+    (d / "t.plist").symlink_to(os.path.relpath(real, d))
     (d / "null.plist").symlink_to("/dev/null")
     items = _scan(orphan_env)
     assert len(_jobs(items)) == 1

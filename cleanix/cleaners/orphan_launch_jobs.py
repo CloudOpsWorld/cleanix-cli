@@ -8,7 +8,9 @@ one plist and how to confirm it before moving it to the Trash.
 Unknown is not orphan: unparsable plists become notes, and programs that are
 relative, templated, on removable/network volumes, in SIP-protected system
 locations, inside an app bundle that still exists, or whose existence cannot
-be determined are never reported.
+be determined are never reported. Wrapper programs (/bin/sh -c, /usr/bin/env,
+an interpreter plus a script) are intentionally "unknown": the wrapper itself
+is a SIP path and the script argument is not judged.
 """
 
 from __future__ import annotations
