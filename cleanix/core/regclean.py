@@ -62,6 +62,9 @@ backend between its own handle check and ``DeleteKeyEx``.
 
 from __future__ import annotations
 
+import os
+import re
+import stat
 from typing import List, Optional, Protocol, Tuple
 
 from cleanix.core import regsafety, regsnap, winenv
@@ -115,48 +118,119 @@ class RegistryBackupSink(Protocol):
 
 BACKUP_REQUIRED = "backup is required for this entry"
 MAX_BACKUP_FILES = 10_000
+_RUN_ID = re.compile(r"\A[0-9A-Za-z][0-9A-Za-z._-]{0,127}\Z")
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 class VerifyOnlySink:
     """Sink for the elevated helper: the GUI already wrote the backup as the
     user into a quarantine run (ruling R6), and the helper writes nothing.
 
-    It is not a blind pass: ``before_delete`` vetoes (raises
-    ``regbackup.BackupError``) unless
+    It is bound to ONE quarantine run of the invoking account, named by its
+    run id (``VerifyOnlySink("20261119-...")``); a path is accepted only when
+    it is exactly a run directory directly under ``quarantine_root()``.
+    ``before_delete`` vetoes (raises ``regbackup.BackupError``) unless
 
     * the item is an HKLM entry (HKCU entries are never cleaned by the
-      helper, and never without a backup the user can restore), and
-    * ``backup_dir`` (the run directory, or its ``registry`` subdirectory)
-      holds a backup JSON that passes the full restore validation and is
-      for exactly this cleaner, hive, key, value and fingerprint.
+      helper, and never without a backup the user can restore);
+    * the run id is a plain name (no separators, traversal, drive or NUL)
+      and the run directory is a real directory (not a link or junction)
+      directly under the quarantine root;
+    * the run's manifest has a registry entry for exactly this cleaner,
+      hive, key and value that Undo would restore (``deleted`` is not
+      False), and
+    * that entry's backup JSON (read from the run's own ``registry``
+      directory) passes the full restore validation and is for exactly
+      this cleaner, target and fingerprint.
+
+    So whatever the helper deletes is restorable by ``cleanix restore
+    <run>``; a loose or orphaned backup file never counts.
     """
 
-    def __init__(self, backup_dir) -> None:
+    def __init__(self, run, root=None) -> None:
+        self._run = run
+        self._root = root
+        self.run_id: Optional[str] = None
+        if isinstance(run, str) and _RUN_ID.match(run):
+            self.run_id = run
+        elif isinstance(run, os.PathLike):
+            name = os.fspath(run)
+            base = os.path.basename(os.path.normpath(name)) if name else ""
+            self.run_id = base if _RUN_ID.match(base or "-") else None
+
+    def _root_dir(self) -> str:
+        from cleanix.core import quarantine
+
+        return os.fspath(self._root if self._root is not None else quarantine.quarantine_root())
+
+    def _run_dir(self):
+        """The validated run directory, or raise ``BackupError``."""
         from pathlib import Path
 
-        self.backup_dir = Path(backup_dir) if backup_dir is not None else None
+        from cleanix.core import regbackup
 
-    def _directory(self):
-        assert self.backup_dir is not None
-        sub = self.backup_dir / "registry"
-        return sub if sub.is_dir() else self.backup_dir
+        def refuse(why: str):
+            return regbackup.BackupError(f"{BACKUP_REQUIRED}: {why}")
+
+        if self._run is None:
+            raise refuse("no backup run was given")
+        if self.run_id is None or self.run_id in (".", ".."):
+            raise refuse("not a valid quarantine run id")
+        root = self._root_dir()
+        real_root = os.path.realpath(root)
+        if isinstance(self._run, os.PathLike):
+            # A path must resolve to a run directly under the root.
+            if os.path.dirname(os.path.realpath(os.fspath(self._run))) != real_root:
+                raise refuse("the backup is not a run of this account's quarantine")
+        run_dir = os.path.join(root, self.run_id)
+        try:
+            st = os.lstat(run_dir)
+        except OSError as exc:
+            raise refuse(f"no quarantine run '{self.run_id}'") from exc
+        if (
+            stat.S_ISLNK(st.st_mode)
+            or not stat.S_ISDIR(st.st_mode)
+            or getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise refuse("the quarantine run is a link or not a directory")
+        if os.path.dirname(os.path.realpath(run_dir)) != real_root:
+            raise refuse("the backup is not a run of this account's quarantine")
+        return Path(run_dir)
+
+    @property
+    def backup_dir(self):
+        try:
+            return self._run_dir()
+        except Exception:  # noqa: BLE001
+            return None
 
     def before_delete(self, item: CleanableItem, backend) -> None:
-        from cleanix.core import regbackup
+        from cleanix.core import quarantine, regbackup
 
         reg = item.reg
         if reg is None or reg.hive != "HKLM":
             raise regbackup.BackupError(BACKUP_REQUIRED)
-        if self.backup_dir is None:
-            raise regbackup.BackupError(f"{BACKUP_REQUIRED}: no backup location was given")
-        directory = self._directory()
-        try:
-            candidates = sorted(directory.glob("*__registry.json"))[:MAX_BACKUP_FILES]
-        except OSError as exc:
-            raise regbackup.BackupError(f"{BACKUP_REQUIRED}: {exc}") from exc
-        for path in candidates:
+        run_dir = self._run_dir()
+        data = quarantine._read_manifest(run_dir)
+        if not data:
+            raise regbackup.BackupError(
+                f"{BACKUP_REQUIRED}: quarantine run '{self.run_id}' has no readable manifest"
+            )
+        for entry in quarantine._items_of(data)[:MAX_BACKUP_FILES]:
+            if not (
+                isinstance(entry, dict)
+                and entry.get("type") == "registry"
+                and entry.get("deleted") is not False
+                and entry.get("cleaner_id") == item.cleaner_id
+                and entry.get("hive") == reg.hive
+                and entry.get("key") == reg.key
+                and entry.get("value") == reg.value
+            ):
+                continue
             try:
-                cid, target, snap = regbackup.load_verified(path)
+                cid, target, snap = regbackup.load_verified(
+                    quarantine._backup_json(run_dir, entry)
+                )
             except regbackup.RestoreError:
                 continue
             if (
@@ -166,7 +240,8 @@ class VerifyOnlySink:
             ):
                 return None
         raise regbackup.BackupError(
-            f"{BACKUP_REQUIRED}: no verified backup of it was found in {directory}"
+            f"{BACKUP_REQUIRED}: quarantine run '{self.run_id}' holds no restorable, "
+            "verified backup of it"
         )
 
     def after_delete(self, item: CleanableItem, deleted: bool) -> None:
@@ -329,10 +404,10 @@ def delete_target(
             raise  # RegistryChanged before the first write: nothing deleted
         if _intact(backend, target):
             raise NotRemoved(
-                f"not removed: {exc or type(exc).__name__}; nothing was deleted"
+                f"not removed: {str(exc) or type(exc).__name__}; nothing was deleted"
             ) from exc
         raise PartialDelete(
-            f"partially deleted: {exc or type(exc).__name__}; scan again"
+            f"partially deleted: {str(exc) or type(exc).__name__}; scan again"
         ) from exc
 
     # 5. verify it is gone
@@ -341,7 +416,7 @@ def delete_target(
     except Exception as exc:  # noqa: BLE001
         raise PartialDelete(
             f"partially deleted or state unknown: could not verify the removal "
-            f"({exc or type(exc).__name__}); scan again"
+            f"({str(exc) or type(exc).__name__}); scan again"
         ) from exc
     if present:
         raise PartialDelete(

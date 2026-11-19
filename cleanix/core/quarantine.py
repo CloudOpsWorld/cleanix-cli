@@ -301,6 +301,7 @@ class Quarantine:
                 return
             except Exception as exc:  # noqa: BLE001
                 last = exc
+                time.sleep(0.05)  # a short back-off before the second attempt
         self.items[idx]["deleted"] = previous
         assert last is not None
         raise last
@@ -430,8 +431,18 @@ def _size_of(item: Dict) -> int:
 
 
 def latest_run() -> Optional[str]:
+    """The most recently created run (by the manifest's ``created`` time,
+    then the id), never by the lexical order of pid digits."""
     runs = list_runs()
-    return runs[-1]["run_id"] if runs else None
+    if not runs:
+        return None
+
+    def key(r: Dict):
+        c = r.get("created", 0)
+        ok = isinstance(c, (int, float)) and not isinstance(c, bool)
+        return (c if ok else 0, str(r.get("run_id", "")))
+
+    return max(runs, key=key)["run_id"]
 
 
 def restore(run_id: str, *, allow_machine_restore: bool = False) -> Dict:
@@ -449,6 +460,7 @@ def restore(run_id: str, *, allow_machine_restore: bool = False) -> Dict:
         raise FileNotFoundError(f"no quarantine run '{run_id}'")
 
     restored, failed = [], []
+    skipped = 0
     for item in _items_of(data):
         if not isinstance(item, dict):
             failed.append(("?", "invalid manifest entry"))
@@ -456,7 +468,8 @@ def restore(run_id: str, *, allow_machine_restore: bool = False) -> Dict:
         kind = item.get("type")
         if kind == "registry":
             if item.get("deleted") is False:
-                continue  # never deleted: nothing to restore
+                skipped += 1  # never deleted: nothing to restore, keep its backup
+                continue
             ok, text = _restore_registry(run_dir, run_id, item, allow_machine_restore)
             if ok:
                 restored.append(text)
@@ -481,8 +494,9 @@ def restore(run_id: str, *, allow_machine_restore: bool = False) -> Dict:
         except OSError as exc:
             failed.append((item["original"], str(exc)))
 
-    # If everything came back, drop the (now empty) run.
-    if not failed:
+    # Drop the run only when it is fully consumed: something came back,
+    # nothing failed, and no entry with a kept backup was skipped.
+    if restored and not failed and not skipped:
         shutil.rmtree(run_dir, ignore_errors=True)
     return {"restored": restored, "failed": failed}
 
@@ -513,34 +527,58 @@ def _restore_registry(
             require_owner=True,
         )
     except regbackup.RestoreRefused as exc:
+        if winenv.is_admin() and not allow_machine_restore:
+            return False, (
+                "not restored: machine-wide (HKLM) entries need explicit "
+                "confirmation; review exactly what will be written and confirm "
+                f"the restore of run {run_id}"
+            )
         return False, exc.message_for(run_id)
     except Exception as exc:  # noqa: BLE001 - one entry never aborts the rest
         return False, str(exc) or type(exc).__name__
     return True, shown
 
 
+MACHINE_WARNING = (
+    "These values will be WRITTEN machine-wide. The backup files may have been "
+    "written by any program running as your user."
+)
+USER_WARNING = (
+    "These values will be WRITTEN for your account. The backup files may have "
+    "been written by any program running as your user."
+)
+
+
 def describe_registry_entries(run_id: str) -> List[str]:
     """Human-readable lines naming exactly what restoring ``run_id`` would
-    write to the registry: for each entry to restore, its target and every
-    key (``HIVE\\key``) and value (``HIVE\\key [name]``) in its validated
-    backup. An entry whose backup does not validate is listed as such (and
-    restore would refuse it). Callers show this before passing
-    ``allow_machine_restore=True`` to :func:`restore`."""
+    write to the registry: a warning line first, then for each entry restore
+    would touch every key and every value with its type and data (names and
+    data escaped, long data truncated; see ``regbackup.describe_backup``),
+    read from the validated backup, never from the manifest. An entry whose
+    backup does not validate is listed as such (restore would refuse it).
+    Callers show this before passing ``allow_machine_restore=True`` to
+    :func:`restore`."""
     from cleanix.core import regbackup
+
+    from cleanix.core.models import _visible
 
     data = _read_manifest(quarantine_root() / run_id)
     if not data:
         raise FileNotFoundError(f"no quarantine run '{run_id}'")
     lines: List[str] = []
+    machine = False
     for item in _items_of(data):
         if not isinstance(item, dict) or item.get("type") != "registry":
             continue
         if item.get("deleted") is False:
-            continue
+            continue  # restore never touches it
+        machine = machine or item.get("hive") == "HKLM"
         try:
             lines.extend(regbackup.describe_backup(_backup_json(quarantine_root() / run_id, item)))
         except regbackup.RestoreError as exc:
-            lines.append(f"{item.get('original', '?')}: {exc}")
+            lines.append(f"{_visible(str(item.get('original', '?')))}: {_visible(str(exc))}")
+    if lines:
+        lines.insert(0, MACHINE_WARNING if machine else USER_WARNING)
     return lines
 
 
