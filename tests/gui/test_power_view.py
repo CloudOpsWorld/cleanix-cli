@@ -872,3 +872,15 @@ def test_zero_size_report_only_finding_visible_but_never_selected(qtbot, sync_wo
     assert v.tree.group_count() == 1  # the plain zero-size group stays hidden
     v.select_all_visible()
     assert v.item_model.checked_items() == []
+
+
+def test_status_line_does_not_count_report_only_size_as_freeable(view):
+    only = ScanResult(reports=[CleanerReport("big_files", "Big", "Big", items=[
+        CleanableItem("big_files", "huge.iso", size=2000 * MB, path="/x/huge.iso",
+                      report_only=True, hint="Delete it manually")])])
+    view._on_scan_finished(only)
+    assert view.status_label.text() == "1 findings to review (nothing to free)"
+    view._on_scan_finished(_result())
+    freeable = 900 * 1024 + 10 * MB + 1 + 5 * MB
+    assert view.status_label.text() == (
+        f"Found 5 items, {pv.human_size(freeable)} to free")

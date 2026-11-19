@@ -154,7 +154,7 @@ Seven detectors look for things that were left behind when a program was
 removed. They only **report**: nothing is deleted, nothing is preselected, and
 there is no way to clean them from Cleanix. Each finding names the exact path;
 system-level findings also include a command that confirms ownership
-(`dpkg-query -S`, `rpm -qf`, `pacman -Qo`, `pkgutil`) where a package backend
+(`dpkg -S`, `rpm -qf`, `pacman -Qo`) where a package backend
 exists, while user-level ones may not, so you decide. They appear under "Needs your review"
 and in `cleanix scan`. They work without root; anything they cannot read is
 listed as a "Not checked" note instead of being guessed, and a command that
@@ -162,7 +162,7 @@ fails or prints something unexpected never counts as "orphaned".
 
 | id | OS | Reports |
 |---|---|---|
-| `orphan_files` (opt-in, slow) | Linux | Folders in `/opt`, `/usr/local`, `/var/lib` and `/var/cache` that no installed package owns |
+| `orphan_files` (opt-in) | Linux | Folders in `/opt`, `/usr/local`, `/var/lib` and `/var/cache` that no installed package owns |
 | `stale_services` | Linux | systemd units, drop-ins and enable links in administrator-owned unit folders whose program or unit file is gone |
 | `stale_launchers` | Linux | `.desktop` menu and autostart entries whose program is missing |
 | `stale_alternatives` | Linux | Broken links in `/etc/alternatives` |
@@ -182,6 +182,15 @@ Known limits, read these before acting on a finding:
   (`com.vendor.App`); folders named after the app ("Slack") are never reported.
 - The macOS detectors have only been tested against fake data, not on a real
   Mac. Treat their findings with extra care.
+- `orphan_files` skips folders that look like live service data (k3s,
+  kubelet, container runtimes and similar) and anything changed within
+  `orphan_min_age_days`, but a program that creates its own folders at runtime
+  can still be reported; every finding says so. Check what uses a path first.
+- The two macOS leftover reports that run `mdfind`/`pkgutil` (`orphan_app_data`
+  and `stale_receipts`) only run in a Deep scan in Simple mode.
+- Notes ("Not checked", "Scan stopped early") are listed like findings: they
+  show up in the item counts and in `--json` output with size 0. A distinct
+  marker is a planned change.
 - Any finding may be a false positive; confirm before removing anything
   (with your package manager where one applies).
 
@@ -194,7 +203,8 @@ and old Homebrew versions (`homebrew`).
 Three config keys tune the scans: `orphan_max_items` (default 200 findings per
 detector), `orphan_max_seconds` (default 60 s per detector; when it runs out
 one note says the results are incomplete) and `orphan_min_age_days` (default
-30; macOS app data younger than this is not reported).
+30; macOS app data and `orphan_files` entries touched more recently than this
+are not reported; 0 turns the check off).
 
 ## Working with what a scan finds
 

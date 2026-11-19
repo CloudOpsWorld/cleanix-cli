@@ -44,9 +44,48 @@ READ_ONLY_COMMANDS: frozenset = frozenset(
 )
 
 
+# Exact argument shapes. A path/id operand must not look like an option, so a
+# smuggled ``--forget`` or ``-f`` after the fixed words is refused.
+_FIXED_ARGV: frozenset = frozenset(
+    {
+        ("dpkg-query", "-W", "-f=${Package}\\n"),
+        ("rpm", "-qa", "--qf", "%{NAME}\\n"),
+        ("pacman", "-Qq"),
+        ("mdfind", "kMDItemContentType == 'com.apple.application-bundle'"),
+        ("pkgutil", "--pkgs"),
+    }
+)
+# Prefixes followed by path operands / by exactly one id operand.
+_PATH_ARGV = frozenset(
+    {("dpkg-query", "-S"), ("rpm", "-qf"), ("pacman", "-Qo")}
+)
+_ID_ARGV = frozenset(
+    {
+        ("pkgutil", "--pkg-info-plist"),
+        ("pkgutil", "--only-files", "--files"),
+    }
+)
+
+
+def _argv_allowed(argv: Sequence[str]) -> bool:
+    a = tuple(argv)
+    if tuple(a[:2]) not in READ_ONLY_COMMANDS:
+        return False
+    if a in _FIXED_ARGV:
+        return True
+    if a[:2] in _PATH_ARGV:
+        rest = a[2:]
+        return bool(rest) and all(x.startswith("/") for x in rest)
+    for prefix in _ID_ARGV:
+        if a[: len(prefix)] == prefix:
+            rest = a[len(prefix):]
+            return len(rest) == 1 and bool(rest[0]) and not rest[0].startswith("-")
+    return False
+
+
 def run(argv: Sequence[str], timeout: int = 60) -> tuple[int, str, str]:
     """Run an allowlisted read-only command under the C locale."""
-    if tuple(argv[:2]) not in READ_ONLY_COMMANDS:
+    if not _argv_allowed(argv):
         return 126, "", "refused"
     try:
         return run_command(["env", "LC_ALL=C", *argv], timeout)
@@ -410,19 +449,6 @@ def system_account_names(root: str | Path) -> set:
 
 def _norm(name: str) -> str:
     return re.sub(r"\d+$", "", re.sub(r"[^a-z0-9]", "", name.lower()))
-
-
-def name_matches(name: str, names: set) -> bool:
-    n = _norm(name)
-    if not n:
-        return False
-    for cand in names:
-        c = _norm(cand)
-        if not c:
-            continue
-        if n == c or (len(n) >= 4 and c.startswith(n)):
-            return True
-    return False
 
 
 # ---------------------------------------------------------------- reporter

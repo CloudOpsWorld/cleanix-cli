@@ -199,15 +199,6 @@ def test_detect_backend_by_family(orphan_env):
     assert oc.detect_pkg_backend({"debian"}) is None
 
 
-def test_name_matches():
-    assert oc.name_matches("postgresql", {"postgresql-16"})
-    assert oc.name_matches("NetworkManager", {"network-manager"})
-    assert oc.name_matches("mysql", {"mysql-server-8.0"})
-    assert not oc.name_matches("ucf", {"ucfx"})
-    assert not oc.name_matches("myapp", {"mya"})
-    assert not oc.name_matches("---", {"x"})
-
-
 def test_owner_check_command_quotes():
     assert oc.owner_check_command("dpkg", "/opt/My App") == "dpkg -S '/opt/My App'"
     assert oc.owner_check_command("rpm", "/opt/x") == "rpm -qf /opt/x"
@@ -488,3 +479,40 @@ def test_reporter_caps_notes(orphan_env):
     items = list(T(Config()).find_items())
     assert len(items) == oc.MAX_NOTES + 1
     assert "suppressed" in items[-1].description
+
+
+@pytest.mark.parametrize("argv", [
+    ["pkgutil", "--only-files", "--forget", "--files", "com.x.y"],
+    ["pkgutil", "--only-files", "--files", "com.x.y", "--forget"],
+    ["pkgutil", "--only-files", "--files", "--forget"],
+    ["pkgutil", "--pkgs", "--extra"],
+    ["pkgutil", "--forget", "com.x.y"],
+    ["pkgutil", "--pkg-info-plist", "com.x.y", "extra"],
+    ["dpkg-query", "-S", "--admindir=/x", "/opt/a"],
+    ["rpm", "-qf", "--eval", "/opt/a"],
+    ["rpm", "-qa", "--qf", "%{NAME}\\n", "--erase"],
+    ["pacman", "-Qq", "-d"],
+    ["dpkg-query", "-W", "-f=${Package}\\n", "--show"],
+    ["dpkg-query", "-S"],
+])
+def test_run_pins_exact_argv_shapes(monkeypatch, argv):
+    called = []
+    monkeypatch.setattr(oc, "run_command", lambda *a, **k: called.append(a))
+    assert oc.run(argv) == (126, "", "refused")
+    assert called == []
+
+
+@pytest.mark.parametrize("argv", [
+    ["pkgutil", "--only-files", "--files", "com.x.y"],
+    ["pkgutil", "--pkg-info-plist", "com.x.y"],
+    ["pkgutil", "--pkgs"],
+    ["dpkg-query", "-S", "/opt/a", "/opt/b"],
+    ["rpm", "-qf", "/opt/a"],
+    ["pacman", "-Qo", "/opt/a"],
+    ["dpkg-query", "-W", "-f=${Package}\\n"],
+    ["rpm", "-qa", "--qf", "%{NAME}\\n"],
+    ["pacman", "-Qq"],
+])
+def test_run_allows_exact_argv_shapes(monkeypatch, argv):
+    monkeypatch.setattr(oc, "run_command", lambda a, t=120: (0, "", ""))
+    assert oc.run(argv) == (0, "", "")

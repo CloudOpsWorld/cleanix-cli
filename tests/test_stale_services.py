@@ -294,3 +294,22 @@ def test_control_char_names_skipped(orphan_env):
     except OSError:
         pytest.skip("filesystem rejects newline names")
     assert descs(sysf(orphan_env)) == []
+
+
+def test_package_backend_detected_once_per_scan(orphan_env, monkeypatch):
+    from cleanix.cleaners import orphan_common as oc
+    from cleanix.cleaners.stale_services import StaleSystemdUnitReporter
+    from cleanix.config import Config
+
+    d = orphan_env.root / "etc/systemd/system"
+    d.mkdir(parents=True)
+    (orphan_env.root / "usr/lib/systemd/system").mkdir(parents=True)
+    for n in ("a", "b", "c"):
+        (d / f"{n}.service").write_text(f"[Service]\nExecStart=/usr/bin/nope-{n}\n")
+    calls = []
+    monkeypatch.setattr(
+        oc.OrphanReporter, "pkg_backend", lambda self: calls.append(1) or "dpkg"
+    )
+    rep = StaleSystemdUnitReporter(Config()).scan()
+    assert len(rep.items) >= 3
+    assert len(calls) == 1

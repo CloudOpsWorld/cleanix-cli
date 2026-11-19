@@ -238,11 +238,19 @@ class StaleSystemdUnitReporter(OrphanReporter):
             return None
 
     # ------------------------------------------------------------- misc
+    def _reset(self) -> None:
+        super()._reset()
+        self._backend_known = False
+        self._backend = None
+
     def _hint(self, unit: str, logical: str, user: bool) -> str:
         ctl = "systemctl --user" if user else "systemctl"
         sudo = "" if user else "sudo "
         check = f"{ctl} status {shlex.quote(unit)}"
-        owner = oc.owner_check_command(self.pkg_backend(), logical)
+        if not self._backend_known:
+            self._backend_known = True
+            self._backend = self.pkg_backend()  # once per scan, not per finding
+        owner = oc.owner_check_command(self._backend, logical)
         if owner:
             check += f"; {owner}"
         return (

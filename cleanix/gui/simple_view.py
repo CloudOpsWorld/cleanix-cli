@@ -565,10 +565,11 @@ class SimpleView(QWidget):
         self.review_toggle.setVisible(bool(review))
         if not groups:
             summary = "Nothing found to clean."
-        elif result.total_size <= 0:
+        elif result.cleanable_size <= 0:
             summary = f"{result.total_items} findings to review (nothing to free)."
         else:
-            summary = f"Found {human_size(result.total_size)} in {result.total_items} items."
+            n = len(result.cleanable_items())
+            summary = f"Found {human_size(result.cleanable_size)} in {n} items."
         self.results_summary.setText(summary)
         self._refresh_clean_button()
         self._set_state(SimpleState.RESULTS)
