@@ -1,4 +1,4 @@
-# Actionable findings, a Findings tab and a Registry tab — design
+# Actionable findings, a Review tab and a Registry tab — design
 
 Status: draft for approval. Builds on `2026-11-19-curated-listings-and-orphans-design.md` (A curated listings, B registry cleanup, C orphan reports, all shipped in 1.4.0b3).
 
@@ -12,7 +12,7 @@ Today every "finding" (big files, duplicates, downloads, orphaned app data, unow
 - **Everything deletable, including system-wide findings** (the user's decision), through the existing elevated helper with new allowlisted actions. Each detector declares a *remedy*: what "delete" means for its items (remove path, forget package receipt, unload and remove a launch job, disable and remove a systemd unit). Items with no safe remedy (e.g. "could not read", "not checked" notes) stay report-only and say why.
 - **CLI, non-interactive:** `cleanix clean --act-on <scenario[,scenario…]|category>`, previewing by default and acting with `--execute`, like `clean` today.
 - **CLI, interactive:** `cleanix review [scenario…]`: findings by category, one prompt per item (delete / skip / delete all remaining in this group / skip group / quit).
-- **GUI (Power mode):** three tabs: *Cleanup* (today's safe items), *Findings* (the report-only items, grouped by category, tick per file and per category tri-state), *Registry* (Windows only; the five `win_reg_*` detectors, moved out of Cleanup).
+- **GUI (Power mode):** three tabs: *Cleanup* (today's safe items), *Review* (the report-only items, grouped by category, tick per file and per category tri-state), *Registry* (Windows only; the five `win_reg_*` detectors, moved out of Cleanup).
 - Findings are listed **by category** everywhere (CLI report, review, GUI).
 
 ## Non-goals / anti-goals
@@ -52,11 +52,11 @@ Implementation shape: a `Remedy` layer next to the report detectors (data on eac
 4. **Duplicates.** The model is group-aware. The executor re-stats the surviving copy at delete time and fails closed if it is missing, unreadable or changed. In the GUI, ticking a duplicate category ticks every copy except one survivor per group (default: oldest, shown and changeable); a group can never be fully ticked.
 5. **Undo.** Paths: Undo via quarantine. Launch-job plists, systemd units and package receipts: copied before removal but presented as permanent (no restore is built; the copy is for manual recovery). Same honesty rule as `regpromises`.
 6. **Typed confirmation.** One confirmation per batch of system-wide items (not per item), listing them; interactive runs require typing `DELETE SYSTEM FILES`; non-interactive runs need `--yes` and an elevated process.
-7. **Platforms.** `big_files`, `duplicates`, `downloads` and user-space leftovers work on all three OSes. `orphan_*` / `stale_*` system-wide detectors are Linux/macOS only; on Windows the Findings tab shows only user-space scenarios and the Registry tab holds the registry detectors.
+7. **Platforms.** `big_files`, `duplicates`, `downloads` and user-space leftovers work on all three OSes. `orphan_*` / `stale_*` system-wide detectors are Linux/macOS only; on Windows the Review tab shows only user-space scenarios and the Registry tab holds the registry detectors.
 
 ## Left to the builder
 
-Category taxonomy and names (proposal: *Your files*, *Leftovers of removed apps*, *System files no package owns*, *Services and background jobs*, *Install records*); exact prompt wording; per-detector remedy table; how the Findings tab shows system-wide items needing admin (reuse existing "Needs admin" badge and elevation flow); whether `review` accepts `--category`.
+Category taxonomy and names (proposal: *Your files*, *Leftovers of removed apps*, *System files no package owns*, *Services and background jobs*, *Install records*); exact prompt wording; per-detector remedy table; how the Review tab shows system-wide items needing admin (reuse existing "Needs admin" badge and elevation flow); whether `review` accepts `--category`.
 
 ## Risks
 

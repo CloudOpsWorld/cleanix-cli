@@ -1,8 +1,8 @@
-# Actionable findings, Findings tab and Registry tab — Implementation Plan
+# Actionable findings, Review tab and Registry tab — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let users act on report-only findings (CLI scenario flag, interactive review, GUI Findings tab) including system-wide ones via the elevated helper, and move Windows registry entries to their own GUI tab.
+**Goal:** Let users act on report-only findings (CLI scenario flag, interactive review, GUI Review tab) including system-wide ones via the elevated helper, and move Windows registry entries to their own GUI tab.
 
 **Architecture:** A `Remedy` (what "delete" means + evidence fingerprint) is attached to finding items by their detectors. A new executor (`cleanix/core/actions.py`) re-verifies and applies remedies; `Engine.clean` keeps refusing report-only items so every existing flow is unchanged. System-wide remedies run in the elevated helper through a new request type that re-scans and only acts on items its own scan reports (same pattern as the registry action). CLI and GUI are thin layers over the executor.
 
@@ -36,7 +36,7 @@
 - Create `cleanix/core/remedy.py` — `RemedyKind`, `Remedy`, fingerprinting, re-verify helpers.
 - Create `cleanix/core/actions.py` — executor: plan, confirm, apply, summary.
 - Create `cleanix/core/findings.py` — finding categories, grouping, `plan_duplicates`.
-- Modify `cleanix/core/models.py` (item `remedy`), `curation.py` (copy for categories), detectors listed per task, `service.py`, `cli.py`, `elevate.py`/`elevated.py` (request type), `report.py`, `completion.py`, GUI (`grouped_results.py`, `power_view.py`, `main_window.py`, new `findings_view.py`, `registry_view.py`), README/docs.
+- Modify `cleanix/core/models.py` (item `remedy`), `curation.py` (copy for categories), detectors listed per task, `service.py`, `cli.py`, `elevate.py`/`elevated.py` (request type), `report.py`, `completion.py`, GUI (`grouped_results.py`, `power_view.py`, `main_window.py`, new `review_view.py`, `registry_view.py`), README/docs.
 - Tests mirror each module under `tests/`.
 
 ---
@@ -124,11 +124,12 @@
 - [ ] Step 1: Tests: `test_system_items_skipped_without_elevation`, `test_typed_confirmation_wrong_text_aborts`, `test_yes_without_elevation_skips_system_but_runs_user`, `test_summary_lists_not_done`.
 - [ ] Step 2: Implement; commit.
 
-### Task 11: GUI Findings model and tree
+### Task 11: GUI Review model and tree
 
-**Files:** Create `cleanix/gui/findings_view.py`; modify `cleanix/gui/grouped_results.py`, `cleanix/gui/models.py`; Test `tests/gui/test_findings_view.py`.
+**Files:** Create `cleanix/gui/review_view.py`; modify `cleanix/gui/grouped_results.py`, `cleanix/gui/models.py`; Test `tests/gui/test_review_view.py`.
 
-**Interfaces:** `FindingsView(QWidget)` shows `group_findings()` as category → scenario → items; tri-state category/scenario ticks; per-file tick; bulk ticks only select items that are actionable and already realised (never unseen collapsed items); system items disabled without elevation and badged "Needs admin"; duplicate scenario ticking leaves one survivor per group (default oldest, changeable through a context action), a group can never be fully ticked; footer shows selected count/size and the undo-or-permanent line; signal `actRequested(items: list, permanent: bool)`.
+**Interfaces:** `ReviewView(QWidget)` shows `group_findings()` as category → scenario → items; tri-state category/scenario ticks; per-file tick; bulk ticks only select items that are actionable and already realised (never unseen collapsed items); system items disabled without elevation and badged "Needs admin"; duplicate scenario ticking leaves one survivor per group (default oldest, changeable through a context action), a group can never be fully ticked; footer shows selected count/size and the undo-or-permanent line; signal `actRequested(items: list, permanent: bool)`.
+- [ ] Step 0: Fix `setAlternatingRowColors(True)` in `grouped_results.py` so alternate rows keep readable contrast on dark palettes (seen on macOS dark mode: pale rows with white text); test `test_row_colors_readable_on_dark_palette` compares text vs base/alternate-base contrast.
 - [ ] Step 1: Tests (offscreen): `test_category_tick_selects_all_actionable_visible`, `test_collapsed_items_not_selected_by_bulk`, `test_duplicates_leave_one_survivor`, `test_system_items_disabled_without_elevation`, `test_nothing_preselected`.
 - [ ] Step 2: Implement; commit.
 
@@ -136,7 +137,7 @@
 
 **Files:** Create `cleanix/gui/registry_view.py`; modify `cleanix/gui/power_view.py`, `cleanix/gui/main_window.py`, `cleanix/gui/workers.py`; Test `tests/gui/test_tabs.py`.
 
-**Interfaces:** Power mode gets `Cleanup | Findings | Registry` tabs (Registry only on Windows). `win_reg_*` results are removed from the Cleanup tree and shown in `RegistryView` grouped by detector with the existing backup/permanent copy; act flow uses `service.act`/the helper request; Findings tab runs scans for report-only scenarios (opt-in "Scan for findings" button; slow scenarios behind the existing Deep scan wording); Undo button reuses quarantine runs. Simple mode unchanged.
+**Interfaces:** The existing "Findings" tab (scan-summary panel) keeps its name, so the new tab is called "Review". Power mode gets `Cleanup | Review | Registry` tabs (Registry only on Windows). `win_reg_*` results are removed from the Cleanup tree and shown in `RegistryView` grouped by detector with the existing backup/permanent copy; act flow uses `service.act`/the helper request; Review tab runs scans for report-only scenarios (opt-in "Scan for findings" button; slow scenarios behind the existing Deep scan wording); Undo button reuses quarantine runs. Simple mode unchanged.
 - [ ] Step 1: Tests: `test_registry_items_not_in_cleanup_tab`, `test_registry_tab_only_on_windows`, `test_findings_tab_scan_button_does_not_autostart`, `test_simple_mode_has_no_findings`.
 - [ ] Step 2: Implement; commit.
 
