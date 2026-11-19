@@ -119,6 +119,9 @@ class ActPlan:
 
     items: List[CleanableItem] = field(default_factory=list)
     skipped: List[Tuple[CleanableItem, str]] = field(default_factory=list)
+    # The copies that stay (also listed in ``skipped`` with reason KEPT): a
+    # structured marker so callers never classify them by wording.
+    kept: List[CleanableItem] = field(default_factory=list)
 
 
 class Survivor(NamedTuple):
@@ -337,6 +340,7 @@ def _plan_group(copies: List[CleanableItem], survivor: CleanableItem, plan: ActP
         plan.skipped.extend((c, reason) for c in copies)
         return
     plan.skipped.append((survivor, KEPT))
+    plan.kept.append(survivor)
     plan.skipped.extend(bad)
     plan.items.extend(_stamp(c, survivor) for c in removable)
 

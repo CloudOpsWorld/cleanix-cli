@@ -239,7 +239,7 @@ def test_act_on_skips_and_errors_reported_separately(tmp_path, monkeypatch, caps
     assert "Skipped 2 item(s)" in out and "changed since scan" in out
 
 
-def test_act_on_exit_code_1_on_real_error(tmp_path, monkeypatch, capsys):
+def test_act_on_exit_code_2_on_real_error(tmp_path, monkeypatch, capsys):
     p = _file(tmp_path)
     _patch_scan(monkeypatch, [_finding(p)])
     def boom(*a, **k):
@@ -248,7 +248,7 @@ def test_act_on_exit_code_1_on_real_error(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(safety, "safe_rmtree", boom)
     code, out = _run(capsys, "--act-on", "big_files", "--permanent",
                      "--execute", "--yes")
-    assert code == 1 and "disk on fire" in out and p.exists()
+    assert code == 2 and "disk on fire" in out and p.exists()
 
 
 def test_hostile_filename_is_escaped_in_output(tmp_path, monkeypatch, capsys):
@@ -317,3 +317,23 @@ def test_act_dry_run_then_act_hashes_kept_copy_once(tmp_path, monkeypatch):
     actions.act(plan.items, Config(), dry_run=True, record_history=False)
     s = actions.act(plan.items, Config(), dry_run=False)
     assert s.removed == 1 and len(reads) == 1
+
+
+def test_act_on_keep_without_duplicates_is_an_error(tmp_path, monkeypatch, capsys):
+    p = _file(tmp_path)
+    _patch_scan(monkeypatch, [_finding(p)])
+    code, out = _run(capsys, "--act-on", "big_files", "--keep", "oldest")
+    assert code == 2 and "--keep only applies" in out and p.exists()
+
+
+def test_plan_exposes_kept_copies_and_cli_never_lists_them_as_skipped(
+        tmp_path, monkeypatch, capsys):
+    paths, items = _dups(tmp_path, n=2)
+    plan = findings.plan_duplicates(items, "oldest")
+    assert [i.path for i in plan.kept] == [str(paths[0])]
+    monkeypatch.setattr(findings, "KEPT", "zzz: the one that stays")
+    _patch_scan(monkeypatch, items)
+    code, out = _run(capsys, "--act-on", "duplicates", "--keep", "oldest",
+                     "--execute", "--yes")
+    assert code == 0 and paths[0].exists() and not paths[1].exists()
+    assert "Skipped" not in out

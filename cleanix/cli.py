@@ -567,6 +567,10 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
         return _act_error(console, err)
     keep = getattr(args, "keep", None)
     keep_help = "|".join(findings.KEEP_POLICIES)
+    if keep and "duplicates" not in ids:
+        return _act_error(
+            console, "--keep only applies to the duplicates scenario; "
+            "add duplicates to --act-on or drop --keep")
     if "duplicates" in ids and not keep:
         return _act_error(
             console, f"the duplicates scenario needs --keep ({keep_help}) "
@@ -589,6 +593,7 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
     dup_ids = {id(i) for i in dups}
     to_act = [i for i in rest if id(i) not in dup_ids]
     plan_skipped: List[Tuple[object, str]] = []
+    kept_ids = set()
     if dups:
         if not keep:
             return _act_error(
@@ -596,6 +601,7 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
         plan = findings.plan_duplicates(dups, keep)
         to_act += plan.items
         plan_skipped = list(plan.skipped)
+        kept_ids = {id(i) for i in plan.kept}
 
     # Dry-run pass: the real verdict (and reason) for every item.
     pre = service.act(to_act, config, dry_run=True, permanent=permanent,
@@ -605,6 +611,7 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
         key(i.path): why for i, why in plan_skipped + list(pre.skipped)
         if getattr(i, "path", None)}
     stamped = {key(i.path): i for i in to_act if i.path}
+    kept_paths = {key(i.path) for i in plan.kept} if dups else set()
     eligible = [i for i in to_act if key(i.path) not in skip_by_path]
 
     undo = ("permanent, no undo" if permanent else
@@ -627,7 +634,7 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
                 k = key(i.path) if i.path else ""
                 why = skip_by_path.get(k)
                 if why is not None:
-                    label = why if why.startswith("kept") else f"skipped: {why}"
+                    label = why if k in kept_paths else f"skipped: {why}"
                     _act_line(console, i, safe(label))
                     continue
                 action = f"{verb}: {undo}"
@@ -688,7 +695,7 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
             f"[bold]cleanix quarantine empty[/bold].")
     elif permanent and summary.removed:
         console.print("[dim]Deleted permanently; there is no undo.[/dim]")
-    skipped = [(i, w) for i, w in plan_skipped if not w.startswith("kept")]
+    skipped = [(i, w) for i, w in plan_skipped if id(i) not in kept_ids]
     skipped += list(summary.skipped)
     skipped += [(i, "needs an elevated run (not done here)") for i in root_items]
     if skipped:
@@ -700,7 +707,9 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
     for o in summary.errors:
         console.print(
             f"  [red]![/red] {safe(o.item.description)}: {safe(o.error)}")
-    return 1 if summary.errors or summary.undo_record_error else 0
+    # Same convention as plain `clean`: 2 on real errors, 1 only for a user
+    # abort (above), 0 for success (skips are not failures).
+    return 2 if summary.errors or summary.undo_record_error else 0
 
 
 def cmd_clean(args: argparse.Namespace, console: Console) -> int:
