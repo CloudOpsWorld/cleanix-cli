@@ -139,7 +139,7 @@ def test_idle_page_has_headline_reassurance_and_deep_scan_off(qtbot):
     assert v.reassurance_label.text() == (
         "Nothing is deleted until you review it. Most cleanups can be undone.")
     assert v.scan_button.isDefault() and v.scan_button.minimumHeight() >= 40
-    assert v.deep_scan_check.text() == "Deep scan (slower: duplicates, big files)"
+    assert v.deep_scan_check.text() == "Deep scan (slower: duplicates, big files, Mac leftovers)"
     assert not v.deep_scan_check.isChecked()
 
 

@@ -386,8 +386,9 @@ full path and any manual-removal hint; right-click an item for Copy path and
 Open location.
 
 **Simple mode** (the default) is Scan, review, Clean, Undo. A **Deep scan**
-checkbox (off by default) adds the slow cleaners (duplicates, big files and
-similar); a normal scan skips them. Results are split into three lists: the
+checkbox (off by default) adds the slow cleaners (duplicates, big files,
+downloads and the two macOS leftover reports, install records and data of
+removed apps); a normal scan skips them. Results are split into three lists: the
 main list holds groups with something pre-selected, "Also found (not
 selected)" holds the Permanent and Needs admin groups, and "Needs your
 review" holds the Review groups. Simple mode only lets you tick reviewed-safe

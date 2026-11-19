@@ -44,7 +44,7 @@ from cleanix.gui.grouped_results import GroupedResults
 IDLE_HEADLINE = "Free up disk space"
 IDLE_REASSURANCE = ("Nothing is deleted until you review it. "
                     "Most cleanups can be undone.")
-DEEP_SCAN_TEXT = "Deep scan (slower: duplicates, big files)"
+DEEP_SCAN_TEXT = "Deep scan (slower: duplicates, big files, Mac leftovers)"
 SLOW = catalog.SLOW_SCAN_IDS
 
 
