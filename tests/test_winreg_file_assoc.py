@@ -35,10 +35,19 @@ def make_ctx(owner_matches=True, states=None):
 
 
 def scan(ctx=None):
+    """Run the detector; a crash (swallowed by Cleaner.scan) fails the test."""
+    from cleanix.core import winregistry
+
     det = WinRegFileAssoc(Config())
     c = ctx or make_ctx()
     det.context = lambda: c
-    return det.scan().items
+    backend = winregistry.get_backend()
+    before = len(backend.calls)
+    report = det.scan()
+    assert report.skipped_reason is None, report.skipped_reason
+    ran = [x for x in backend.calls[before:] if x[0] == "subkeys"]
+    assert ran, "the detector did not read the registry"
+    return report.items
 
 
 def names(items):
@@ -118,9 +127,22 @@ def test_icon_non_string_kept(fake_registry):
     assert scan() == []
 
 
-def test_unquoted_command_unknown_kept(fake_registry):
-    progid(fake_registry, "A.B", cmd=r"C:\gone\app.exe %1")
-    assert scan() == []
+def test_unquoted_command_with_unknown_candidate_kept(fake_registry):
+    progid(fake_registry, "A.B", cmd=GONE + " %1")
+    # every candidate missing except one the prober cannot judge
+    prober = FakeProber({GONE: S.UNKNOWN}, default=S.MISSING)
+    ctx = dataclasses.replace(make_ctx(), prober=prober)
+    assert scan(ctx) == []
+    assert GONE in prober.calls
+
+
+def test_unquoted_command_all_candidates_missing_listed(fake_registry):
+    # documents target_state: an unquoted command is MISSING only when every
+    # CreateProcess candidate is provably absent
+    progid(fake_registry, "A.B", cmd=GONE + " %1")
+    prober = FakeProber({}, default=S.MISSING)
+    ctx = dataclasses.replace(make_ctx(), prober=prober)
+    assert len(scan(ctx)) == 1
 
 
 def test_removable_drive_kept(fake_registry):
@@ -253,7 +275,8 @@ def test_non_ascii_name_refused(fake_registry):
 
 
 def test_applications_itself_kept(fake_registry):
-    fake_registry.add_key("HKCU", CL + r"\Applications", {"": (REG_SZ, "x")})
+    # structurally a dead handler, so only the deny rule keeps it
+    progid(fake_registry, "Applications")
     assert scan() == []
 
 
@@ -308,10 +331,25 @@ def test_hklm_under_users_unknown(fake_registry):
     assert scan(make_ctx(states={r"C:\Users\x\app.exe": S.MISSING})) == []
 
 
-def test_backup_problem_skipped(fake_registry):
-    progid(fake_registry, "A.B")
-    fake_registry.add_key("HKCU", CL + r"\A.B", {"bad\nname": (REG_SZ, "x")})
-    assert scan() == []
+def test_backup_problem_skipped(fake_registry, monkeypatch):
+    from cleanix.cleaners import winreg_file_assoc as mod
+
+    seen = []
+    real = mod.backup_problem
+
+    def spy(cid, target, snap):
+        r = real(cid, target, snap)
+        seen.append((target.key, r))
+        return r
+
+    monkeypatch.setattr(mod, "backup_problem", spy)
+    progid(fake_registry, "C.D")
+    # structurally fine (any verb name is allowed), but not backup-able
+    progid(fake_registry, "A.B", extra_verbs={"edit ": CMD_GONE})
+    assert names(scan()) == [("HKCU", CL + r"\C.D")]
+    verdicts = dict(seen)
+    assert verdicts[CL + r"\C.D"] is None
+    assert verdicts[CL + r"\A.B"] is not None
 
 
 def test_file_assoc_never_touches_unlisted_containers(fake_registry):
@@ -323,3 +361,101 @@ def test_file_assoc_never_touches_unlisted_containers(fake_registry):
     for call in fake_registry.calls:
         assert call[0] in ("subkeys", "values", "key_exists", "is_link"), call
         assert call[2].casefold().startswith(r"software\classes"), call
+
+
+def test_shell_key_extra_value_kept(fake_registry):
+    progid(fake_registry, "A.B")
+    fake_registry.add_key("HKCU", CL + r"\A.B\shell", {"Other": (REG_SZ, "x")})
+    assert scan() == []
+
+
+def test_shell_key_default_value_ok(fake_registry):
+    progid(fake_registry, "A.B")
+    fake_registry.add_key("HKCU", CL + r"\A.B\shell", {"": (REG_SZ, "open")})
+    assert len(scan()) == 1
+
+
+def test_defaulticon_extra_subkey_kept(fake_registry):
+    progid(fake_registry, "A.B", icon=GONE)
+    fake_registry.add_key("HKCU", CL + r"\A.B\DefaultIcon\x")
+    assert scan() == []
+
+
+def test_defaulticon_extra_value_kept(fake_registry):
+    progid(fake_registry, "A.B", icon=GONE)
+    fake_registry.add_key("HKCU", CL + r"\A.B\DefaultIcon", {"Other": (REG_SZ, "x")})
+    assert scan() == []
+
+
+def test_defaulticon_without_default_kept(fake_registry):
+    progid(fake_registry, "A.B")
+    fake_registry.add_key("HKCU", CL + r"\A.B\DefaultIcon", {"Other": (REG_SZ, GONE)})
+    assert scan() == []
+
+
+@pytest.mark.parametrize("val", [(REG_DWORD, 1), (REG_BINARY, b"x")])
+def test_verb_icon_non_string_kept(fake_registry, val):
+    progid(fake_registry, "A.B")
+    fake_registry.add_key("HKCU", CL + r"\A.B\shell\open", {"Icon": val})
+    assert scan() == []
+
+
+def test_every_key_of_the_tree_is_link_checked(fake_registry):
+    progid(fake_registry, "A.B", icon=GONE)
+    assert len(scan()) == 1
+    checked = {c[2] for c in fake_registry.calls if c[0] == "is_link"}
+    root = CL + r"\A.B"
+    for sub in ("", r"\shell", r"\shell\open", r"\shell\open\command", r"\DefaultIcon"):
+        assert root + sub in checked, sub
+
+
+@pytest.mark.parametrize("sub", ["shell", r"shell\open", r"shell\open\command", "DefaultIcon"])
+def test_link_anywhere_in_tree_kept(fake_registry, sub):
+    progid(fake_registry, "A.B", icon=GONE)
+    fake_registry.add_key("HKCU", CL + "\\A.B\\" + sub, link=True)
+    assert scan() == []
+
+
+# -- the Windows ProgId deny table lives in regsafety ----------------------
+
+from cleanix.core import regsafety  # noqa: E402
+from cleanix.core.models import RegTarget  # noqa: E402
+
+_DENIED_PROGIDS = [
+    "txtfilelegacy", "Paint.Picture", "Wordpad.Document.1", "MSInfo.Document",
+    "htafile", "Msi.Patch", "Msi.Package", "rtffile", "regfile", "inffile",
+    "inifile", "cmdfile", "vbsfile", "vbefile", "jsfile", "jsefile", "wsffile",
+    "wshfile", "chm.file", "CABFolder", "giffile", "jpegfile", "pngfile",
+    "bmpfile", "icofile", "htmlfile", "mhtmlfile", "xmlfile", "MSEdgeHTM",
+    "ChromeHTML", "FirefoxHTML-308046B0AF4A39CB", "IE.AssocFile.HTM", "IE.HTTP",
+    "Microsoft.Foo", "Windows.Foo", "ms-settings", "AppX1234", "txtfile",
+    "http", "mailto", "Component Categories", "TXTFILE", "HTAFILE",
+]
+_DENIED_APPS = [
+    f"{n}.exe"
+    for n in (
+        "explorer", "iexplore", "msedge", "notepad", "wordpad", "mspaint", "mmc",
+        "cmd", "powershell", "wscript", "cscript", "regedit", "control", "calc",
+        "write", "winword", "excel", "powerpnt", "outlook", "onenote",
+    )
+]
+
+
+@pytest.mark.parametrize("hive", ["HKCU", "HKLM"])
+@pytest.mark.parametrize("name", _DENIED_PROGIDS)
+def test_check_target_refuses_windows_progids(hive, name):
+    t = RegTarget(hive, CL + "\\" + name)
+    assert regsafety.check_target("win_reg_file_assoc", t) is not None
+
+
+@pytest.mark.parametrize("hive", ["HKCU", "HKLM"])
+@pytest.mark.parametrize("name", _DENIED_APPS + [n.upper() for n in _DENIED_APPS])
+def test_check_target_refuses_windows_applications(hive, name):
+    t = RegTarget(hive, CL + r"\Applications" + "\\" + name)
+    assert regsafety.check_target("win_reg_file_assoc", t) is not None
+
+
+def test_check_target_allows_ordinary_names():
+    for key in (CL + r"\MyApp.File", CL + r"\Applications\gone.exe",
+                CL + r"\Applications\notepad2.exe", CL + r"\Vendor.Doc.1"):
+        assert regsafety.check_target("win_reg_file_assoc", RegTarget("HKCU", key)) is None, key

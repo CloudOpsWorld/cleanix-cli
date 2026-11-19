@@ -36,28 +36,6 @@ _VERB_VALUES = frozenset(
     {"", "muiverb", "extended", "icon", "noworkingdirectory", "friendlyappname",
      "position"}
 )
-# Well-known Windows Applications\ entries, never reported whatever they say.
-_WINDOWS_APPS = frozenset(
-    {"notepad.exe", "wordpad.exe", "mspaint.exe", "explorer.exe", "iexplore.exe",
-     "write.exe", "calc.exe", "cmd.exe", "powershell.exe", "regedit.exe",
-     "mmc.exe", "control.exe", "msedge.exe", "wmplayer.exe", "snippingtool.exe",
-     "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "onenote.exe"}
-)
-# Well-known Windows ProgIds and categories the guard's deny list does not
-# cover; never reported (conservative, casefolded).
-_WINDOWS_PROGIDS = frozenset(
-    {"txtfile", "http", "https", "ftp", "file", "mailto", "regfile", "inffile",
-     "inifile", "htmlfile", "jpegfile", "pngfile", "giffile", "bmpfile",
-     "cplfile", "dllfile", "sysfile", "vbsfile", "vbefile", "jsfile", "jsefile",
-     "wsffile", "wshfile", "chm.file", "helpfile", "cabfile", "cdafile",
-     "mscfile", "themefile", "icofile", "curfile", "anifile",
-     "component categories", "shell", "search", "search-ms", "telnet", "news",
-     "nntp", "snews", "gopher", "tn3270", "ie.http", "ie.ftp", "ie.file",
-     "mhtmlfile", "xmlfile", "urlfile", "internetshortcut", "shortcut",
-     "scrfile", "ocxfile", "pffile", "fonfile", "ttffile", "otffile",
-     "cabfolder", "sendto", "droptarget", "desktop", "network", "printers",
-     "recyclebin"}
-)
 _STRING_TYPES = (REG_SZ, REG_EXPAND_SZ)
 
 
@@ -81,8 +59,6 @@ class WinRegFileAssoc(RegistryDetector):
             return
         machine = container.hive == "HKLM"
         for name in sorted(names):
-            if name.casefold() in _WINDOWS_APPS | _WINDOWS_PROGIDS:
-                continue
             key = container.key + "\\" + name
             target = RegTarget(container.hive, key, None, "")
             if check_target(self.id, target) is not None:
