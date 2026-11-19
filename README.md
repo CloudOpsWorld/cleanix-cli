@@ -447,6 +447,53 @@ Known residuals, accepted for now (details in `cleanix/elevated.py`):
 - **macOS:** the administrator path has been reasoned about from the code and
   unit-tested with mocks, but not yet run on a real Mac.
 
+**Machine-wide registry entries (Windows).** The helper has a second, separate
+action for registry entries under `HKLM`:
+
+- Before the prompt, the GUI backs each entry up **as you** into a new
+  quarantine run (`.reg` + `.json`); an entry whose backup fails is not sent.
+  If you decline the prompt, that run is removed again.
+- The request carries only the registry detector ids, the item keys you
+  ticked (each embeds the entry's content fingerprint), the backup **run id**
+  and your quarantine folder. The helper re-scans with exactly those
+  detectors and deletes only `HKLM` entries its own scan found, whose key and
+  fingerprint match, that pass the registry safety rules, and for which that
+  run holds a verified backup it could restore. Anything else is refused or
+  reported as "no longer found".
+- The helper never reads or changes `HKCU`: running elevated, `HKCU` is the
+  administrator's hive, not yours. A request naming an `HKCU` entry is
+  refused as a whole, as is one with an unknown field, a run id containing a
+  path separator, a detector outside the five registry detectors, or a helper
+  that is not elevated.
+- The run must be yours: the helper takes the owner of the request folder
+  (created by the unelevated GUI), looks up that account's profile in
+  `HKLM\...\ProfileList` (administrator-writable only), and accepts the
+  quarantine folder only inside that profile, without links or junctions, and
+  only when the folder, the run and its manifest are owned by that account.
+  It never uses the administrator's own `%LOCALAPPDATA%`.
+- The helper writes nothing: no quarantine run, no history. Restoring these
+  entries needs an Administrator terminal (`cleanix restore <run>` or
+  `reg import "<absolute .reg path>" /reg:64`); inspect the `.reg` file first.
+
+What this does **not** protect against:
+
+- **Programs running as you.** A same-user (medium-integrity) program can edit
+  the request or the backup run between the GUI and the helper. It can only
+  choose among entries the helper's own allowlisted scan finds dead, and each
+  delete still needs a verified backup; but it can alter backup files after
+  the fact, which is why the GUI never offers an elevated restore and
+  `cleanix restore` shows exactly what it will write before writing it.
+- **The registry delete race (R17).** There is no transactional registry API:
+  between the last check and `RegDeleteKeyEx` a key could be swapped for a
+  registry link, and the link's target could be deleted. This is reported as
+  "partially deleted … scan again", never as success.
+- **Restore of tampered backups (T4).** Restore re-validates every path and
+  value, but a backup in your folder may have been written by any program
+  running as you; an elevated restore writes machine-wide. Review the listed
+  keys and values before confirming.
+- **Partial deletes (T11).** A key tree that fails mid-delete is reported with
+  its backup run; restore recreates exactly the missing parts.
+
 ## Usage
 
 ```bash
