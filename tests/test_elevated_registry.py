@@ -685,9 +685,9 @@ def real_detectors(h, monkeypatch):
     contexts = []
     env = {"SystemRoot": r"C:\Windows", "ProgramFiles": r"C:\Program Files"}
 
-    def fake_default_context():
+    def fake_default_context(owner_matches=True):
         return DetectorContext(env, FakeProber({}, Existence.MISSING), r"C:\Users",
-                               r"C:\Windows")
+                               r"C:\Windows", owner_matches)
 
     # Both the name the base imported and the module function (a
     # centralised context() may call either).

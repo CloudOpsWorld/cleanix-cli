@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Iterable, Iterator, List, Optional
 
 from cleanix.cleaners.base import SCOPE_SYSTEM, Cleaner
-from cleanix.core import regsnap, regtargets, winregistry
+from cleanix.core import regsnap, regtargets, scanmode, winregistry
 from cleanix.core.models import CleanableItem, CleanerReport, ItemKind, RegTarget
 from cleanix.core.platform import WINDOWS
 from cleanix.core.regsafety import Container, check_target, containers_for
@@ -87,7 +87,13 @@ class RegistryDetector(Cleaner):
         self.incomplete = []
         backend = winregistry.get_backend()
         ctx = self.context()
+        helper = scanmode.is_helper_mode()
         for container in containers_for(self.id):
+            # The elevated helper's HKCU is the administrator's hive (R15):
+            # never examined there. (Helper mode only: an elevated CLI
+            # legitimately cleans its own HKCU.)
+            if helper and container.hive != "HKLM":
+                continue
             for finding in self.entries(container, backend, ctx):
                 if check_target(self.id, finding.target, backend) is not None:
                     continue
