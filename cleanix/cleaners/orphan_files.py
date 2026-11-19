@@ -238,12 +238,7 @@ class UnownedSystemFilesReporter(OrphanReporter):
             root_dev = oc.device_of(root_real)
             for n, item in enumerate(self._candidates(root, kids)):
                 if n % _CHECK_EVERY == 0 and self.budget.expired():
-                    yield self.note(
-                        root_real,
-                        f"Not checked: rest of {root} (time limit reached)",
-                        "Raise orphan_max_seconds in the config to scan further.",
-                    )
-                    break
+                    return  # find_items adds the one "incomplete" note
                 if isinstance(item, Finding):
                     yield item
                     continue

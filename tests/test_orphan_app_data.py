@@ -271,7 +271,9 @@ def test_expired_budget_during_inventory_is_not_checked(mac):
     cfg = Config()
     cfg.orphan_max_seconds = 0
     items = _scan(cfg)
-    assert _reported(items) == [] and len(_notes(items)) == 1
+    assert _reported(items) == [] and _notes(items) == []
+    stop = [i for i in items if "Scan stopped early (time limit)" in i.description]
+    assert len(stop) == 1 and "Full Disk Access" not in stop[0].hint
 
 
 def test_reports_old_app_data(mac):

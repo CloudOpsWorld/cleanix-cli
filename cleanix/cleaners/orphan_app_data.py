@@ -325,6 +325,8 @@ class OrphanAppDataReporter(oc.OrphanReporter):
     # ------------------------------------------------------------ discovery
     def system_findings(self) -> Iterable[oc.Finding]:
         if self._installed() is None:
+            if self.budget.stop_reason:
+                return  # ran out of time listing apps: the stop note says so
             apps = oc.in_root(self.sysroot, "/Applications")
             yield self.note(
                 apps,

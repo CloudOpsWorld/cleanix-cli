@@ -96,6 +96,12 @@ class ScanBudget:
             return True
         return False
 
+    def remaining(self) -> float:
+        """Seconds left before the time limit (0.0 once it is spent)."""
+        if self._start is None:
+            self.start()
+        return max(0.0, self.max_seconds - (self._clock() - self._start))
+
     def take(self) -> bool:
         if self.expired():
             return False
@@ -462,11 +468,40 @@ class OrphanReporter(Cleaner):
 
     def find_items(self):
         if self.budget.stop_reason:
-            return  # an earlier pass (e.g. another user) already ran out
+            # an earlier pass (e.g. another user) already ran out
+            yield from self._stop_note()
+            return
         if not self._system_done:
             self._system_done = True
             yield from self._emit(self.system_findings())
+            yield from self._stop_note()
+            if self.budget.stop_reason:
+                return
         yield from self._emit(self.user_findings())
+        yield from self._stop_note()
+
+    def _stop_note(self):
+        """The one "results are incomplete" note, once the budget has run out.
+
+        Detectors that simply stop discovering when ``budget.expired()`` rely
+        on this; it is emitted at most once per scan.
+        """
+        if self._stop_noted or not self.budget.stop_reason:
+            return
+        self._stop_noted = True
+        yield self._item(
+            Finding(
+                Path(self.sysroot),
+                f"Scan stopped early ({self.budget.stop_reason}); "
+                "results are incomplete",
+                "Raise orphan_max_items / orphan_max_seconds in the "
+                "config to scan further.",
+                requires_root=False,
+                note=True,
+            ),
+            0,
+            True,
+        )
 
     def _emit(self, findings: Iterable[Finding]):
         for f in findings:
@@ -485,21 +520,7 @@ class OrphanReporter(Cleaner):
                     )
                 continue
             if not self.budget.take():
-                if not self._stop_noted:
-                    self._stop_noted = True
-                    reason = self.budget.stop_reason or "limit"
-                    yield self._item(
-                        Finding(
-                            Path(self.sysroot),
-                            f"Scan stopped early ({reason}); results are incomplete",
-                            "Raise orphan_max_items / orphan_max_seconds in the "
-                            "config to scan further.",
-                            requires_root=False,
-                            note=True,
-                        ),
-                        0,
-                        True,
-                    )
+                yield from self._stop_note()
                 return
             size, complete = bounded_size(f.path, self.budget)
             yield self._item(f, size, complete)

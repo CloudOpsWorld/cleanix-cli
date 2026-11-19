@@ -122,11 +122,7 @@ class StaleReceiptReporter(oc.OrphanReporter):
 
     def _timeout(self) -> int:
         """Per-call timeout: never more than the time left in the budget."""
-        b = self.budget
-        if b._start is None:
-            b.start()
-        remaining = b.max_seconds - (b._clock() - b._start)
-        return max(1, min(MAX_CALL_TIMEOUT, int(remaining)))
+        return max(1, min(MAX_CALL_TIMEOUT, int(self.budget.remaining())))
 
     def _run(self, argv):
         return oc.run(argv, self._timeout())
