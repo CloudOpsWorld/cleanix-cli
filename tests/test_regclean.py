@@ -194,7 +194,7 @@ def test_backup_dir_unwritable_nothing_deleted(state, fake_registry, tmp_path):
     p, path_item = _path_item(tmp_path)
     run = quarantine.new_run()
     # A regular file where the "registry" backup directory must go.
-    run.dir.mkdir(parents=True)
+    run._claim()
     (run.dir / "registry").write_bytes(b"not a directory")
     res = Engine([]).clean([item, path_item], dry_run=False, registry_backup=run)
     reg_o, path_o = res.outcomes
@@ -483,9 +483,7 @@ def test_dry_run_touches_nothing(state, fake_registry):
     res = Engine([]).clean([item], dry_run=True, registry_backup=run)
     o = res.outcomes[0]
     assert o.dry_run and o.removed is False and o.error is None and o.freed == 0
-    assert _writes(reg) == []
-    assert all(c[0] in ("subkeys", "values", "key_exists", "is_link", "can_delete")
-               for c in reg.calls)
+    assert reg.calls == []  # a dry run makes no registry call at all
     assert not (state / "q").exists()
     summary = service.clean([item], Config(), dry_run=True)
     assert summary.quarantine_run is None and not (state / "q").exists()
@@ -592,13 +590,19 @@ def test_service_helper_mode_writes_nothing(state, fake_registry, monkeypatch):
     reg = fake_registry
     _foo_tree(reg, hive="HKLM")
     item = _item(reg, hive="HKLM")
+    gui_run = quarantine.new_run()  # the GUI's backup, written as the user
+    gui_run.store_registry(item, reg)
+    before = sorted(p.name for p in (state / "q").iterdir())
+    reg.calls.clear()
     summary = service.clean([item], Config(), dry_run=False, use_quarantine=False,
                             record_history=False, registry_backup_elsewhere=True,
-                            )
+                            registry_backup_dir=gui_run.dir)
     assert summary.removed == 1, summary.errors
     assert summary.quarantine_run is None
-    assert not (state / "q").exists() and not (state / "state").exists()
+    assert sorted(p.name for p in (state / "q").iterdir()) == before
+    assert not (state / "state").exists()
     assert not reg.key_exists("HKLM", FOO)
+    assert not [c for c in reg.calls if c[0] in ("create_key", "set_value")]
 
 
 def test_service_registry_without_history_refused(state, fake_registry):
@@ -701,7 +705,8 @@ def test_old_file_manifests_still_restore(state, tmp_path):
     }), encoding="utf-8")
     runs = quarantine.list_runs()
     assert runs == [{"run_id": "20250101-000000-1", "created": 1.0, "count": 1,
-                     "size": 5, "registry": 0, "registry_admin": 0}]
+                     "size": 5, "registry": 0, "registry_admin": 0,
+                     "removed_count": 1}]
     res = quarantine.restore("20250101-000000-1")
     assert res == {"restored": [str(original)], "failed": []}
     assert original.read_text(encoding="utf-8") == "hello"
@@ -739,11 +744,478 @@ def test_unknown_entry_type_fails_restore(state):
     assert root.exists()
 
 
-def test_verify_only_sink_is_noop(fake_registry):
-    sink = regclean.VerifyOnlySink()
-    _foo_tree(fake_registry)
-    item = _item(fake_registry)
+def test_verify_only_sink_writes_nothing(state, fake_registry):
+    _foo_tree(fake_registry, hive="HKLM")
+    item = _item(fake_registry, hive="HKLM")
+    run = quarantine.new_run()
+    run.store_registry(item, fake_registry)
+    sink = regclean.VerifyOnlySink(run.dir)
     fake_registry.calls.clear()
     sink.before_delete(item, fake_registry)
     sink.after_delete(item, True)
     assert fake_registry.calls == []
+
+
+# == fix round 1 ====================================================================
+# -- C1: unique run ids, manifest guard ------------------------------------------------
+def test_new_run_ids_unique_within_one_second(state, monkeypatch):
+    monkeypatch.setattr(quarantine.time, "strftime", lambda fmt, *a: "20261119-120000")
+    a, b = quarantine.new_run(), quarantine.new_run()
+    assert a.run_id != b.run_id
+    assert a.run_id.startswith("20261119-120000-") and b.run_id.startswith("20261119-120000-")
+    a._claim()
+    b._claim()
+    assert a.dir != b.dir and a.dir.is_dir() and b.dir.is_dir()
+
+
+def test_same_id_takes_a_fresh_directory(state, fake_registry, monkeypatch, tmp_path):
+    """Two runs constructed with the same id (the old same-second case)
+    never share a directory; restoring one cannot touch the other."""
+    monkeypatch.setattr(quarantine, "new_run",
+                        lambda: quarantine.Quarantine("20261119-000000-1"))
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    s1 = service.clean([item], Config(), dry_run=False, use_quarantine=False)
+    p, path_item = _path_item(tmp_path)
+    s2 = service.clean([path_item], Config(), dry_run=False, use_quarantine=True)
+    assert s1.quarantine_run and s2.quarantine_run and s1.quarantine_run != s2.quarantine_run
+    first = _manifest(state / "q" / s1.quarantine_run)
+    assert [e.get("type") for e in first["items"]] == ["registry"]
+    json_path = Path(first["items"][0]["json"])
+    assert json_path.is_file()
+    # Restoring run B leaves run A's backups alone.
+    assert quarantine.restore(s2.quarantine_run)["failed"] == []
+    assert p.exists() and json_path.is_file()
+    res = quarantine.restore(s1.quarantine_run)
+    assert res == {"restored": [item.reg.display], "failed": []}
+    assert reg.key_exists("HKCU", FOO + r"\Sub\Deeper")
+
+
+def test_two_registry_cleans_same_second_do_not_collide(state, fake_registry, monkeypatch):
+    monkeypatch.setattr(quarantine.time, "strftime", lambda fmt, *a: "20261119-120000")
+    reg = fake_registry
+    _foo_tree(reg)
+    reg.add_key("HKCU", UNINST + r"\Bar", {"DisplayName": (REG_SZ, "Bar")})
+    a, b = _item(reg), _item(reg, key=UNINST + r"\Bar")
+    s1 = service.clean([a], Config(), dry_run=False, use_quarantine=False)
+    s2 = service.clean([b], Config(), dry_run=False, use_quarantine=False)
+    assert s1.removed == 1 and s2.removed == 1, (s1.errors, s2.errors)
+    assert s1.quarantine_run != s2.quarantine_run
+    assert len(_manifest(state / "q" / s1.quarantine_run)["items"]) == 1
+    assert len(_manifest(state / "q" / s2.quarantine_run)["items"]) == 1
+
+
+def test_save_refuses_a_manifest_it_did_not_write(state):
+    a = quarantine.new_run()
+    a.items.append({"original": "x", "stored": "y", "size": 1})
+    a.save()
+    before = (a.dir / "manifest.json").read_bytes()
+    b = quarantine.Quarantine(a.run_id)
+    b._claimed = True  # as if it had (wrongly) got the same directory
+    with pytest.raises(quarantine.ManifestConflict):
+        b.save()
+    assert (a.dir / "manifest.json").read_bytes() == before
+    a.items.append({"original": "z", "stored": "w", "size": 1})
+    a.save()  # the owner can still update it
+
+
+def test_save_fsyncs_and_retries_permission_error(state, monkeypatch):
+    synced, attempts = [], [0]
+    real_fsync, real_replace = quarantine.os.fsync, quarantine._replace
+    monkeypatch.setattr(quarantine.os, "fsync", lambda fd: synced.append(fd) or real_fsync(fd))
+    monkeypatch.setattr(quarantine.time, "sleep", lambda s: None)
+
+    def flaky(src, dst):
+        attempts[0] += 1
+        if attempts[0] < 3:
+            raise PermissionError(13, "in use")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(quarantine, "_replace", flaky)
+    run = quarantine.new_run()
+    run.save()
+    assert synced and attempts[0] == 3
+    assert (run.dir / "manifest.json").is_file()
+    assert not list(run.dir.glob(".manifest.*"))
+
+
+def test_vetoed_registry_clean_saves_no_empty_run(state, fake_registry):
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    reg.add_key("HKCU", FOO, {"New": (REG_SZ, "x")})
+    summary = service.clean([item], Config(), dry_run=False, use_quarantine=False)
+    assert summary.removed == 0 and summary.quarantine_run is None
+    assert quarantine.list_runs() == []
+
+
+# -- I1: strict backup-elsewhere -------------------------------------------------------------
+def test_elsewhere_refuses_hkcu(state, fake_registry):
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    run = quarantine.new_run()
+    run.store_registry(item, reg)  # even with a backup
+    reg.calls.clear()
+    s = service.clean([item], Config(), dry_run=False, use_quarantine=False,
+                      record_history=False, registry_backup_elsewhere=True,
+                      registry_backup_dir=run.dir)
+    assert s.removed == 0
+    assert "backup is required for this entry" in s.errors[0].error
+    assert _writes(reg) == [] and reg.key_exists("HKCU", FOO)
+
+
+def test_elsewhere_hklm_without_valid_backup_refused(state, fake_registry, monkeypatch, tmp_path):
+    monkeypatch.setattr(winenv, "is_admin", lambda: True)
+    reg = fake_registry
+    _foo_tree(reg, hive="HKLM")
+    reg.add_key("HKLM", UNINST + r"\Bar", {"DisplayName": (REG_SZ, "Bar")})
+    item = _item(reg, hive="HKLM")
+    other = _item(reg, hive="HKLM", key=UNINST + r"\Bar")
+    run = quarantine.new_run()
+    run.store_registry(other, reg)  # a backup, but of another entry
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    for d in (None, empty, run.dir):
+        s = service.clean([item], Config(), dry_run=False, use_quarantine=False,
+                          record_history=False, registry_backup_elsewhere=True,
+                          registry_backup_dir=d)
+        assert s.removed == 0, d
+        assert "backup is required for this entry" in s.errors[0].error
+    # A tampered backup of the right entry does not count either.
+    run.store_registry(item, reg)
+    jp = Path(run.items[-1]["json"])
+    doc = json.loads(jp.read_text(encoding="ascii"))
+    doc["snapshot"]["values"][0]["data"] = "tampered"
+    jp.write_text(json.dumps(doc), encoding="ascii")
+    s = service.clean([item], Config(), dry_run=False, use_quarantine=False,
+                      record_history=False, registry_backup_elsewhere=True,
+                      registry_backup_dir=run.dir)
+    assert s.removed == 0
+    assert _writes(reg) == [] and reg.key_exists("HKLM", FOO + r"\Sub\Deeper")
+
+
+def test_elsewhere_partial_names_backup_location(state, fake_registry, monkeypatch):
+    monkeypatch.setattr(winenv, "is_admin", lambda: True)
+    reg = fake_registry
+    _foo_tree(reg, hive="HKLM")
+    item = _item(reg, hive="HKLM")
+    run = quarantine.new_run()
+    run.store_registry(item, reg)
+    real_delete, n = reg.delete_key, [0]
+
+    def flaky(hive, key):
+        n[0] += 1
+        if n[0] == 2:
+            raise RegistryError("in use")
+        return real_delete(hive, key)
+
+    reg.delete_key = flaky
+    s = service.clean([item], Config(), dry_run=False, use_quarantine=False,
+                      record_history=False, registry_backup_elsewhere=True,
+                      registry_backup_dir=run.dir)
+    err = s.errors[0].error
+    assert err.startswith("partially deleted") and str(run.dir) in err
+
+
+# -- I2: machine restore needs confirmation, ownership ---------------------------------------
+def _hklm_run(reg, monkeypatch):
+    monkeypatch.setattr(winenv, "is_admin", lambda: True)
+    _foo_tree(reg, hive="HKLM")
+    item = _item(reg, hive="HKLM")
+    s = service.clean([item], Config(), dry_run=False, use_quarantine=False)
+    assert s.removed == 1, s.errors
+    return item, s.quarantine_run
+
+
+def test_hklm_restore_needs_explicit_confirmation(state, fake_registry, monkeypatch):
+    from cleanix.core import regbackup
+
+    reg = fake_registry
+    item, run_id = _hklm_run(reg, monkeypatch)
+    monkeypatch.setattr(regbackup, "owner_is_current_user", lambda p: True)
+    res = quarantine.restore(run_id)  # admin, but not confirmed
+    (_orig, reason), = res["failed"]
+    assert f"cleanix restore {run_id}" in reason and "reg import" in reason
+    assert not reg.key_exists("HKLM", FOO)
+    lines = quarantine.describe_registry_entries(run_id)
+    assert lines == quarantine.Quarantine.describe_registry_entries(run_id)
+    assert "HKLM\\" + FOO in lines
+    assert "HKLM\\" + FOO + " [DisplayName]" in lines
+    assert "HKLM\\" + FOO + r"\Sub\Deeper [B]" in lines
+    res = quarantine.restore(run_id, allow_machine_restore=True)
+    assert res == {"restored": [item.reg.display], "failed": []}
+    assert reg.key_exists("HKLM", FOO + r"\Sub\Deeper")
+
+
+@pytest.mark.parametrize("owner", [None, False])
+def test_hklm_restore_refused_when_owner_not_verified(state, fake_registry, monkeypatch, owner):
+    from cleanix.core import regbackup
+
+    reg = fake_registry
+    _it, run_id = _hklm_run(reg, monkeypatch)
+    monkeypatch.setattr(regbackup, "owner_is_current_user", lambda p: owner)
+    reg.calls.clear()
+    res = quarantine.restore(run_id, allow_machine_restore=True)
+    (_orig, reason), = res["failed"]
+    assert reason.startswith("refused")
+    assert _writes(reg) == [] and not reg.key_exists("HKLM", FOO)
+
+
+def test_hkcu_restore_refused_only_for_foreign_owner(state, fake_registry, monkeypatch):
+    from cleanix.core import regbackup
+
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    s = service.clean([item], Config(), dry_run=False, use_quarantine=False)
+    monkeypatch.setattr(regbackup, "owner_is_current_user", lambda p: False)
+    res = quarantine.restore(s.quarantine_run)
+    assert res["failed"][0][1].startswith("refused: the backup file is not owned")
+    monkeypatch.setattr(regbackup, "owner_is_current_user", lambda p: None)
+    res = quarantine.restore(s.quarantine_run)  # unknown owner: HKCU as today
+    assert res == {"restored": [item.reg.display], "failed": []}
+
+
+class _Sec:
+    def __init__(self, owner, user="S-1-5-21-1", admins=None, boom=False):
+        self.owner, self.user, self.admins, self.boom = owner, user, admins, boom
+
+    def file_owner(self, path):
+        if self.boom:
+            raise OSError("ctypes failed")
+        return self.owner
+
+    def user_sid(self):
+        return self.user
+
+    def admins_sid_if_member(self):
+        return self.admins
+
+
+@pytest.mark.parametrize("sec, expected", [
+    (_Sec("S-1-5-21-1"), True),
+    (_Sec("S-1-5-21-2"), False),
+    (_Sec("S-1-5-32-544", admins="S-1-5-32-544"), True),
+    (_Sec("S-1-5-32-544", admins=None), False),
+    (_Sec(None), None),
+    (_Sec("S-1-5-21-1", user=None), None),
+    (_Sec("S-1-5-21-1", boom=True), None),
+])
+def test_owner_is_current_user_windows_mocked(monkeypatch, tmp_path, sec, expected):
+    from cleanix.core import regbackup
+
+    monkeypatch.setattr(regbackup.sys, "platform", "win32")
+    monkeypatch.setattr(regbackup, "_win_security", lambda: sec)
+    assert regbackup.owner_is_current_user(tmp_path / "f") is expected
+
+
+def test_owner_is_current_user_posix_mocked(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from cleanix.core import regbackup
+
+    monkeypatch.setattr(regbackup.sys, "platform", "linux")
+    monkeypatch.setattr(regbackup.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(regbackup, "_lstat", lambda p: SimpleNamespace(st_uid=1000))
+    assert regbackup.owner_is_current_user(tmp_path / "f") is True
+    monkeypatch.setattr(regbackup, "_lstat", lambda p: SimpleNamespace(st_uid=0))
+    assert regbackup.owner_is_current_user(tmp_path / "f") is False
+
+
+@pytest.mark.skipif(__import__("sys").platform != "win32", reason="real Windows security API")
+def test_owner_is_current_user_windows_real(tmp_path):
+    from cleanix.core import regbackup
+
+    f = tmp_path / "mine.json"
+    f.write_text("{}", encoding="ascii")
+    assert regbackup.owner_is_current_user(f) is True
+
+
+# -- I3: pin the delete path ---------------------------------------------------------------------
+def test_link_planted_between_target_and_leaf_refused(state, fake_registry):
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    real = reg.can_delete
+
+    def plant(hive, key, value):
+        r = real(hive, key, value)
+        if key == FOO:  # the last preflight call, after the step-2 snapshot
+            reg.add_key("HKCU", FOO + r"\Sub", link=True)
+        return r
+
+    reg.can_delete = plant
+    with pytest.raises(regclean.RegistryChanged):
+        regclean.delete_target(reg, "win_reg_uninstall", item.reg, is_admin=False)
+    assert _writes(reg) == []
+
+
+def test_ancestor_changed_between_deletes_stops(state, fake_registry):
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    real = reg.delete_key
+
+    def then_link_ancestor(hive, key):
+        real(hive, key)
+        reg.add_key("HKCU", UNINST, link=True)
+
+    reg.delete_key = then_link_ancestor
+    with pytest.raises(regclean.PartialDelete):
+        regclean.delete_target(reg, "win_reg_uninstall", item.reg, is_admin=False)
+    assert [c[2] for c in reg.calls if c[0] == "delete_key"] == [FOO + r"\Sub\Deeper"]
+
+
+def test_value_changed_just_before_delete_value(state, fake_registry):
+    reg = fake_registry
+    reg.add_key("HKCU", RUN, {"GoneApp": (REG_SZ, r"C:\Gone\app.exe")})
+    item = _item(reg, cid="win_reg_startup", key=RUN, value="GoneApp")
+    real = reg.can_delete
+
+    def change(hive, key, value):
+        r = real(hive, key, value)
+        reg.add_key("HKCU", RUN, {"GoneApp": (REG_SZ, r"C:\Live\app.exe")})
+        return r
+
+    reg.can_delete = change
+    with pytest.raises(regclean.RegistryChanged):
+        regclean.delete_target(reg, "win_reg_startup", item.reg, is_admin=False)
+    assert _writes(reg) == []
+
+
+def test_value_preflight_denied(state, fake_registry):
+    reg = fake_registry
+    reg.add_key("HKCU", RUN, {"GoneApp": (REG_SZ, r"C:\Gone\app.exe")}, deny_delete=True)
+    item = _item(reg, cid="win_reg_startup", key=RUN, value="GoneApp")
+    with pytest.raises(AccessDenied):
+        regclean.delete_target(reg, "win_reg_startup", item.reg, is_admin=False)
+    assert not [c for c in reg.calls if c[0] == "delete_value"]
+
+
+def test_two_items_different_outcomes_exact_flags(state, fake_registry):
+    reg = fake_registry
+    _foo_tree(reg)
+    reg.add_key("HKCU", UNINST + r"\Bar", {"DisplayName": (REG_SZ, "Bar")})
+    a, b = _item(reg), _item(reg, key=UNINST + r"\Bar")
+    run = quarantine.new_run()
+
+    class SecondRacy:
+        run_id = run.run_id
+
+        def before_delete(self, it, backend):
+            run.store_registry(it, backend)
+            if it is b:
+                reg.add_key("HKCU", UNINST + r"\Bar", {"X": (REG_SZ, "new")})
+
+        def after_delete(self, it, deleted):
+            run.mark_registry(it, deleted)
+
+    res = Engine([]).clean([a, b], dry_run=False, registry_backup=SecondRacy())
+    assert [o.removed for o in res.outcomes] == [True, False]
+    assert [e["deleted"] for e in _manifest(run.dir)["items"]] == [True, False]
+    assert [e["deleted"] for e in run.items] == [True, False]
+    res = quarantine.restore(run.run_id)
+    assert res == {"restored": [a.reg.display], "failed": []}
+    assert reg.key_exists("HKCU", FOO + r"\Sub\Deeper")
+
+
+def test_unknown_deleted_state_is_restored(state, fake_registry):
+    """``deleted: None`` (a crash or a failed after_delete) still restores."""
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    run = quarantine.new_run()
+    run.store_registry(item, reg)
+    regclean.delete_target(reg, "win_reg_uninstall", item.reg, is_admin=False)
+    assert _manifest(run.dir)["items"][0]["deleted"] is None
+    res = quarantine.restore(run.run_id)
+    assert res == {"restored": [item.reg.display], "failed": []}
+
+
+def test_failure_after_target_gone_is_partial_not_intact(state, fake_registry):
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    run = quarantine.new_run()
+    real = reg.delete_key
+
+    def delete_then_fail(hive, key):
+        real(hive, key)
+        if key == FOO:
+            raise RegistryError("reported failure after deleting")
+
+    reg.delete_key = delete_then_fail
+    o = Engine([]).clean([item], dry_run=False, registry_backup=run).outcomes[0]
+    assert o.error.startswith("partially deleted")
+    assert _manifest(run.dir)["items"][0]["deleted"] is True
+
+
+# -- minors ---------------------------------------------------------------------------------------
+def test_entry_gone_since_scan_is_changed_not_blocked(state, fake_registry):
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    for k in (FOO + r"\Sub\Deeper", FOO + r"\Sub", FOO):
+        reg.delete_key("HKCU", k)
+    run = quarantine.new_run()
+    o = Engine([]).clean([item], dry_run=False, registry_backup=run).outcomes[0]
+    assert o.error == "changed since the scan; scan again"
+    assert run.items == []
+
+
+def test_mark_save_failure_is_reported_and_consistent(state, fake_registry, monkeypatch):
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    run = quarantine.new_run()
+    real_save, n = run.save, [0]
+
+    def save():
+        n[0] += 1
+        if n[0] >= 2:  # every save after the backup entry fails
+            raise OSError("disk full")
+        return real_save()
+
+    monkeypatch.setattr(run, "save", save)
+    o = Engine([]).clean([item], dry_run=False, registry_backup=run).outcomes[0]
+    assert o.removed is True
+    assert o.error.startswith("deleted, but the undo record could not be updated")
+    assert "cleanix restore is still safe" in o.error
+    assert n[0] == 3  # the result save was tried twice
+    assert run.items[0]["deleted"] is None
+    assert _manifest(run.dir)["items"][0]["deleted"] is None
+    assert not reg.key_exists("HKCU", FOO)
+
+
+def test_non_dict_manifest_items_do_not_crash(state):
+    root = state / "q" / "r1"
+    root.mkdir(parents=True)
+    (root / "manifest.json").write_text(json.dumps({
+        "run_id": "r1", "created": 1.0,
+        "items": ["x", 5, {"type": "registry"}, {"type": "registry", "deleted": False}],
+    }), encoding="utf-8")
+    row, = quarantine.list_runs()
+    assert row["count"] == 4 and row["registry"] == 2 and row["size"] == 0
+    res = quarantine.restore("r1")
+    assert res["restored"] == []
+    reasons = [r for _o, r in res["failed"]]
+    assert len(reasons) == 3  # the deleted:False entry is skipped
+    assert reasons[0] == reasons[1] == "invalid manifest entry"
+    assert reasons[2].startswith("not a registry backup file")
+    (root / "manifest.json").write_text("[1, 2]", encoding="utf-8")
+    assert quarantine.list_runs() == []
+
+
+def test_list_runs_removed_count(state, fake_registry):
+    reg = fake_registry
+    _foo_tree(reg)
+    reg.add_key("HKCU", UNINST + r"\Bar", {"DisplayName": (REG_SZ, "Bar")})
+    a, b = _item(reg), _item(reg, key=UNINST + r"\Bar")
+    run = quarantine.new_run()
+    Engine([]).clean([a], dry_run=False, registry_backup=run)
+    run.store_registry(b, reg)
+    run.mark_registry(b, False)
+    row, = quarantine.list_runs()
+    assert row["registry"] == 2 and row["removed_count"] == 1
