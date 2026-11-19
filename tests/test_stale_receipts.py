@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import plistlib
+import sys
 from pathlib import Path
+
+import pytest
 
 from cleanix.cleaners import base, orphan_common as oc, stale_receipts as sr
 from cleanix.config import Config
@@ -94,8 +97,10 @@ def test_stale_receipt_reported(orphan_env):
         "/private/var/db/receipts/com.vendor.gone.plist"
     )
     assert it.hint == (
-        "See what it installed: pkgutil --files com.vendor.gone. "
-        "To drop only the record: sudo pkgutil --forget com.vendor.gone."
+        "This package may no longer be installed. After confirming with "
+        "`pkgutil --pkg-info com.vendor.gone` and `pkgutil --files "
+        "com.vendor.gone`, you can drop only that record: "
+        "sudo pkgutil --forget com.vendor.gone"
     )
 
 
@@ -164,12 +169,113 @@ def test_unsafe_ids_skipped(orphan_env):
         assert "-evil" not in argv and "a/b" not in argv
 
 
-def test_only_first_fifty_files_sampled(orphan_env):
+BIG = [f"usr/local/vendor/f{i:03d}" for i in range(400)]
+
+
+def test_sample_is_stratified_and_deterministic():
+    files = sorted(BIG)
+    a = sr.sample_files("com.big.gone", files)
+    assert a == sr.sample_files("com.big.gone", files)
+    assert len(a) == 150 and len(set(a)) == 150
+    assert a[:25] == files[:25] and a[-25:] == files[-25:]
+    assert a != sr.sample_files("com.other.id", files)
+    assert sr.sample_files("x", files[:100]) == files[:100]
+
+
+def test_file_beyond_index_fifty_present_is_not_stale(orphan_env):
     env = orphan_env
     _pkgs(env, ["com.big.gone"])
-    files = [f"Big.app/f{i}" for i in range(80)]
-    _fake(env, "com.big.gone", files)
-    _present(env, "Applications/Big.app/f10")  # inside the sample
+    _fake(env, "com.big.gone", BIG, plist=_plist(loc="/", pkgid="com.big.gone"))
+    files = sorted(BIG)
+    sample = sr.sample_files("com.big.gone", files)
+    late = next(f for f in sample if files.index(f) > 60)
+    assert files.index(late) > 50
+    _present(env, late)
+    assert _stale(_scan(env)) == []
+
+
+def test_big_receipt_all_missing_is_stale(orphan_env):
+    env = orphan_env
+    _pkgs(env, ["com.big.gone"])
+    # unsorted pkgutil output must not matter
+    _fake(env, "com.big.gone", list(reversed(BIG)),
+          plist=_plist(loc="/", pkgid="com.big.gone"))
+    assert len(_stale(_scan(env))) == 1
+
+
+def test_shared_root_with_file_present_not_stale(orphan_env):
+    env = orphan_env
+    _pkgs(env, ["com.tool.x"])
+    _fake(env, "com.tool.x", ["usr/local/bin/tool"],
+          plist=_plist(loc="/", pkgid="com.tool.x"))
+    _present(env, "usr/local/bin/tool")
+    assert _stale(_scan(env)) == []
+
+
+def test_shared_root_all_missing_is_stale(orphan_env):
+    env = orphan_env
+    _pkgs(env, ["com.tool.x"])
+    _fake(env, "com.tool.x", ["usr/local/bin/tool"],
+          plist=_plist(loc="/", pkgid="com.tool.x"))
+    assert len(_stale(_scan(env))) == 1
+
+
+def test_staging_and_unstable_locations_not_reported(orphan_env):
+    env = orphan_env
+    locs = {
+        "com.s.tmp": "/tmp/stage",
+        "com.s.ptmp": "private/tmp/x",
+        "com.s.folders": "private/var/folders/ab/cd",
+        "com.s.vfolders": "/var/folders/ab",
+        "com.s.missing": "opt/vendor/missing",
+    }
+    _pkgs(env, list(locs))
+    for pid, loc in locs.items():
+        _fake(env, pid, GONE_FILES, plist=_plist(loc=loc, pkgid=pid))
+    assert _stale(_scan(env)) == []
+
+
+def test_renamed_or_moved_app_not_stale(orphan_env):
+    env = orphan_env
+    ids = ["com.m.utilities", "com.m.user", "com.m.library", "com.m.system",
+           "com.m.gone"]
+    _pkgs(env, ids)
+    for pid, app in zip(ids, ["A", "B", "C", "D", "E"]):
+        _fake(env, pid, [f"{app}.app/Contents/MacOS/x", f"{app}.app/Contents/Info.plist"])
+    _present(env, "Applications/Utilities/A.app/Contents/Info.plist")
+    _present(env, "Users/bob/Applications/B.app/Contents/Info.plist")
+    _present(env, "Library/C.app/Contents/Info.plist")
+    _present(env, "System/Applications/D.app/Contents/Info.plist")
+    items = _stale(_scan(env))
+    assert [i.description.rsplit(" ", 1)[1] for i in items] == ["com.m.gone"]
+
+
+def test_bundle_in_install_location_not_stale(orphan_env):
+    env = orphan_env
+    _pkgs(env, ["com.vendor.gone"])
+    _fake(env, "com.vendor.gone", GONE_FILES)
+    (env.root / "Applications/Gone.app").mkdir(parents=True)
+    assert _stale(_scan(env)) == []
+
+
+def test_non_ascii_id_skipped(orphan_env):
+    env = orphan_env
+    _pkgs(env, ["com.vendor.göne"])
+    _fake(env, "com.vendor.göne", GONE_FILES)
+    report = _scan(env)
+    assert _stale(report) == []
+    assert not [c for c in env.cmds.calls if c[1] == "--pkg-info-plist"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX symlinks")
+def test_symlinked_receipt_skipped(orphan_env):
+    env = orphan_env
+    _pkgs(env, ["com.vendor.gone"])
+    _fake(env, "com.vendor.gone", GONE_FILES, receipt=None)
+    rdir = env.root / "private/var/db/receipts"
+    rdir.mkdir(parents=True)
+    (rdir / "real.dat").write_text("x")
+    (rdir / "com.vendor.gone.plist").symlink_to("real.dat")  # relative target
     assert _stale(_scan(env)) == []
 
 
@@ -203,15 +309,86 @@ def test_budget_limits_pkgutil_calls(orphan_env):
     cfg = Config()
     cfg.orphan_max_items = 5
     report = sr.StaleReceiptReporter(cfg).scan()
+    # Receipts cost no budget slot; only the 5 findings do. The 6th finding
+    # is generated (6 receipts examined) and then refused, giving one note.
     info = [c for c in env.cmds.calls if c[1] == "--pkg-info-plist"]
-    assert len(info) <= 5
+    files = [c for c in env.cmds.calls if c[1] == "--only-files"]
+    assert len(info) == 6 and len(files) == 6
     notes = [i for i in report.items if "stopped early" in i.description]
     assert len(notes) == 1
-    assert len(_stale(report)) <= 5
+    assert len(_stale(report)) == 5
+    assert [i.description.rsplit(" ", 1)[1] for i in _stale(report)] == ids[:5]
 
 
-def test_pkgs_failure_yields_nothing(orphan_env):
+def test_non_findings_do_not_consume_budget(orphan_env):
+    env = orphan_env
+    ids = [f"com.vendor.k{i:03d}" for i in range(40)]
+    _pkgs(env, ids)
+    for i in ids:
+        _fake(env, i, GONE_FILES)
+        _present(env, "Applications/Gone.app/Contents/Info.plist")
+    cfg = Config()
+    cfg.orphan_max_items = 3
+    report = sr.StaleReceiptReporter(cfg).scan()
+    assert len([c for c in env.cmds.calls if c[1] == "--pkg-info-plist"]) == 40
+    assert not [i for i in report.items if "stopped early" in i.description]
+
+
+def test_time_budget_stops_scan_with_one_note(orphan_env):
+    env = orphan_env
+    ids = [f"com.vendor.t{i:03d}" for i in range(10)]
+    _pkgs(env, ids)
+    for i in ids:
+        _fake(env, i, GONE_FILES)
+    ticks = iter(range(0, 1000))
+    rep = sr.StaleReceiptReporter(Config())
+    rep.budget = oc.ScanBudget(200, 3.5, clock=lambda: float(next(ticks)))
+    rep._reset = lambda: None  # keep the injected budget
+    report = rep.scan()
+    notes = [i for i in report.items if "stopped early" in i.description]
+    assert len(notes) == 1 and "time limit" in notes[0].description
+    assert len([c for c in env.cmds.calls if c[1] == "--pkg-info-plist"]) < 10
+
+
+def test_call_timeout_never_exceeds_budget(orphan_env, monkeypatch):
+    env = orphan_env
+    _pkgs(env, ["com.vendor.gone"])
+    _fake(env, "com.vendor.gone", GONE_FILES)
+    seen = []
+    real = oc.run
+
+    def spy(argv, timeout=60):
+        seen.append(timeout)
+        return real(argv, timeout)
+
+    monkeypatch.setattr(oc, "run", spy)
+    cfg = Config()
+    cfg.orphan_max_seconds = 5.0
+    sr.StaleReceiptReporter(cfg).scan()
+    assert seen and all(1 <= t <= 5 for t in seen)
+
+
+def test_pkgs_failure_emits_note(orphan_env):
     env = orphan_env
     env.cmds.tools.add("pkgutil")
     env.cmds.on(("pkgutil", "--pkgs"), rc=1)
-    assert _stale(_scan(env)) == []
+    report = _scan(env)
+    assert _stale(report) == []
+    assert [i.description for i in report.items] == [
+        "Not checked: could not list installer receipts"
+    ]
+    assert all(i.size == 0 for i in report.items)
+
+
+def test_unchecked_receipts_aggregated_in_one_note(orphan_env):
+    env = orphan_env
+    ids = ["com.r.a", "com.r.b", "com.r.c", "com.r.ok"]
+    _pkgs(env, ids)
+    _fake(env, "com.r.a", GONE_FILES, plist_rc=1)
+    _fake(env, "com.r.b", GONE_FILES, plist="<<bad>>")
+    _fake(env, "com.r.c", GONE_FILES, files_rc=2)
+    _fake(env, "com.r.ok", GONE_FILES)
+    report = _scan(env)
+    notes = [i for i in report.items if "could not be checked" in i.description]
+    assert [n.description for n in notes] == ["3 receipts could not be checked"]
+    assert len(_stale(report)) == 1
