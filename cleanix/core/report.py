@@ -40,6 +40,8 @@ def render_scan_table(
             table.add_row(report.name, "0", "-", "clean")
             continue
         note = report.description
+        if report.incomplete:
+            note = f"[yellow]incomplete: {report.incomplete}[/yellow]"
         size_cell = human_size(report.total_size)
         if report.report_only:
             note = "[yellow]report only — review manually[/yellow]"
@@ -128,6 +130,7 @@ def scan_to_dict(result: ScanResult) -> Dict[str, Any]:
                 "name": r.name,
                 "ran": r.ran,
                 "skipped_reason": r.skipped_reason,
+                "incomplete": r.incomplete,
                 "count": r.count,
                 "bytes": r.total_size,
                 "human": human_size(r.total_size),

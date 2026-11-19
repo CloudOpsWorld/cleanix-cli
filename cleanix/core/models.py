@@ -134,6 +134,9 @@ class CleanerReport:
     description: str
     items: List[CleanableItem] = field(default_factory=list)
     skipped_reason: Optional[str] = None  # set when the cleaner could not run
+    # set when the cleaner ran but could not examine everything (items listed
+    # are real, the list may be partial)
+    incomplete: Optional[str] = None
 
     @property
     def total_size(self) -> int:

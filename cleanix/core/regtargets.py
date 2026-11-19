@@ -242,10 +242,13 @@ def _canon(path: str) -> str:
     return ntpath.normpath(_unwrap(path))
 
 
-def _under(path: str, root: str) -> bool:
+def under(path: str, root: str) -> bool:
     p = path.casefold().rstrip("\\")
     r = root.casefold().rstrip("\\")
     return bool(r) and (p == r or p.startswith(r + "\\"))
+
+
+_under = under  # old private name
 
 
 def _first_component_after(path: str, root: str) -> str:
@@ -295,15 +298,15 @@ class WinProber:
         self._lstat = lstat
 
     def _microsoft_owned(self, path: str) -> bool:
-        if self._system_root and _under(path, self._system_root):
+        if self._system_root and under(path, self._system_root):
             return True
         for pf in self._program_files:
-            if _under(path, pf):
+            if under(path, pf):
                 first = _first_component_after(path, pf)
                 if first.startswith(("windows", "microsoft", "internet explorer")):
                     return True
         for base in (self._program_data, self._local_appdata):
-            if base and _under(path, base):
+            if base and under(path, base):
                 if _first_component_after(path, base).startswith("microsoft"):
                     return True
         return False
@@ -418,7 +421,7 @@ def _one_state(
     if machine:
         for c in cands:
             canon = _canon(c)
-            if _under(canon, ctx.profiles_root):
+            if under(canon, ctx.profiles_root):
                 return Existence.UNKNOWN
             # Moved profiles: any \Users\ on any drive is per-user territory.
             if _DRIVE_ABS.match(canon) and canon[3:].split("\\", 1)[0].casefold() == "users":
