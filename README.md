@@ -29,7 +29,7 @@ Cleaners declare which platforms they apply to; `cleanix` auto-detects the OS
 | FreeBSD  | `freebsd`                          | pkg cache + autoremove, ports distfiles & work dirs |
 | NetBSD   | `netbsd`                           | pkg, pkgin cache |
 | OpenBSD  | `openbsd`                          | pkg |
-| Windows  | `windows`                          | `%TEMP%`, thumbnail/icon caches, error reports & crash dumps, Recycle Bin, Windows Update/Delivery Optimization cache, system temp & dumps (admin), browser caches (Chrome/Edge/Brave/Firefox), DirectX/NVIDIA/AMD shader caches, WinGet/Chocolatey/Scoop/NuGet caches, Visual Studio cache; report-only: Prefetch, `Windows.old`, WSL disks; opt-in: DISM component store; Task Scheduler |
+| Windows  | `windows`                          | `%TEMP%`, thumbnail/icon caches, error reports & crash dumps, Recycle Bin, Windows Update/Delivery Optimization cache, system temp & dumps (admin), browser caches (Chrome/Edge/Brave/Firefox), DirectX/NVIDIA/AMD shader caches, WinGet/Chocolatey/Scoop/NuGet caches, Visual Studio cache; report-only: Prefetch, `Windows.old`, WSL disks; opt-in: DISM component store, dead registry entries (see [Windows registry cleaners](#windows-registry-cleaners-opt-in)); Task Scheduler |
 | Cross-OS | all of the above                   | trash, thumbnails, ~/.cache, temp files, fonts, browser caches, broken symlinks, `.DS_Store`/AppleDouble, dev/language caches (cargo/go/gradle/ccache/composer/…), pip, npm/yarn, Docker, Podman |
 
 Run `cleanix list` to see what applies to your machine, or `cleanix list --all`
@@ -38,7 +38,11 @@ to see every platform's cleaners.
 ## Windows notes
 
 - Config is `%APPDATA%\cleanix\config.yaml`; state, history and quarantine live
-  under `%LOCALAPPDATA%\cleanix`. Cleanix never touches the registry.
+  under `%LOCALAPPDATA%\cleanix`. Cleanix touches the registry only through
+  the five opt-in registry cleaners (see
+  [Windows registry cleaners](#windows-registry-cleaners-opt-in)): they are
+  never part of a normal scan or clean, never run from the scheduled scan, and
+  every other cleaner leaves the registry alone.
 - Items that need admin rights (`win_system_temp`, `win_update_cache`,
   `win_system_dumps`, DISM) require an **elevated terminal** (Run as
   administrator); otherwise they are skipped with a note.
@@ -46,8 +50,12 @@ to see every platform's cleaners.
   are sized and explained, never deleted.
 - **DISM component-store cleanup is opt-in:**
   `cleanix clean --only win_component_store --execute` (elevated).
-- **Quarantine covers path-based items only.** Command items such as emptying
-  the Recycle Bin and DISM cannot be undone with `cleanix restore`.
+- **Quarantine moves path-based items only.** Command items such as emptying
+  the Recycle Bin and DISM cannot be undone with `cleanix restore`. Registry
+  entries are not moved: before one is deleted, a `.reg` and a `.json` backup
+  of it is written into a quarantine run (even when "keep a copy" is off).
+  Whether Cleanix promises that these can be restored is a separate, gated
+  statement; see [Windows registry cleaners](#windows-registry-cleaners-opt-in).
 - `cleanix schedule install` creates a per-user, scan-only Task Scheduler task
   named "Cleanix Scan" (it never cleans). It does not raise a notification:
   the JSON report at `%LOCALAPPDATA%\cleanix\last-scan.json` is the output.
@@ -379,6 +387,16 @@ These are always permanent and cannot be undone:
   containers;
 - anything cleaned with "keep a copy" unticked.
 
+Registry entries (Windows, Power mode only; Simple mode never cleans them) are
+backed up in every case, but the Undo promise for them is **gated**: until the
+checks in [docs/registry-cleanup-verification.md](docs/registry-cleanup-verification.md)
+have been run on a real Windows machine, the GUI and the CLI say that registry
+entries are removed permanently and that no backup or restore is available in
+this version. Once the promise is switched on, per-user (`HKCU`) entries can be
+restored from the Quarantine tab or with `cleanix restore <run>`, and
+machine-wide (`HKLM`) entries only from an Administrator terminal (never from
+the GUI).
+
 **Administrator permission.** The GUI never runs as root: on Linux, macOS and
 the BSDs it refuses to start when run as root (`sudo cleanix gui`) and asks
 for administrator permission itself when needed. When you clean items
@@ -405,7 +423,10 @@ entries. On macOS and the BSDs it is the same rule (default-enabled system
 cleaners that need root and support the platform, plus `temp`). The opt-in
 memory/swap actions are never included. On Windows it is 4 cleaners:
 `win_system_temp`, `win_system_dumps`, `win_update_cache` and
-`win_component_store` (not `temp`). The GUI offers only administrator items
+`win_component_store` (not `temp`), plus the five registry detectors
+(`win_reg_uninstall`, `win_reg_app_paths`, `win_reg_file_assoc`,
+`win_reg_startup`, `win_reg_shared_dlls`), for which it deletes `HKLM` entries
+only and never `HKCU`. The GUI offers only administrator items
 the helper would clean; the rest are shown read-only with the reason. It uses
 built-in default settings and ignores most of your config: only
 `protected_globs` is honoured, since it can only add protection. It never
@@ -588,12 +609,101 @@ Restoring a run that contains `HKLM` entries also needs an Administrator
 terminal: `cleanix restore` prints exactly what will be written and asks you
 to type `yes` (`--yes` is accepted only together with an explicit run id).
 
-What the CLI promises about backups follows what this version ships. While
-registry undo is not shipped, the CLI says registry entries are removed
-permanently and no backup or restore is available. Once shipped, `HKCU`
-entries are backed up before removal and can be restored with
+What the CLI promises about backups follows what this version ships (see
+"Undo status" below). While registry undo is not shipped, the CLI says registry
+entries are removed permanently and no backup or restore is available. Once
+shipped, `HKCU` entries are backed up before removal and can be restored with
 `cleanix restore <run>`; `HKLM` entries are backed up too, but restoring them
 needs an Administrator terminal.
+
+#### What the registry cleaners do, and do not do
+
+They list an entry only when every piece of evidence the detector needs is
+**provably missing**. "Unknown is not dead": an unreadable key, a network or
+removable drive, a variable that cannot be expanded, a host program such as
+`msiexec` or `rundll32`, anything under the Windows directory, Microsoft- or
+Store-owned locations, an MSI- or Burn-managed uninstall entry, or an entry
+whose structure the detector does not recognise is never listed. For
+machine-wide entries, targets under `C:\Users` are also unknown (they belong to
+another user's per-user install).
+
+- `win_reg_uninstall`: `Uninstall` keys (including the 32-bit `WOW6432Node`
+  view) whose install folder **and** uninstaller are gone.
+- `win_reg_app_paths`: `App Paths\<name>.exe` entries whose program is gone.
+- `win_reg_file_assoc`: "open with" handlers (a class with a
+  `shell\...\command` and an optional `DefaultIcon`) whose programs and icons
+  are all gone.
+- `win_reg_startup`: `Run` and `RunOnce` values for programs that no longer
+  exist. Nothing is "disabled": live startup entries are never touched.
+- `win_reg_shared_dlls`: `SharedDLLs` counters for files that no longer exist.
+
+They never claim to speed up Windows or free space (registry items have size 0
+and are never counted in "freed"), never delete a live entry, never touch
+`HKEY_CLASSES_ROOT`, `HKEY_USERS`, `HKEY_CURRENT_CONFIG`, Windows Installer,
+policy or Explorer keys, and open only the 64-bit registry view
+(`KEY_WOW64_64KEY`; the 32-bit view is reached only through explicit
+`WOW6432Node` paths, also from a 32-bit Python). The findings are always
+labelled **Review** in the GUI. `--all-users` does not load other users'
+hives: `HKCU` is the registry of the account running Cleanix (in an elevated
+terminal that is the administrator's, which is why elevated scans do not judge
+`HKCU` handlers).
+
+**Backups.** A registry entry is deleted only after a backup of exactly what
+was scanned has been written and read back (a failed backup means nothing is
+deleted), and only if the entry is still what the scan saw (its fingerprint is
+part of the item key); otherwise it is reported as "changed since the scan;
+scan again". Each removed entry gets two files in a quarantine run,
+`N__registry.reg` (UTF-16 with BOM, `Windows Registry Editor Version 5.00`;
+readable in Notepad, usable with `reg import`) and `N__registry.json` (typed
+values, the source Cleanix's own restore uses). Restore re-creates missing keys
+and values additively, refuses any entry whose values differ, validates every
+path again and checks that the result equals the backup. Security descriptors
+are not backed up: a restored key inherits its parent's permissions.
+
+**Undo status (gated).** The backup code is shipped and unit-tested against an
+in-memory registry, but several Windows behaviours it relies on can only be
+confirmed on a real machine (registry link handling, `REG_MULTI_SZ` with empty
+strings, the 64-bit view, `reg export`/`reg import` agreement). Until the manual
+verification in
+[docs/registry-cleanup-verification.md](docs/registry-cleanup-verification.md)
+has passed, the switch `UNDO_SHIPPED` in `cleanix/core/regpromises.py` stays
+`False` and every user-visible message says: "Registry entries are removed
+permanently: no backup or restore is available in this version." The files are
+still written and kept in the quarantine run; they are simply not promised.
+
+**Restoring.** `HKCU` entries: `cleanix restore <run>`, or Restore in the GUI's
+Quarantine tab. `HKLM` entries only from an **Administrator terminal**, never
+from the GUI. Inspect every `.reg` file first (the backup folder can be changed
+by any program running as you), then run
+`reg import "<absolute .reg path>" /reg:64` for each one. `cleanix restore
+<run>` from the Administrator terminal also works when it runs as the same
+account that made the backup: it lists exactly which keys and values it will
+write and waits for `yes`. With over-the-shoulder UAC (a separate administrator
+account) only `reg import` with the absolute path works, because the run lives
+in the standard user's profile.
+
+**Limits and residual risks** (details in
+[Security notes for the administrator helper](#security-notes-for-the-administrator-helper)):
+
+- **No transaction (R17).** Between the last check and the delete a key could be
+  swapped for a registry link and the link's target deleted. Cleanix reports a
+  partly deleted entry as such ("scan again"), never as success. What a delete
+  does to a link as the final path component is one of the points the Windows
+  verification measures.
+- **Programs running as you** can edit a backup between the clean and a restore.
+  Restore re-validates and an elevated restore lists what it will write, but
+  that is why the GUI never offers an elevated restore.
+- **A standard user can make a live `HKLM` entry look dead** by renaming a file
+  in a folder they can write; it is then removed only after an administrator
+  approves the prompt, and it is backed up first.
+- **Partial deletes**: a key tree that fails halfway is reported with its
+  backup run; restore recreates exactly the missing parts.
+- An entry that cannot be backed up exactly (a `Policies` subkey, names with
+  line breaks, a registry link, more than 256 keys, 4096 values or 1 MiB of data) is not
+  offered at all.
+
+The elevated helper path (`HKLM`) is covered by unit tests only; it has not
+been run against a real machine-wide registry and must not be tried on one.
 
 ## Configuration via CLI
 
