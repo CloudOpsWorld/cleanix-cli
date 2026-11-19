@@ -497,9 +497,16 @@ Five detectors look for dead registry entries: `win_reg_uninstall`,
 `win_reg_app_paths`, `win_reg_file_assoc`, `win_reg_startup` and
 `win_reg_shared_dlls`. They are Windows only and **never** part of a plain
 `cleanix scan` / `cleanix clean`, a `--profile`, or the scheduled scan; name
-them explicitly (`cleanix list` shows them as `opt-in`):
+them explicitly (`cleanix list` shows them as `opt-in`) with `--only` or the
+`--registry` flag. `--registry` (Windows only; elsewhere it exits 2 with
+"Registry cleanup is only available on Windows.") selects exactly the five
+registry cleaners, or adds them to an explicit `--only`; it counts as the
+explicit selection `clean` requires and is never implied by a profile, the
+configuration or the scheduled scan:
 
 ```bash
+cleanix scan --registry                                         # same five ids
+cleanix clean --registry --execute                              # lists every key/value, asks first
 cleanix scan --only win_reg_uninstall,win_reg_startup          # read-only
 cleanix scan --only win_reg_uninstall --json                    # targets in JSON
 cleanix clean --only win_reg_uninstall --execute                # lists every key/value, asks first
@@ -509,7 +516,9 @@ cleanix restore <run-id>                                        # undo, once shi
 
 Scan output and JSON show each target as `HKCU\path\to\key [value]` (control
 characters are shown escaped); JSON items add `kind`, `target` and
-`registry` (`{"hive","key","value"}` or `null`), and cleaners add `registry`.
+`registry` (`{"hive","key","value"}` or `null`), and each cleaner adds a
+boolean `registry` (true for the five registry ids). `history.jsonl` entries
+of runs that removed registry entries carry a `registry` count (no values).
 Machine-wide (`HKLM`) entries are only removed from an elevated
 (Administrator) terminal; without one they are skipped with a message.
 Restoring a run that contains `HKLM` entries also needs an Administrator
