@@ -361,18 +361,20 @@ def test_helper_ignores_its_own_quarantine_root(h):
     assert res.removed == 0 and any("backup" in e for e in res.errors)
 
 
-def test_helper_passes_the_invoking_root_and_never_uses_quarantine_root(h, monkeypatch):
-    """The backup root reaches VerifyOnlySink as a parameter; the helper never
-    asks quarantine_root() (the ADMINISTRATOR's %LOCALAPPDATA%) and never
-    swaps it."""
+def test_helper_deletes_from_preloaded_backups_only(h, monkeypatch):
+    """The delete uses the backups verified during validation (in memory);
+    the helper never asks quarantine_root() (the ADMINISTRATOR's
+    %LOCALAPPDATA%) and passes no root to resolve."""
+    from cleanix.core import regclean
+
     item = reg_item(h.reg, "Foo")
     run = gui_backup(h, [item])
     h.cleaners.append(startup_cleaner(h))
-    roots = []
+    seen = []
     real_clean = service.clean
 
     def spy_clean(items, config, **kw):
-        roots.append(kw.get("registry_backup_root"))
+        seen.append(kw)
         return real_clean(items, config, **kw)
 
     def forbidden():
@@ -382,8 +384,194 @@ def test_helper_passes_the_invoking_root_and_never_uses_quarantine_root(h, monke
     monkeypatch.setattr(quarantine, "quarantine_root", forbidden)
     assert run_helper(h, selection(h, [item_key(item)], run)) == 0
     assert not present(h, "Foo")
-    assert roots == [Path(str(h.qroot))]
-    assert quarantine.quarantine_root is forbidden
+    (kw,) = seen
+    assert kw.get("registry_backup_root") is None and kw["registry_backup_run"] == run
+    pre = kw["registry_verified_backups"]
+    assert set(pre) == {item_key(item)}
+    assert pre[item_key(item)] == regclean.VerifiedBackup(
+        "win_reg_startup", item.reg, item.reg.fingerprint)
+
+
+@pytest.fixture
+def after_validation(monkeypatch):
+    """Run ``hook()`` right after ``_prepare_registry`` returned."""
+    hooks = []
+    real = elevated._prepare_registry
+
+    def wrapped(req, rdir):
+        plan = real(req, rdir)
+        for hook in hooks:
+            hook()
+        return plan
+
+    monkeypatch.setattr(elevated, "_prepare_registry", wrapped)
+    return hooks
+
+
+def test_no_filesystem_access_to_the_run_after_validation(h, monkeypatch, after_validation):
+    """After _prepare_registry: no realpath/stat/lstat/open/scandir/Path.*
+    call at all while the helper scans and deletes (the result write comes
+    after the spy is removed)."""
+    import builtins
+
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    calls = []
+    installed = []
+
+    def install():
+        def wrap(owner, name):
+            real = getattr(owner, name)
+
+            def spy(*a, **k):
+                calls.append((name, str(a[:1])[:120]))
+                return real(*a, **k)
+
+            monkeypatch.setattr(owner, name, spy)
+            installed.append((owner, name, real))
+
+        for owner, name in ((os.path, "realpath"), (os.path, "exists"),
+                            (os.path, "lexists"), (os.path, "isdir"), (os.path, "isfile"),
+                            (os, "stat"), (os, "lstat"), (os, "open"), (os, "scandir"),
+                            (os, "listdir"), (builtins, "open"), (elevated, "_lstat"),
+                            (elevated, "_owner_sid"), (Path, "exists"), (Path, "is_dir"),
+                            (Path, "stat"), (Path, "lstat"), (Path, "open"),
+                            (Path, "read_bytes"), (Path, "read_text"), (Path, "resolve"),
+                            (Path, "iterdir")):
+            wrap(owner, name)
+
+    after_validation.append(install)
+    real_clean = service.clean
+    phase = []
+
+    def spy_clean(items, config, **kw):
+        out = real_clean(items, config, **kw)
+        phase.append(list(calls))
+        return out
+
+    monkeypatch.setattr(service, "clean", spy_clean)
+    assert run_helper(h, selection(h, [item_key(item)], run)) == 0
+    assert not present(h, "Foo")
+    assert phase == [[]], phase
+
+
+def test_swapping_the_run_after_validation_has_no_effect(h, after_validation):
+    """Deleting or rewriting the run's files after validation changes
+    nothing: the sink uses the preloaded copies."""
+    import shutil
+
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    after_validation.append(lambda: shutil.rmtree(h.qroot / run))
+    assert run_helper(h, selection(h, [item_key(item)], run)) == 0
+    assert not present(h, "Foo")
+    assert elevate.read_result(h.result).removed == 1
+
+
+def test_preloaded_sink_refuses_an_item_without_its_backup(fake_registry):
+    from cleanix.core import regbackup, regclean
+
+    fake_registry.add_key("HKLM", RUN, {"Foo": (REG_SZ, "x"), "Bar": (REG_SZ, "y")})
+    foo, bar = reg_item(fake_registry, "Foo"), reg_item(fake_registry, "Bar")
+    sink = regclean.VerifyOnlySink.from_preloaded(
+        "20261119-1-ab", {item_key(bar): regclean.VerifiedBackup(
+            bar.cleaner_id, bar.reg, bar.reg.fingerprint)})
+    sink.before_delete(bar, fake_registry)
+    for wrong in (foo,
+                  dataclasses.replace(bar, cleaner_id="win_reg_app_paths"),
+                  dataclasses.replace(bar, reg=dataclasses.replace(bar.reg, fingerprint="0" * 64))):
+        with pytest.raises(regbackup.BackupError):
+            sink.before_delete(wrong, fake_registry)
+    assert sink.backup_dir is None
+    bad = regclean.VerifyOnlySink.from_preloaded("../x", {item_key(bar): regclean.VerifiedBackup(
+        bar.cleaner_id, bar.reg, bar.reg.fingerprint)})
+    with pytest.raises(regbackup.BackupError):
+        bad.before_delete(bar, fake_registry)
+    fake_registry.calls.clear()
+    with pytest.raises(regbackup.BackupError):
+        sink.before_delete(foo, fake_registry)
+    assert fake_registry.calls == []
+
+
+def test_preload_skips_a_backup_that_does_not_verify(h):
+    """A tampered backup JSON is not preloaded: the delete is refused."""
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    (js,) = list((h.qroot / run / "registry").glob("*.json"))
+    js.write_bytes(js.read_bytes().replace(b"Gone", b"Gona"))
+    h.cleaners.append(startup_cleaner(h))
+    assert run_helper(h, selection(h, [item_key(item)], run)) == 0
+    assert present(h, "Foo")
+    assert any("backup" in e for e in elevate.read_result(h.result).errors)
+
+
+def test_pinned_read_refuses_a_file_swapped_after_its_lstat(tmp_path, monkeypatch):
+    p = tmp_path / "manifest.json"
+    p.write_bytes(b"{}")
+    assert elevated._read_pinned(str(p), 100, "m") == b"{}"
+    real = os.fstat
+
+    def other_file(fd):
+        st = real(fd)
+        return SimpleNamespace(st_mode=st.st_mode, st_dev=st.st_dev, st_ino=st.st_ino + 1)
+
+    monkeypatch.setattr(elevated, "_fstat", other_file)
+    with pytest.raises(elevated.Refused, match="changed"):
+        elevated._read_pinned(str(p), 100, "m")
+
+
+def test_pinned_read_caps_and_refuses_non_regular(tmp_path):
+    p = tmp_path / "big.json"
+    p.write_bytes(b"x" * 101)
+    with pytest.raises(elevated.Refused, match="too large"):
+        elevated._read_pinned(str(p), 100, "m")
+    with pytest.raises(elevated.Refused):
+        elevated._read_pinned(str(tmp_path), 100, "m")
+    with pytest.raises(elevated.Refused):
+        elevated._read_pinned(str(tmp_path / "missing"), 100, "m")
+
+
+def test_lstat_chain_runs_profile_down_and_stops_at_a_link(h, monkeypatch):
+    """The chain is walked from the profile DOWN; a link at AppData stops it
+    before anything deeper (Local, cleanix, ...) is examined."""
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    seen = []
+    real = os.lstat
+    appdata = _norm(h.home / "AppData")
+
+    def lstat(p, *a, **k):
+        seen.append(_norm(p))
+        st = real(p, *a, **k)
+        if _norm(p) == appdata:
+            return SimpleNamespace(st_mode=st.st_mode, st_file_attributes=0x400)
+        return st
+
+    monkeypatch.setattr(elevated, "_lstat", lstat)
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)),
+                   reason="link or junction")
+    assert seen == [_norm(h.home), appdata]
+
+
+def test_root_reached_through_a_link_above_the_profile_is_refused(h, monkeypatch):
+    """Only the realpath check can see a link above the profile."""
+    item = reg_item(h.reg, "Foo")
+    run = gui_backup(h, [item])
+    h.cleaners.append(startup_cleaner(h))
+    real = os.path.realpath
+    target = _norm(h.qroot)
+
+    def realpath(p, *a, **k):
+        if _norm(p) == target:
+            return str(h.tmp / "elsewhere" / "cleanix" / "quarantine")
+        return real(p, *a, **k)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run)),
+                   reason="reached through a link")
 
 
 def test_backup_run_without_this_entry_refuses_delete(h):
@@ -468,13 +656,15 @@ def test_registry_key_in_file_part_is_refused(h):
 # --------------------------------------------------------------------------
 # the helper: refusals (exit 1, nothing deleted)
 # --------------------------------------------------------------------------
-def assert_refused(h, rc, *, file=None):
+def assert_refused(h, rc, *, file=None, reason=None):
     assert rc == elevated.EXIT_REFUSED
     assert present(h, "Foo") and present(h, "Bar") and present(h, "Mine", "HKCU")
     if file is not None:
         assert file.exists()
     res = elevate.read_result(h.result)
     assert res.removed == 0 and res.errors and res.errors[0].startswith("request refused")
+    if reason is not None:
+        assert reason in res.errors[0], res.errors[0]
 
 
 @pytest.mark.parametrize("mutate", [
@@ -570,20 +760,42 @@ def test_quarantine_root_of_the_other_account_profile_refused(h):
     assert_refused(h, run_helper(h, selection(h, [item_key(item)], run, root=elsewhere)))
 
 
-@pytest.mark.parametrize("make_root", [
-    lambda h: h.home / "AppData" / "Local" / "cleanix",                     # wrong tail
-    lambda h: h.home / "AppData" / "Local" / "x" / "quarantine",
-    lambda h: h.home,                                                      # the profile
-    lambda h: str(h.qroot) + os.sep + ".." + os.sep + "quarantine",        # not normal
-    lambda h: "cleanix" + os.sep + "quarantine",                           # relative
+def test_lexical_normpath_check(monkeypatch):
+    """A path the local-path rule lets through (POSIX form) but that is not
+    normalised is refused by the normpath check."""
+    monkeypatch.setattr(elevate, "_POSIX", True)
+    assert elevated._lexical_root_problem(
+        "/home/a/x/../cleanix/quarantine") == "the quarantine root is not a normalised absolute path"
+    if POSIX:
+        assert elevated._lexical_root_problem(
+            "/home/a/x/quarantine") == "the quarantine root is not a cleanix quarantine"
+
+
+@pytest.mark.parametrize("make_root, reason", [
+    (lambda h: h.home / "AppData" / "Local" / "cleanix", "not a cleanix quarantine"),
+    (lambda h: h.home / "AppData" / "Local" / "x" / "quarantine", "not a cleanix quarantine"),
+    (lambda h: h.home, "not a cleanix quarantine"),                        # the profile
+    # Windows: a ".." component already fails the local-path rule (parse);
+    # POSIX: the normpath check in _prepare_registry refuses it.
+    (lambda h: str(h.qroot) + os.sep + ".." + os.sep + "quarantine",
+     "not a normalised absolute path" if POSIX else "'registry.quarantine_root' is invalid"),
+    (lambda h: "cleanix" + os.sep + "quarantine", "'registry.quarantine_root' is invalid"),
 ])
-def test_bad_quarantine_root_refused(h, make_root):
+def test_bad_quarantine_root_refused(h, make_root, reason):
+    """Each bad root is refused by ITS check (a complete, valid copy of the
+    run sits under the bad root, so no later check could refuse it)."""
+    import shutil
+
     item = reg_item(h.reg, "Foo")
     run = gui_backup(h, [item])
     root = make_root(h)
-    (Path(str(root)) / run).mkdir(parents=True, exist_ok=True) if os.path.isabs(str(root)) else None
+    if os.path.isabs(str(root)) and _norm(root) != _norm(h.qroot):
+        dst = Path(os.path.normpath(str(root))) / run
+        if not dst.exists():
+            shutil.copytree(h.qroot / run, dst)
     h.cleaners.append(startup_cleaner(h))
-    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run, root=root)))
+    assert_refused(h, run_helper(h, selection(h, [item_key(item)], run, root=root)),
+                   reason=reason)
 
 
 def test_missing_profile_list_entry_refused(h):
@@ -1173,6 +1385,11 @@ NON_LOCAL_ROOTS = [
     r"C:\Users\a.\cleanix\quarantine",                       # trailing dot
     r"C:\Users\a \cleanix\quarantine",                       # trailing space
     "C:\\Users\\\\a\\cleanix\\quarantine",                   # empty component
+    "C:\\Users\\a\x00\\cleanix\\quarantine",                 # NUL
+    "C:\\Users\\a\\COM\u00b9\\cleanix\\quarantine",          # superscript devices
+    "C:\\Users\\a\\lpt\u00b3.log\\cleanix\\quarantine",
+    r"C:\Users\con.CORP\AppData\Local\cleanix\quarantine",   # device before the dot
+    "//home/a/cleanix/quarantine",                           # POSIX network form
 ]
 
 
@@ -1284,8 +1501,27 @@ def test_profile_path_must_be_local_and_unexpanded_otherwise(value, fake_registr
 def test_profile_value_must_be_a_string_type(typ, data, fake_registry):
     fake_registry.add_key("HKLM", elevated.PROFILE_LIST + "\\" + USER_SID,
                           {"ProfileImagePath": (typ, data)})
-    with pytest.raises(elevated.Refused):
+    with pytest.raises(elevated.Refused, match="profile path is not usable"):
         elevated._profile_for_sid(USER_SID)
+
+
+def test_gui_keeps_the_run_if_an_exit_1_result_reports_removals(h, gui):
+    """Exit 1 means "refused, nothing deleted"; a result that nonetheless
+    reports removals keeps the backups."""
+    from cleanix.core import elevate_launch
+    from cleanix.gui import elevation
+
+    def launcher(argv):
+        req = Path(argv[argv.index("--request") + 1])
+        res = Path(argv[argv.index("--result") + 1])
+        sel = elevate.read_request(req, expected_uid=UID if POSIX else None)
+        elevate.write_result(res, elevate.HelperResult(
+            freed=0, removed=1, errors=[], unmatched=0, nonce=sel.nonce))
+        raise elevate_launch.ElevationFailed("refused", exit_code=1)
+
+    out = elevation.run_elevated_part([reg_item(h.reg, "Foo")], launcher=launcher)
+    assert out.status == elevation.FAILED and out.helper_exit == 1
+    assert out.registry_backup_run and len(quarantine.list_runs()) == 1
 
 
 @pytest.mark.skipif(POSIX, reason="Windows drive paths")

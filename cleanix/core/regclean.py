@@ -65,7 +65,8 @@ from __future__ import annotations
 import os
 import re
 import stat
-from typing import List, Optional, Protocol, Tuple
+from dataclasses import dataclass
+from typing import List, Mapping, Optional, Protocol, Tuple
 
 from cleanix.core import regsafety, regsnap, winenv
 from cleanix.core.models import CleanableItem, RegTarget
@@ -117,6 +118,17 @@ class RegistryBackupSink(Protocol):
 
 
 BACKUP_REQUIRED = "backup is required for this entry"
+
+
+@dataclass(frozen=True)
+class VerifiedBackup:
+    """A registry backup already read and fully verified (format, safety
+    rules, digest): who it is for, exactly which target, and the
+    fingerprint of the backed-up snapshot."""
+
+    cleaner_id: str
+    target: RegTarget
+    fingerprint: str
 MAX_BACKUP_FILES = 10_000
 _RUN_ID = re.compile(r"\A[0-9A-Za-z][0-9A-Za-z._-]{0,127}\Z")
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -150,6 +162,7 @@ class VerifyOnlySink:
     def __init__(self, run, root=None) -> None:
         self._run = run
         self._root = root
+        self._preloaded: Optional[Mapping[str, "VerifiedBackup"]] = None
         self.run_id: Optional[str] = None
         if isinstance(run, str) and _RUN_ID.match(run):
             self.run_id = run
@@ -197,8 +210,23 @@ class VerifyOnlySink:
             raise refuse("the backup is not a run of this account's quarantine")
         return Path(run_dir)
 
+    @classmethod
+    def from_preloaded(
+        cls, run_id: str, entries: Mapping[str, "VerifiedBackup"]
+    ) -> "VerifyOnlySink":
+        """A sink that never touches the filesystem: ``entries`` maps an
+        item key (``models.item_key``) to the backup the caller already
+        read and fully verified (the elevated helper does every read of
+        the run once, at validation time). An item without an entry, or
+        whose entry does not match exactly, is refused."""
+        sink = cls(run_id)
+        sink._preloaded = dict(entries)
+        return sink
+
     @property
     def backup_dir(self):
+        if self._preloaded is not None:
+            return None  # never resolved again by path
         try:
             return self._run_dir()
         except Exception:  # noqa: BLE001
@@ -206,10 +234,26 @@ class VerifyOnlySink:
 
     def before_delete(self, item: CleanableItem, backend) -> None:
         from cleanix.core import quarantine, regbackup
+        from cleanix.core.models import item_key
 
         reg = item.reg
         if reg is None or reg.hive != "HKLM":
             raise regbackup.BackupError(BACKUP_REQUIRED)
+        if self._preloaded is not None:
+            if self.run_id is None:
+                raise regbackup.BackupError(f"{BACKUP_REQUIRED}: not a valid quarantine run id")
+            b = self._preloaded.get(item_key(item))
+            if (
+                b is not None
+                and b.cleaner_id == item.cleaner_id
+                and b.target == reg
+                and b.fingerprint == reg.fingerprint
+            ):
+                return None
+            raise regbackup.BackupError(
+                f"{BACKUP_REQUIRED}: quarantine run '{self.run_id}' holds no restorable, "
+                "verified backup of it"
+            )
         run_dir = self._run_dir()
         data = quarantine._read_manifest(run_dir)
         if not data:

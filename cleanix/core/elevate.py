@@ -306,6 +306,8 @@ _WIN_DRIVE_ROOT = re.compile(r"[A-Za-z]:\\")
 _WIN_RESERVED = frozenset(
     {"con", "prn", "aux", "nul", "conin$", "conout$"}
     | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+    # Windows also maps the superscript digits (COM¹-³, LPT¹-³) to devices.
+    | {f"{d}{s}" for d in ("com", "lpt") for s in ("¹", "²", "³")}
 )
 
 
@@ -318,7 +320,9 @@ def is_local_absolute_path(path) -> bool:
     paths, no forward slashes, no second ``:`` (alternate data streams),
     no empty components, no component ending in a dot or a space (Win32
     strips them, so they alias other names) and no reserved device names
-    (``CON``, ``NUL``, ``COM1`` ...). Opening any of those as an
+    (``CON``, ``NUL``, ``COM1``, ``COM¹`` ...), judged on the part before the
+    first dot -- so a profile such as ``C:\\Users\\con.CORP`` is refused
+    (fail closed). Opening any of those as an
     administrator could reach the network (and leak the administrator's
     NTLM credentials) or a device. POSIX: a ``/`` path that does not start
     with ``//``."""

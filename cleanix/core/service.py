@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence
+from typing import Any, Callable, List, Mapping, Optional, Sequence
 
 from cleanix.config import Config
 from cleanix.core import history, safety
@@ -83,6 +83,7 @@ def clean(
     registry_backup_run: Optional[str] = None,
     registry_backup_dir: Optional[Path] = None,
     registry_backup_root: Optional[Path] = None,
+    registry_verified_backups: Optional[Mapping[str, Any]] = None,
 ) -> CleanSummary:
     """Clean ``items``. ``cancel`` must be thread-safe: it may be called from
     worker threads.
@@ -101,6 +102,9 @@ def clean(
     ``registry_backup_root`` is the quarantine root that run lives in --
     the elevated helper passes the INVOKING user's validated root, never
     its own %LOCALAPPDATA%; default ``quarantine_root()``;
+    ``registry_verified_backups`` (with ``registry_backup_run``) maps item
+    keys to ``regclean.VerifiedBackup`` objects the caller already read and
+    verified, and then the sink performs no filesystem access at all;
     ``registry_backup_dir`` is a deprecated alias accepted only when it is
     exactly such a run directory). No run is created and
     :class:`regclean.VerifyOnlySink` deletes only HKLM entries that run would
@@ -148,7 +152,12 @@ def clean(
                 bound = Path(registry_backup_dir)
             else:
                 bound = None
-            registry_backup = regclean.VerifyOnlySink(bound, root=registry_backup_root)
+            if registry_verified_backups is not None and registry_backup_run is not None:
+                # Preloaded mode (elevated helper): no filesystem access.
+                registry_backup = regclean.VerifyOnlySink.from_preloaded(
+                    registry_backup_run, registry_verified_backups)
+            else:
+                registry_backup = regclean.VerifyOnlySink(bound, root=registry_backup_root)
         else:
             registry_backup = run
 

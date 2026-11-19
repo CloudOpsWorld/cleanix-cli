@@ -472,7 +472,8 @@ def run_elevated_part(admin_items: Sequence[CleanableItem], config=None, *,
         outcome.launched = True
         res = outcome.result
         if (outcome.status in (DECLINED, UNAVAILABLE)
-                or (outcome.status == FAILED and outcome.helper_exit == 1)
+                or (outcome.status == FAILED and outcome.helper_exit == 1
+                    and (res is None or res.removed == 0))
                 or (outcome.status == DONE and res is not None and res.removed == 0
                     and not res.errors)):
             # Nothing was (or could have been) deleted: declined/unavailable,

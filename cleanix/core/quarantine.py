@@ -393,8 +393,7 @@ def _read_manifest(run_dir: Path) -> Optional[Dict]:
     except OSError:
         return None
     if (
-        _stat.S_ISLNK(st.st_mode)
-        or not _stat.S_ISREG(st.st_mode)
+        not _stat.S_ISREG(st.st_mode)  # lstat: a symlink is never S_ISREG
         or getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
     ):
         return None

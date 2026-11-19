@@ -70,9 +70,13 @@ nothing in it beyond *identifiers*, and nothing in its environment:
     registry safety rules, each with ``service.clean(...,
     use_quarantine=False, record_history=False,
     registry_backup_elsewhere=True, registry_backup_run=<run>,
-    registry_backup_root=<the invoking user's validated root>)``, so
-    ``VerifyOnlySink`` deletes only what that run can restore (the
-    helper's own %LOCALAPPDATA% quarantine is never consulted).
+    registry_verified_backups=<backups preloaded at validation>)``, so
+    ``VerifyOnlySink`` deletes only what that run can restore. The run's
+    manifest and the needed backup JSONs are read ONCE, during validation,
+    each opened right after its lstat and checked by handle (``fstat``:
+    same file), and verified in memory; after validation nothing of the
+    run is opened or resolved by path (the helper's own %LOCALAPPDATA%
+    quarantine is never consulted either).
 
 What the design does and does not protect:
 * The nonce only detects stale or mixed-up result files; it provides no
@@ -113,9 +117,17 @@ Known residuals, accepted for now:
     the backup files afterwards, which is why HKLM restore is never offered
     by the GUI and shows exactly what it writes (T4). The R17 window
     (``RegDeleteKeyEx`` re-resolving the path after the last check) applies
-    unchanged; the outcome is then "partially deleted", never success. The
-    quarantine root is located by path, then checked; a junction swapped in
-    after the check is the same class of residual as (d).
+    unchanged; the outcome is then "partially deleted", never success.
+    Path validation is check-then-use: a non-local root is refused from its
+    text before any filesystem call, and the run is read once, by handle,
+    right after each lstat. What remains is a micro-window between the
+    last lstat of a path and its open: a program running as the user that
+    can create symbolic links (Developer Mode, or an object-manager
+    symlink) could swap a component in that window and make the
+    administrator's open follow it (possibly to a network path). The
+    handle check then refuses the file, but the open already happened.
+    Handle-relative opening (NtCreateFile with a parent handle) is future
+    work, as for (d).
 
 Exit codes (126/127 are never used: pkexec reserves them):
 0 completed (details in the result file), 1 request unreadable/refused
@@ -593,12 +605,110 @@ def _no_link(path: str, what: str, *, directory: bool = True) -> None:
         raise Refused(f"{what} is not a regular file")
 
 
+def _read_pinned(path: str, limit: int, what: str) -> bytes:
+    """Read a small file the user can write, as tightly as stdlib allows:
+    lstat it (a regular file, not a link or reparse point, at most
+    ``limit`` bytes), open it right away (``O_NOFOLLOW`` where available),
+    check that the OPENED file is the one just inspected (``fstat``:
+    same device and inode / file index, still regular), then read at most
+    ``limit`` bytes through that descriptor. Refused on any doubt."""
+    try:
+        st0 = _lstat(path)
+    except OSError:
+        raise Refused(f"{what} cannot be inspected") from None
+    if (_stat_mod.S_ISLNK(st0.st_mode)
+            or getattr(st0, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+            or not _stat_mod.S_ISREG(st0.st_mode)):
+        raise Refused(f"{what} is a link or not a regular file")
+    if getattr(st0, "st_size", 0) > limit:
+        raise Refused(f"{what} is too large")
+    flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        raise Refused(f"{what} could not be opened") from None
+    try:
+        st1 = _fstat(fd)
+        if (not _stat_mod.S_ISREG(st1.st_mode)
+                or (st1.st_dev, st1.st_ino) != (getattr(st0, "st_dev", None),
+                                                getattr(st0, "st_ino", None))):
+            raise Refused(f"{what} changed while it was being opened")
+        chunks, total = [], 0
+        while total <= limit:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except OSError:
+        raise Refused(f"{what} could not be read") from None
+    finally:
+        os.close(fd)
+    if total > limit:
+        raise Refused(f"{what} is too large")
+    return b"".join(chunks)
+
+
+def _preload_backups(req: elevate.RegistryRequest, run_dir: str, manifest: str) -> dict:
+    """Read the run's manifest and the registry backups the request needs,
+    ONCE, by pinned handle (``_read_pinned``), and fully verify them in
+    memory. ``{item key: regclean.VerifiedBackup}``; a key whose backup is
+    missing, unreadable or does not verify is simply absent (the delete of
+    that item is then refused by the sink)."""
+    import json
+
+    from cleanix.core import quarantine, regbackup, regclean, regsnap
+    from cleanix.core.models import RegTarget
+
+    raw = _read_pinned(manifest, quarantine.MAX_MANIFEST_BYTES, "the backup run's manifest")
+    try:
+        doc = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError):
+        raise Refused("the backup run's manifest is not valid") from None
+    entries = doc.get("items") if isinstance(doc, dict) else None
+    if not isinstance(entries, list):
+        raise Refused("the backup run's manifest is not valid")
+    wanted: dict = {}
+    for key in dict.fromkeys(req.keys):
+        cid, hive, rkey, value, fp = elevate.registry_key_parts(key)
+        wanted.setdefault((cid, hive, rkey, value), []).append((key, fp))
+    reg_dir = os.path.join(run_dir, "registry")
+    out: dict = {}
+    for entry in entries[:regclean.MAX_BACKUP_FILES]:
+        if not (isinstance(entry, dict) and entry.get("type") == "registry"
+                and entry.get("deleted") is not False):
+            continue
+        sig = (entry.get("cleaner_id"), entry.get("hive"), entry.get("key"),
+               entry.get("value"))
+        if sig not in wanted:
+            continue
+        name = Path(str(entry.get("json") or "")).name
+        if not regbackup.is_backup_json_name(name):
+            continue
+        try:
+            data = _read_pinned(os.path.join(reg_dir, name), regbackup.MAX_FILE_BYTES,
+                                "a registry backup")
+            cid, target, snap = regbackup.load_verified_bytes(data)
+        except (Refused, regbackup.RestoreError):
+            continue
+        got = regsnap.fingerprint(target, snap)
+        for key, fp in wanted[sig]:
+            if (key not in out and cid == sig[0] and got == fp
+                    and target == RegTarget(sig[1], sig[2], sig[3], fp)):
+                out[key] = regclean.VerifiedBackup(cid, target, got)
+    return out
+
+
 @dataclasses.dataclass(frozen=True)
 class _RegistryPlan:
     only: List[str]
     keys: List[str]
     backup_run: str
     quarantine_root: str
+    # Every backup the request needs, read and verified at validation time:
+    # nothing of the run is read by name after _prepare_registry.
+    backups: dict = dataclasses.field(default_factory=dict)
 
 
 def _lexical_root_problem(root: str) -> Optional[str]:
@@ -662,8 +772,12 @@ def _prepare_registry(req: elevate.RegistryRequest, rdir: elevate.RequestDir) ->
                        (manifest, "the backup run's manifest")):
         if _owner_sid(path) != sid:
             raise Refused(f"{what} does not belong to the requesting account")
+    # The ONLY reads of the run's files, right after their checks; the
+    # delete phase uses these in-memory, verified copies (no path is opened
+    # or resolved again while the helper scans and deletes).
+    backups = _preload_backups(req, run_dir, manifest)
     return _RegistryPlan(list(dict.fromkeys(req.only)), list(dict.fromkeys(req.keys)),
-                         req.backup_run, root)
+                         req.backup_run, root, backups)
 
 
 @contextlib.contextmanager
@@ -750,6 +864,7 @@ def _component_problem(st, expected_uid: Optional[int],
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _lstat = os.lstat
+_fstat = os.fstat
 
 
 def _is_under(path: str, root: str) -> bool:
@@ -1162,7 +1277,7 @@ def _execute_registry(session: _Session, plan: _RegistryPlan, config, cancel,
             summary = service.clean([item], config, dry_run=False, use_quarantine=False,
                                     record_history=False, registry_backup_elsewhere=True,
                                     registry_backup_run=plan.backup_run,
-                                    registry_backup_root=Path(plan.quarantine_root),
+                                    registry_verified_backups=plan.backups,
                                     cancel=cancel)
         if not summary.result.outcomes:
             return True

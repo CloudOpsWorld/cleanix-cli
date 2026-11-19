@@ -617,6 +617,21 @@ def load_verified(json_path: Path) -> Tuple[str, RegTarget, Snapshot]:
     return entry.cleaner_id, entry.target, entry.snap
 
 
+def load_verified_bytes(raw: bytes) -> Tuple[str, RegTarget, Snapshot]:
+    """:func:`load_verified` for a backup document already read into memory
+    (the elevated helper reads each file once, by handle, at validation
+    time). Same validation; raises :class:`RestoreError`."""
+    try:
+        entry = _load(raw)
+    except _Invalid as exc:
+        raise RestoreError(f"refused: {exc}") from exc
+    return entry.cleaner_id, entry.target, entry.snap
+
+
+def is_backup_json_name(name: str) -> bool:
+    return bool(_JSON_NAME.match(name))
+
+
 DESCRIBE_MAX_CHARS = 300
 DESCRIBE_MAX_BYTES = 32
 _TYPE_NAMES = {

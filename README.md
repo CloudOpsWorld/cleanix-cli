@@ -493,8 +493,11 @@ action for registry entries under `HKLM`:
   only when the folder, the run and its manifest are owned by that account.
   It never uses the administrator's own `%LOCALAPPDATA%`.
 - The quarantine folder must be on a local drive: a network (UNC, WebDAV) or
-  device path is refused from its text alone, before the helper touches it,
-  so the administrator's credentials are never sent anywhere.
+  device path is refused from its text alone, before the helper touches the
+  filesystem. A request therefore cannot point the helper at a network share
+  directly. The run's manifest and backups are read once, during that
+  validation, each right after it is checked, and the helper deletes using
+  those in-memory copies; it never opens the run again by name.
 - The helper writes nothing: no quarantine run, no history.
 - Restoring these entries needs an Administrator terminal. The backup folder
   can be changed by **any program running as you**, so inspect every `.reg`
@@ -522,6 +525,14 @@ What this does **not** protect against:
   keys and values before confirming.
 - **Partial deletes (T11).** A key tree that fails mid-delete is reported with
   its backup run; restore recreates exactly the missing parts.
+- **Link swaps during validation.** Each file of the run is checked with
+  `lstat` (links are not followed) and opened immediately afterwards; the
+  opened file must be the one just checked, or it is refused. A program
+  running as you that can create symbolic links (Developer Mode, or an
+  object-manager symlink) could still swap a folder in the instant between
+  that check and the open. The administrator's open would then follow the
+  swapped link, possibly to a network path, before the check refuses the
+  file. Opening relative to an already-verified folder handle is future work.
 - **"Missing" evidence in folders standard users can write.** A machine-wide
   entry is listed as dead when the program it points at is missing. Some
   locations outside `C:\Users` are writable by standard users (folders created
