@@ -471,9 +471,17 @@ action for registry entries under `HKLM`:
   quarantine folder only inside that profile, without links or junctions, and
   only when the folder, the run and its manifest are owned by that account.
   It never uses the administrator's own `%LOCALAPPDATA%`.
-- The helper writes nothing: no quarantine run, no history. Restoring these
-  entries needs an Administrator terminal (`cleanix restore <run>` or
-  `reg import "<absolute .reg path>" /reg:64`); inspect the `.reg` file first.
+- The quarantine folder must be on a local drive: a network (UNC, WebDAV) or
+  device path is refused from its text alone, before the helper touches it,
+  so the administrator's credentials are never sent anywhere.
+- The helper writes nothing: no quarantine run, no history.
+- Restoring these entries needs an Administrator terminal. The backup folder
+  can be changed by **any program running as you**, so inspect every `.reg`
+  file before importing it, then run `reg import "<absolute .reg path>" /reg:64`
+  for each one. `cleanix restore <run>` works only when the Administrator
+  terminal runs as the same account that made the backup (it lists exactly what
+  it will write first). With over-the-shoulder UAC (a separate administrator
+  account) it cannot find the run.
 
 What this does **not** protect against:
 
@@ -493,6 +501,14 @@ What this does **not** protect against:
   keys and values before confirming.
 - **Partial deletes (T11).** A key tree that fails mid-delete is reported with
   its backup run; restore recreates exactly the missing parts.
+- **"Missing" evidence in folders standard users can write.** A machine-wide
+  entry is listed as dead when the program it points at is missing. Some
+  locations outside `C:\Users` are writable by standard users (folders created
+  directly under `C:\` inherit "Authenticated Users: Modify"; some vendor
+  folders under `ProgramData`). A standard user can rename a file there so that
+  a live `HKLM` entry looks dead, and it is then deleted once an administrator
+  approves the prompt. This is a denial of service only (the entry is backed up
+  first), not a privilege gain.
 
 ## Usage
 

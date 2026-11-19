@@ -80,6 +80,10 @@ class ElevatedOutcome:
     registry_backup_failed: int = 0
     registry_backup_run: Optional[str] = None
     registry_backup_dir: str = ""
+    registry_changed: int = 0
+    registry_backup_error: str = ""
+    # The helper's own exit code when it failed (1: refused, nothing deleted).
+    helper_exit: Optional[int] = None
 
 
 @dataclass
@@ -295,21 +299,32 @@ def build_selection(admin_items: Sequence[CleanableItem], *,
                              keys=keys, use_quarantine=False, registry=registry)
 
 
+class _BackupNotPrepared(Exception):
+    """The quarantine run for the registry backups could not be created."""
+
+
 def _backup_registry(items: Sequence[CleanableItem]):
     """Back the HKLM entries up AS THE USER into one new quarantine run,
     before any launch (ruling R6). ``(run or None, backed-up items, number
-    of failures)``; an entry whose backup fails is dropped. Never raises
-    (except BaseException)."""
+    of failed backups, number of entries changed since the scan)``; an entry
+    whose backup fails is dropped. Raises :class:`_BackupNotPrepared` when
+    the run itself cannot be created."""
     from cleanix.core import quarantine, winregistry
+    from cleanix.core.regclean import RegistryChanged
 
-    run = quarantine.new_run()
-    backend = winregistry.get_backend()
+    try:
+        run = quarantine.new_run()
+        backend = winregistry.get_backend()
+    except Exception as exc:  # noqa: BLE001
+        raise _BackupNotPrepared(type(exc).__name__) from None
     kept: List[CleanableItem] = []
-    failed = 0
+    failed = changed = 0
     for item in items:
         try:
             run.store_registry(item, backend)
             kept.append(item)
+        except RegistryChanged:
+            changed += 1
         except Exception:  # noqa: BLE001 - this entry is simply not removed
             failed += 1
     if not kept:
@@ -317,8 +332,8 @@ def _backup_registry(items: Sequence[CleanableItem]):
             run.discard_if_empty()
         except Exception:  # noqa: BLE001
             pass
-        return None, [], failed
-    return run, kept, failed
+        return None, [], failed, changed
+    return run, kept, failed, changed
 
 
 def _purge_run(run_id: Optional[str]) -> None:
@@ -389,32 +404,58 @@ def run_elevated_part(admin_items: Sequence[CleanableItem], config=None, *,
     request_dir = None
     backup = None
     kept: List[CleanableItem] = []
-    failed = 0
+    failed = changed = 0
+    prep_error = ""
     launched = False
 
     def with_registry(outcome: ElevatedOutcome) -> ElevatedOutcome:
         outcome.registry_selected = len(reg_items)
         outcome.registry_backup_failed = failed
+        outcome.registry_changed = changed
+        outcome.registry_backup_error = prep_error
         if backup is not None:
             outcome.registry_backup_run = backup.run_id
             outcome.registry_backup_dir = os.path.abspath(str(backup.dir))
         return outcome
 
-    try:
-        if reg_items:
-            backup, kept, failed = _backup_registry(reg_items)
-            if not kept and not file_items:
-                return with_registry(ElevatedOutcome(
-                    FAILED, "Registry backup failed; nothing was removed."))
-        registry = None
+    def drop_backup() -> None:
+        nonlocal backup
         if backup is not None:
-            from cleanix.core import quarantine
+            _purge_run(backup.run_id)
+            backup = None
 
-            registry = elevate.RegistryRequest(
-                only=list(dict.fromkeys(i.cleaner_id for i in kept)),
-                keys=list(dict.fromkeys(item_key(i) for i in kept)),
-                backup_run=backup.run_id,
-                quarantine_root=os.path.realpath(str(quarantine.quarantine_root())))
+    try:
+        registry = None
+        if reg_items:
+            root = ""
+            try:
+                from cleanix.core import quarantine
+
+                root = os.path.realpath(str(quarantine.quarantine_root()))
+            except Exception:  # noqa: BLE001
+                prep_error = BACKUP_NOT_PREPARED
+            if not prep_error and not elevate.is_local_absolute_path(root):
+                # Never hand the administrator a network or device path.
+                prep_error = BACKUP_NOT_LOCAL
+            if not prep_error:
+                try:
+                    backup, kept, failed, changed = _backup_registry(reg_items)
+                except _BackupNotPrepared:
+                    prep_error = BACKUP_NOT_PREPARED
+            if backup is not None:
+                registry = elevate.RegistryRequest(
+                    only=list(dict.fromkeys(i.cleaner_id for i in kept)),
+                    keys=list(dict.fromkeys(item_key(i) for i in kept)),
+                    backup_run=backup.run_id, quarantine_root=root)
+            if registry is None and not file_items:
+                if prep_error:
+                    message = f"{prep_error}; nothing was removed."
+                elif changed and not failed:
+                    message = ("The registry entries changed since the scan; nothing "
+                               "was removed. Scan again.")
+                else:
+                    message = "Registry backup failed; nothing was removed."
+                return with_registry(ElevatedOutcome(FAILED, message))
         n = len(file_items) + len(kept)
         selection = build_selection(file_items, registry=registry)
         request_dir = elevate.make_request_dir()
@@ -424,26 +465,35 @@ def run_elevated_part(admin_items: Sequence[CleanableItem], config=None, *,
         argv = elevate_launch.elevated_command(
             request_path, result_path, config_path or _config_path())
         if cancel is not None and cancel():
-            _purge_run(backup.run_id if backup is not None else None)
+            drop_backup()
             return None
         launched = True
         outcome = _launch(launch, argv, n, result_path, selection.nonce)
         outcome.launched = True
-        if outcome.status in (DECLINED, UNAVAILABLE) and backup is not None:
-            # The helper never ran: nothing was deleted, drop the backups.
-            _purge_run(backup.run_id)
-            backup = None
+        res = outcome.result
+        if (outcome.status in (DECLINED, UNAVAILABLE)
+                or (outcome.status == FAILED and outcome.helper_exit == 1)
+                or (outcome.status == DONE and res is not None and res.removed == 0
+                    and not res.errors)):
+            # Nothing was (or could have been) deleted: declined/unavailable,
+            # refused by the helper before any deletion (exit 1), or a run
+            # that removed nothing and reported no error. Drop the backups.
+            drop_backup()
         return with_registry(outcome)
     except Exception as exc:  # noqa: BLE001 - surfaced as a plain failure
-        if not launched and backup is not None:
-            _purge_run(backup.run_id)
-            backup = None
+        if not launched:
+            drop_backup()
         return with_registry(ElevatedOutcome(
             FAILED, "Administrator cleaning failed. Scan again to see what is left.",
             detail=type(exc).__name__))
     finally:
         if request_dir is not None:
             shutil.rmtree(request_dir, ignore_errors=True)
+
+
+BACKUP_NOT_PREPARED = "Registry backup could not be prepared"
+BACKUP_NOT_LOCAL = ("Registry backup folder is not on a local drive; registry "
+                    "entries are not cleaned from it")
 
 
 # Exit codes of the helper itself that may come with a (partial) result.
@@ -483,7 +533,8 @@ def _launch(run, argv, n: int, result_path, nonce: str) -> ElevatedOutcome:
         else:
             message = ("Administrator cleaning failed; some administrator items "
                        "may already have been removed. Scan again to see what is left.")
-        return ElevatedOutcome(FAILED, message, result=result, detail=detail)
+        return ElevatedOutcome(FAILED, message, result=result, detail=detail,
+                               helper_exit=code)
     if rc != 0:
         return ElevatedOutcome(
             FAILED, "Administrator cleaning failed. Scan again to see what is left.",
@@ -542,6 +593,25 @@ def admin_preview_line(count: int, size: int, registry: int = 0) -> str:
     return head + "they cannot be undone"
 
 
+def machine_restore_lines(run: str, run_dir: str) -> List[str]:
+    """How to restore machine-wide registry entries backed up in ``run``.
+
+    Safe under over-the-shoulder UAC, where the Administrator terminal is a
+    DIFFERENT account: its ``cleanix restore`` looks in that account's own
+    quarantine and cannot find the run, and the ``.reg`` files sit in a
+    folder any program running as the user can change (an edited file could
+    plant machine-wide entries when an administrator imports it)."""
+    return [
+        f"Registry entries were backed up to quarantine run {run} ({run_dir}).",
+        "That folder can be changed by any program running as you: inspect every "
+        ".reg file before importing it.",
+        "To restore, from an Administrator terminal run "
+        f"reg import \"{run_dir}\\registry\\<file>.reg\" /reg:64 for each .reg file; "
+        f"cleanix restore {run} works only when the Administrator terminal runs as "
+        "this same account (it lists exactly what it will write first).",
+    ]
+
+
 def admin_outcome_lines(summary) -> List[str]:
     """Plain-language lines describing the administrator part of ``summary``
     (empty when there were no administrator items)."""
@@ -575,14 +645,18 @@ def admin_outcome_lines(summary) -> List[str]:
         was = "was" if reg_failed == 1 else "were"
         lines.append(f"{_entries(reg_failed)} could not be backed up and {was} "
                      "not removed")
+    reg_changed = int(getattr(outcome, "registry_changed", 0) or 0)
+    if reg_changed:
+        was = "was" if reg_changed == 1 else "were"
+        lines.append(f"{_entries(reg_changed)} changed since the scan and {was} "
+                     "not removed; scan again")
+    prep = getattr(outcome, "registry_backup_error", "")
+    if prep:
+        lines.append(f"{prep}; registry entries were not removed")
     shipped = _undo_shipped()
     reg_run = getattr(outcome, "registry_backup_run", None)
     if reg_run and shipped:
-        lines.append(
-            f"Registry entries were backed up to quarantine run {reg_run} "
-            f"({getattr(outcome, 'registry_backup_dir', '')}); to restore, from an "
-            f"Administrator terminal run cleanix restore {reg_run} or reg import "
-            "each .reg file there")
+        lines.extend(machine_restore_lines(reg_run, getattr(outcome, "registry_backup_dir", "")))
     if getattr(summary, "late_cancel", False):
         lines.append(LATE_CANCEL_LINE)
     if failed:
