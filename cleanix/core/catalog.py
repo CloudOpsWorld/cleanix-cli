@@ -44,6 +44,21 @@ REGISTRY_IDS: Tuple[str, ...] = (
     "win_reg_shared_dlls",
 )
 
+
+def admin_registry_cleaner_ids() -> frozenset:
+    """Registry detectors whose machine-wide (HKLM) entries the elevated
+    helper may delete: the ``REGISTRY_IDS`` that have at least one HKLM
+    container in ``regsafety``. Pure; the platform gate lives in
+    ``cleanix.elevated.admin_registry_cleaner_ids``. Deliberately separate
+    from the file-cleaner allowlist (``elevated.admin_cleaner_ids``)."""
+    from cleanix.core.regsafety import containers_for
+
+    return frozenset(
+        cid for cid in REGISTRY_IDS
+        if any(c.hive == "HKLM" for c in containers_for(cid))
+    )
+
+
 _CATEGORY_BY_ID: Dict[str, str] = {}
 
 

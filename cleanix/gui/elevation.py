@@ -11,7 +11,12 @@ The GUI never runs as root. A clean is split in two:
   itself deems eligible (allowlisted cleaner, needs admin rights, not
   report-only), ignores ``use_quarantine`` and never writes history: these
   items are removed PERMANENTLY and can never be undone. The GUI records one
-  history entry for them itself, as the user, from the helper's counts.
+  history entry for them itself, as the user, from the helper's counts;
+* **machine-wide registry items** (REGISTRY, HKLM) are first backed up by
+  the GUI, as the user, into one quarantine run; the same single prompt
+  then sends them in the request's registry part (run id + item keys) and
+  the helper deletes only entries that run can restore (restorable only
+  from an Administrator terminal, ruling R6).
 
 The helper only returns counts, so administrator rows cannot be matched back
 to per-item outcomes: views keep them and ask the user to scan again.
@@ -37,7 +42,7 @@ from dataclasses import dataclass
 from typing import Callable, FrozenSet, List, Optional, Sequence, Tuple
 
 from cleanix.core import elevate, elevate_launch, service, utils
-from cleanix.core.models import CleanableItem, item_key
+from cleanix.core.models import CleanableItem, ItemKind, item_key
 from cleanix.core.platform import LINUX, MACOS, WINDOWS, current_os
 from cleanix.core.utils import human_size
 
@@ -67,6 +72,14 @@ class ElevatedOutcome:
     outcome_unknown: bool = False
     # True once the launcher (prompt + helper) was actually called.
     launched: bool = False
+    # Registry (HKLM) items: how many were selected, how many could not be
+    # backed up (dropped from the request), and the quarantine run holding
+    # the backups the GUI wrote as the user BEFORE the launch (None when
+    # nothing was backed up or the run was purged because nothing ran).
+    registry_selected: int = 0
+    registry_backup_failed: int = 0
+    registry_backup_run: Optional[str] = None
+    registry_backup_dir: str = ""
 
 
 @dataclass
@@ -97,6 +110,9 @@ class CombinedSummary(service.CleanSummary):
     late_cancel: bool = False
     admin_preview_count: int = 0
     admin_preview_size: int = 0
+    # Dry run: how many of the previewed administrator items are registry
+    # entries (they are backed up before the helper deletes them).
+    admin_preview_registry: int = 0
 
 
 # Progress text the worker emits right before the (unstoppable) elevated
@@ -267,12 +283,54 @@ def _config_path() -> str:
     return str(config_mod.config_file_path())
 
 
-def build_selection(admin_items: Sequence[CleanableItem]) -> elevate.Selection:
-    """Cleaner ids and item keys of ``admin_items`` only; quarantine off."""
-    only = list(dict.fromkeys(i.cleaner_id for i in admin_items))
-    keys = list(dict.fromkeys(item_key(i) for i in admin_items))
+def build_selection(admin_items: Sequence[CleanableItem], *,
+                    registry: Optional[elevate.RegistryRequest] = None
+                    ) -> elevate.Selection:
+    """Cleaner ids and item keys of the non-registry ``admin_items`` only
+    (registry entries go only through ``registry``); quarantine off."""
+    files = [i for i in admin_items if i.kind is not ItemKind.REGISTRY]
+    only = list(dict.fromkeys(i.cleaner_id for i in files))
+    keys = list(dict.fromkeys(item_key(i) for i in files))
     return elevate.Selection(invoking_user=_invoking_user_name(), only=only,
-                             keys=keys, use_quarantine=False)
+                             keys=keys, use_quarantine=False, registry=registry)
+
+
+def _backup_registry(items: Sequence[CleanableItem]):
+    """Back the HKLM entries up AS THE USER into one new quarantine run,
+    before any launch (ruling R6). ``(run or None, backed-up items, number
+    of failures)``; an entry whose backup fails is dropped. Never raises
+    (except BaseException)."""
+    from cleanix.core import quarantine, winregistry
+
+    run = quarantine.new_run()
+    backend = winregistry.get_backend()
+    kept: List[CleanableItem] = []
+    failed = 0
+    for item in items:
+        try:
+            run.store_registry(item, backend)
+            kept.append(item)
+        except Exception:  # noqa: BLE001 - this entry is simply not removed
+            failed += 1
+    if not kept:
+        try:
+            run.discard_if_empty()
+        except Exception:  # noqa: BLE001
+            pass
+        return None, [], failed
+    return run, kept, failed
+
+
+def _purge_run(run_id: Optional[str]) -> None:
+    """Remove a backup run nothing was deleted from. Never raises."""
+    if not run_id:
+        return
+    try:
+        from cleanix.core import quarantine
+
+        quarantine.purge(run_id)
+    except Exception:  # noqa: BLE001 - leaves a harmless backup behind
+        pass
 
 
 def _is_timeout(exc: BaseException) -> bool:
@@ -310,18 +368,55 @@ def run_elevated_part(admin_items: Sequence[CleanableItem], config=None, *,
     the request was written): if it is set, the launcher is never called and
     None is returned ("stopped before the administrator step"). Once the
     launcher runs, nothing here can stop it.
+
+    Registry (HKLM) items are first backed up AS THE USER into one new
+    quarantine run (``Quarantine.store_registry``); an item whose backup
+    fails is dropped from the request. The request names that run and the
+    user's quarantine root, and the helper deletes only entries that run
+    can restore. The run is purged when nothing could have been deleted
+    (declined, unavailable, cancelled or failed before the launch) and kept
+    otherwise.
     """
     del use_quarantine, config  # the helper loads its own default config
     admin_items = list(admin_items)
-    n = len(admin_items)
-    if not n:
+    if not admin_items:
         return ElevatedOutcome(DONE, "No administrator items were selected.",
                                elevate.HelperResult(freed=0, removed=0, errors=[],
                                                     unmatched=0))
-    run = launcher or elevate_launch.launch_elevated  # looked up at call time
+    file_items = [i for i in admin_items if i.kind is not ItemKind.REGISTRY]
+    reg_items = [i for i in admin_items if i.kind is ItemKind.REGISTRY]
+    launch = launcher or elevate_launch.launch_elevated  # looked up at call time
     request_dir = None
+    backup = None
+    kept: List[CleanableItem] = []
+    failed = 0
+    launched = False
+
+    def with_registry(outcome: ElevatedOutcome) -> ElevatedOutcome:
+        outcome.registry_selected = len(reg_items)
+        outcome.registry_backup_failed = failed
+        if backup is not None:
+            outcome.registry_backup_run = backup.run_id
+            outcome.registry_backup_dir = os.path.abspath(str(backup.dir))
+        return outcome
+
     try:
-        selection = build_selection(admin_items)
+        if reg_items:
+            backup, kept, failed = _backup_registry(reg_items)
+            if not kept and not file_items:
+                return with_registry(ElevatedOutcome(
+                    FAILED, "Registry backup failed; nothing was removed."))
+        registry = None
+        if backup is not None:
+            from cleanix.core import quarantine
+
+            registry = elevate.RegistryRequest(
+                only=list(dict.fromkeys(i.cleaner_id for i in kept)),
+                keys=list(dict.fromkeys(item_key(i) for i in kept)),
+                backup_run=backup.run_id,
+                quarantine_root=os.path.realpath(str(quarantine.quarantine_root())))
+        n = len(file_items) + len(kept)
+        selection = build_selection(file_items, registry=registry)
         request_dir = elevate.make_request_dir()
         request_path = request_dir / elevate.REQUEST_NAME
         result_path = request_dir / elevate.RESULT_NAME
@@ -329,14 +424,23 @@ def run_elevated_part(admin_items: Sequence[CleanableItem], config=None, *,
         argv = elevate_launch.elevated_command(
             request_path, result_path, config_path or _config_path())
         if cancel is not None and cancel():
+            _purge_run(backup.run_id if backup is not None else None)
             return None
-        outcome = _launch(run, argv, n, result_path, selection.nonce)
+        launched = True
+        outcome = _launch(launch, argv, n, result_path, selection.nonce)
         outcome.launched = True
-        return outcome
+        if outcome.status in (DECLINED, UNAVAILABLE) and backup is not None:
+            # The helper never ran: nothing was deleted, drop the backups.
+            _purge_run(backup.run_id)
+            backup = None
+        return with_registry(outcome)
     except Exception as exc:  # noqa: BLE001 - surfaced as a plain failure
-        return ElevatedOutcome(
+        if not launched and backup is not None:
+            _purge_run(backup.run_id)
+            backup = None
+        return with_registry(ElevatedOutcome(
             FAILED, "Administrator cleaning failed. Scan again to see what is left.",
-            detail=type(exc).__name__)
+            detail=type(exc).__name__))
     finally:
         if request_dir is not None:
             shutil.rmtree(request_dir, ignore_errors=True)
@@ -411,10 +515,31 @@ def record_admin_history(outcome: Optional[ElevatedOutcome]) -> None:
 MAX_SHOWN_ERRORS = 5
 
 
-def admin_preview_line(count: int, size: int) -> str:
-    """Dry-run line for administrator items (nothing was elevated)."""
-    return (f"{count} administrator item(s) ({human_size(int(size or 0))}) would be "
-            "removed after one administrator prompt; they cannot be undone")
+def _entries(n: int) -> str:
+    return f"{n} registry entry" if n == 1 else f"{n} registry entries"
+
+
+def _undo_shipped() -> bool:
+    try:
+        from cleanix.core import regpromises
+
+        return bool(regpromises.registry_undo_shipped())
+    except Exception:  # noqa: BLE001 - never promise undo on doubt
+        return False
+
+
+def admin_preview_line(count: int, size: int, registry: int = 0) -> str:
+    """Dry-run line for administrator items (nothing was elevated).
+    ``registry`` of them are HKLM registry entries, which are backed up
+    first; that is only said once registry undo has shipped (regpromises)."""
+    head = (f"{count} administrator item(s) ({human_size(int(size or 0))}) would be "
+            "removed after one administrator prompt; ")
+    registry = int(registry or 0)
+    if registry > 0 and _undo_shipped():
+        verb = "is" if registry == 1 else "are"
+        return head + (f"files and commands cannot be undone, {_entries(registry)} "
+                       f"{verb} backed up first")
+    return head + "they cannot be undone"
 
 
 def admin_outcome_lines(summary) -> List[str]:
@@ -422,7 +547,8 @@ def admin_outcome_lines(summary) -> List[str]:
     (empty when there were no administrator items)."""
     preview = int(getattr(summary, "admin_preview_count", 0) or 0)
     if preview:
-        return [admin_preview_line(preview, getattr(summary, "admin_preview_size", 0))]
+        return [admin_preview_line(preview, getattr(summary, "admin_preview_size", 0),
+                                   getattr(summary, "admin_preview_registry", 0))]
     selected = int(getattr(summary, "admin_selected", 0) or 0)
     outcome: Optional[ElevatedOutcome] = getattr(summary, "admin", None)
     if not selected:
@@ -444,6 +570,19 @@ def admin_outcome_lines(summary) -> List[str]:
     failed = not lines
     if failed:
         lines.append("Administrator cleaning failed (see details)")
+    reg_failed = int(getattr(outcome, "registry_backup_failed", 0) or 0)
+    if reg_failed:
+        was = "was" if reg_failed == 1 else "were"
+        lines.append(f"{_entries(reg_failed)} could not be backed up and {was} "
+                     "not removed")
+    shipped = _undo_shipped()
+    reg_run = getattr(outcome, "registry_backup_run", None)
+    if reg_run and shipped:
+        lines.append(
+            f"Registry entries were backed up to quarantine run {reg_run} "
+            f"({getattr(outcome, 'registry_backup_dir', '')}); to restore, from an "
+            f"Administrator terminal run cleanix restore {reg_run} or reg import "
+            "each .reg file there")
     if getattr(summary, "late_cancel", False):
         lines.append(LATE_CANCEL_LINE)
     if failed:
@@ -468,8 +607,12 @@ def admin_outcome_lines(summary) -> List[str]:
             lines.append(f"{len(res.errors)} administrator error(s):")
             lines.extend(f"  {e}" for e in res.errors[:MAX_SHOWN_ERRORS])
         if res.removed:
-            lines.append("Administrator items are removed permanently; "
-                         "they cannot be undone.")
+            if shipped and int(getattr(outcome, "registry_selected", 0) or 0):
+                lines.append("Administrator files and commands are removed "
+                             "permanently; they cannot be undone.")
+            else:
+                lines.append("Administrator items are removed permanently; "
+                             "they cannot be undone.")
         lines.append("Scan again to refresh the list.")
     return lines
 
