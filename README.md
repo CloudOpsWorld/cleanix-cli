@@ -491,6 +491,38 @@ cleanix factory-reset
 cleanix factory-reset --scope user
 ```
 
+### Windows registry cleaners (opt-in)
+
+Five detectors look for dead registry entries: `win_reg_uninstall`,
+`win_reg_app_paths`, `win_reg_file_assoc`, `win_reg_startup` and
+`win_reg_shared_dlls`. They are Windows only and **never** part of a plain
+`cleanix scan` / `cleanix clean`, a `--profile`, or the scheduled scan; name
+them explicitly (`cleanix list` shows them as `opt-in`):
+
+```bash
+cleanix scan --only win_reg_uninstall,win_reg_startup          # read-only
+cleanix scan --only win_reg_uninstall --json                    # targets in JSON
+cleanix clean --only win_reg_uninstall --execute                # lists every key/value, asks first
+cleanix clean --only win_reg_uninstall --execute --yes          # no prompt
+cleanix restore <run-id>                                        # undo, once shipped
+```
+
+Scan output and JSON show each target as `HKCU\path\to\key [value]` (control
+characters are shown escaped); JSON items add `kind`, `target` and
+`registry` (`{"hive","key","value"}` or `null`), and cleaners add `registry`.
+Machine-wide (`HKLM`) entries are only removed from an elevated
+(Administrator) terminal; without one they are skipped with a message.
+Restoring a run that contains `HKLM` entries also needs an Administrator
+terminal: `cleanix restore` prints exactly what will be written and asks you
+to type `yes` (`--yes` is accepted only together with an explicit run id).
+
+What the CLI promises about backups follows what this version ships. While
+registry undo is not shipped, the CLI says registry entries are removed
+permanently and no backup or restore is available. Once shipped, `HKCU`
+entries are backed up before removal and can be restored with
+`cleanix restore <run>`; `HKLM` entries are backed up too, but restoring them
+needs an Administrator terminal.
+
 ## Configuration via CLI
 
 `cleanix config` reads/writes `~/.config/cleanix/config.yaml` (`%APPDATA%\cleanix\config.yaml` on Windows) with type-checked

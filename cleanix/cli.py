@@ -18,15 +18,19 @@ from pathlib import Path
 from typing import List, Optional
 
 from rich.console import Console
+from rich.markup import escape
 from rich.prompt import Confirm, Prompt
 
 from cleanix import __version__
 from cleanix.config import Config
 from cleanix.core.engine import Engine
-from cleanix.core.models import ScanResult
+from cleanix.core.models import ItemKind, ScanResult, item_target
 from cleanix.core.registry import build_cleaners, describe_all, unknown_ids
 from cleanix.core.report import (
+    registry_items,
+    registry_notice,
     render_clean_summary,
+    render_registry_items,
     render_report_only,
     render_scan_table,
     scan_to_json,
@@ -124,6 +128,23 @@ def _elevate_text() -> str:
     return "re-run with sudo"
 
 
+def _is_elevated() -> bool:
+    """Administrator on Windows, root elsewhere (patchable for tests)."""
+    from cleanix.core import platform as plat
+    from cleanix.core import winenv
+
+    if plat.is_windows():
+        return bool(winenv.is_admin())
+    return is_root()
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def _disk_label() -> str:
     """The volume reported by _disk_free(): the system drive on Windows."""
     from cleanix.core import platform as plat
@@ -155,8 +176,10 @@ def _interactive_select(items: list, console: Console) -> list:
     console.print("\n[bold]Select items to remove[/bold] "
                   "(all selected by default):")
     for idx, i in enumerate(ordered, 1):
+        label = (escape(item_target(i)) if i.kind is ItemKind.REGISTRY
+                 else i.description)
         console.print(f"  [cyan]{idx:>3}[/cyan]  {human_size(i.size):>10}  "
-                      f"{i.description}")
+                      f"{label}")
     raw = Prompt.ask(
         "Enter numbers to SKIP (comma/space/ranges, e.g. 1,3-5), "
         "or press Enter to remove all",
@@ -183,7 +206,10 @@ def _write_simulation(items: list, console: Console) -> int:
 
     lines = []
     for i in sorted(items, key=lambda x: x.size, reverse=True):
-        target = i.path or ("$ " + " ".join(i.command or []))
+        if i.kind is ItemKind.COMMAND:
+            target = "$ " + item_target(i)
+        else:
+            target = item_target(i)
         root = " [root]" if i.requires_root else ""
         lines.append(f"{human_size(i.size):>10}  {target}{root}")
     body = "\n".join(lines) + "\n"
@@ -199,7 +225,7 @@ def _write_simulation(items: list, console: Console) -> int:
         f"{human_size(sum(i.size for i in items))} would be reclaimed. "
         "[dim]Nothing was deleted.[/dim]"
     )
-    console.print(body.rstrip())
+    console.print(escape(body.rstrip()))
     if where:
         console.print(f"[dim]Written to {where}[/dim]")
     return 0
@@ -292,6 +318,7 @@ def cmd_list(args: argparse.Namespace, console: Console) -> int:
     table.add_column("root?", justify="center")
     table.add_column("platforms", style="magenta")
     table.add_column("here?", justify="center")
+    table.add_column("default", justify="center")
     table.add_column("description", style="dim")
     for cid, cleaner in describe_all(config).items():
         plats = "all" if ALL in cleaner.platforms else ",".join(cleaner.platforms)
@@ -304,6 +331,7 @@ def cmd_list(args: argparse.Namespace, console: Console) -> int:
             "yes" if cleaner.requires_root else "no",
             plats,
             "[green]✓[/green]" if here else "[dim]–[/dim]",
+            "on" if cleaner.default_enabled else "[yellow]opt-in[/yellow]",
             cleaner.description,
         )
     console.print(table)
@@ -372,6 +400,10 @@ def cmd_scan(args: argparse.Namespace, console: Console) -> int:
         if result.report_only_items():
             console.print()
             render_report_only(result, console)
+        reg_items = registry_items(result.cleanable_items())
+        if reg_items:
+            console.print()
+            render_registry_items(reg_items, console)
         if result.cleanable_items():
             console.print(
                 "\nRun [bold]cleanix clean[/bold] to preview removal, or "
@@ -410,13 +442,12 @@ def cmd_explain(args: argparse.Namespace, console: Console) -> int:
     table.add_column("Delete?", justify="center")
     table.add_column("Path / command", style="cyan", overflow="fold")
     for i in sorted(report.items, key=lambda x: x.size, reverse=True):
-        target = i.path or " ".join(i.command or [])
         table.add_row(
             human_size(i.size),
             i.kind.value,
             "yes" if i.requires_root else "no",
             "[yellow]report-only[/yellow]" if i.report_only else "yes",
-            target,
+            escape(item_target(i)),
         )
     console.print(table)
     console.print(f"[dim]{report.count} item(s), "
@@ -452,6 +483,20 @@ def cmd_clean(args: argparse.Namespace, console: Console) -> int:
             "report-only and must be removed manually.)"
         )
         return 0
+    reg_items = registry_items(items)
+    if reg_items:
+        console.print()
+        render_registry_items(reg_items, console)
+        # Registry cleaners are opt-in: a registry item is only ever acted on
+        # when its cleaner was named explicitly.
+        named = {c.lower() for c in (_split_csv(args.only) or [])}
+        if any(i.cleaner_id.lower() not in named for i in reg_items):
+            console.print(
+                "\n[red]Registry cleaners must be selected explicitly with "
+                "--only (for example --only win_reg_uninstall). Nothing was "
+                "changed.[/red]"
+            )
+            return 2
     root_items = [i for i in items if i.requires_root]
     if root_items and not is_root():
         console.print(
@@ -475,17 +520,45 @@ def cmd_clean(args: argparse.Namespace, console: Console) -> int:
         result = engine.clean(items, dry_run=True)
         console.print()
         render_clean_summary(result, console)
+        if reg_items:
+            console.print(
+                "[dim]Registry entries listed above would be removed; "
+                "nothing in the registry was touched.[/dim]"
+            )
         console.print(
             "\n[dim]This was a dry run. Add [bold]--execute[/bold] to actually "
             "remove these items.[/dim]"
         )
         return 0
 
+    # Machine-wide registry entries can only be removed from an elevated
+    # terminal; the rest of the selection still goes ahead.
+    if reg_items and not _is_elevated():
+        hklm = [i for i in reg_items if i.reg is not None and i.reg.hive == "HKLM"]
+        if hklm:
+            console.print(
+                f"\n[yellow]{len(hklm)} machine-wide (HKLM) registry entr"
+                f"{'y' if len(hklm) == 1 else 'ies'} need an elevated "
+                f"(Administrator) terminal and will be skipped; "
+                f"{_elevate_text()} to include them.[/yellow]"
+            )
+            items = [i for i in items if i not in hklm]
+            reg_items = [i for i in reg_items if i not in hklm]
+            if not items:
+                console.print("Nothing was changed.")
+                return 1
+
     # Real deletion — require confirmation unless --yes.
+    if reg_items:
+        console.print("\n[bold]These registry entries will be removed:[/bold]")
+        for i in reg_items:
+            console.print(f"  {escape(item_target(i))}")
+        console.print(f"[yellow]{escape(registry_notice())}[/yellow]")
     if not args.yes:
         console.print()
         confirmed = Confirm.ask(
-            f"Permanently remove {len(items)} item(s) and reclaim up to "
+            f"{'Remove' if reg_items else 'Permanently remove'} "
+            f"{len(items)} item(s) and reclaim up to "
             f"{human_size(scan.cleanable_size)}?",
             default=False,
         )
@@ -494,13 +567,24 @@ def cmd_clean(args: argparse.Namespace, console: Console) -> int:
             return 1
 
     quarantine = None
-    if args.quarantine:
-        from cleanix.core import quarantine as qmod
-        quarantine = qmod.new_run()
-
+    summary = None
     free_before = _disk_free()
-    with console.status("Cleaning..."):
-        result = engine.clean(items, dry_run=False, quarantine=quarantine)
+    if reg_items:
+        # The service layer always backs registry entries up first (it creates
+        # the backup run), records history and saves the run.
+        from cleanix.core import service
+
+        with console.status("Cleaning..."):
+            summary = service.clean(
+                items, config, dry_run=False, use_quarantine=bool(args.quarantine)
+            )
+        result = summary.result
+    else:
+        if args.quarantine:
+            from cleanix.core import quarantine as qmod
+            quarantine = qmod.new_run()
+        with console.status("Cleaning..."):
+            result = engine.clean(items, dry_run=False, quarantine=quarantine)
     console.print()
     render_clean_summary(result, console)
 
@@ -517,11 +601,21 @@ def cmd_clean(args: argparse.Namespace, console: Console) -> int:
 
     # Record history, write a per-file audit manifest, and finalize quarantine.
     from cleanix.core import history
-    history.record(result.freed, result.removed_count,
-                   mode="quarantine" if quarantine else "delete")
-    manifest = history.write_manifest(result)
+    if summary is not None:
+        manifest = summary.manifest_path or ""
+        reg_removed = sum(
+            1 for o in result.outcomes
+            if o.removed and o.item.kind is ItemKind.REGISTRY
+        )
+        history.annotate_last_registry(reg_removed)
+    else:
+        history.record(result.freed, result.removed_count,
+                       mode="quarantine" if quarantine else "delete")
+        manifest = history.write_manifest(result)
     if manifest:
         console.print(f"[dim]Audit log: {manifest}[/dim]")
+    if summary is not None:
+        _print_registry_outcome(summary, args, console)
     if quarantine is not None and quarantine.items:
         quarantine.save()
         console.print(
@@ -531,6 +625,40 @@ def cmd_clean(args: argparse.Namespace, console: Console) -> int:
             f"[bold]cleanix restore[/bold]."
         )
     return 0 if not result.errors else 2
+
+
+def _print_registry_outcome(summary, args, console: Console) -> None:
+    """After a clean that included registry entries: what was removed and what
+    the user may truthfully do about it (read from regpromises)."""
+    from cleanix.core import regpromises
+
+    outcomes = summary.result.outcomes
+    reg_done = [o for o in outcomes
+                if o.removed and o.item.kind is ItemKind.REGISTRY]
+    files_done = [o for o in outcomes
+                  if o.removed and o.item.kind is ItemKind.PATH]
+    run_id = summary.quarantine_run
+    if args.quarantine and files_done and run_id:
+        console.print(
+            f"\n[cyan]Moved {len(files_done)} item(s) to quarantine "
+            f"'{run_id}'.[/cyan] Space is reclaimed once you run "
+            f"[bold]cleanix quarantine empty[/bold]."
+        )
+    if reg_done:
+        if not regpromises.registry_undo_shipped():
+            console.print(f"\n[yellow]{escape(registry_notice())}[/yellow]")
+        elif run_id:
+            note = ""
+            if any(o.item.reg is not None and o.item.reg.hive == "HKLM"
+                   for o in reg_done):
+                note = (" Restoring HKLM entries needs an Administrator "
+                        "terminal.")
+            console.print(
+                f"\n[cyan]Registry backup saved in run '{run_id}'; undo with "
+                f"[bold]cleanix restore {run_id}[/bold].[/cyan]{note}"
+            )
+    if summary.undo_record_error:
+        console.print(f"[red]{escape(summary.undo_record_error)}[/red]")
 
 
 def cmd_config(args: argparse.Namespace, console: Console) -> int:
@@ -885,12 +1013,60 @@ def cmd_dashboard(args: argparse.Namespace, console: Console) -> int:
 def cmd_restore(args: argparse.Namespace, console: Console) -> int:
     from cleanix.core import quarantine
 
+    if getattr(args, "yes", False) and not args.run_id:
+        console.print(
+            "[red]--yes needs an explicit run id; it is never accepted for "
+            "the latest run. Nothing was restored.[/red]"
+        )
+        return 2
     run_id = args.run_id or quarantine.latest_run()
     if not run_id:
         console.print("[yellow]Nothing in quarantine to restore.[/yellow]")
         return 1
+
+    # Machine-wide (HKLM) registry entries: show exactly what would be
+    # written and get an explicit confirmation before allowing it.
+    allow_machine = False
+    info = next((r for r in quarantine.list_runs() if r["run_id"] == run_id), None)
+    if info and info.get("registry_admin"):
+        if not _is_elevated():
+            console.print(
+                "[yellow]This run contains machine-wide (HKLM) registry "
+                "entries. Restoring them needs an Administrator terminal: "
+                f"open one and run `cleanix restore {run_id}`. Other entries "
+                "in the run are restored now.[/yellow]"
+            )
+        else:
+            try:
+                lines = quarantine.describe_registry_entries(run_id)
+            except FileNotFoundError as exc:
+                console.print(f"[red]{escape(str(exc))}[/red]")
+                return 1
+            if lines:
+                console.print("\n[bold]Registry entries that will be written:[/bold]")
+                for line in lines:
+                    console.print(f"  {escape(line)}")
+                if not getattr(args, "yes", False):
+                    if not _stdin_is_tty():
+                        console.print(
+                            "[red]Refusing to restore machine-wide registry "
+                            "entries non-interactively. Run in a terminal, or "
+                            "pass the run id with --yes.[/red]"
+                        )
+                        return 2
+                    answer = Prompt.ask(
+                        "Type [bold]yes[/bold] to write these entries "
+                        "(anything else aborts)"
+                    )
+                    if answer.strip() != "yes":
+                        console.print("Aborted. Nothing was restored.")
+                        return 1
+                allow_machine = True
     try:
-        res = quarantine.restore(run_id)
+        if allow_machine:
+            res = quarantine.restore(run_id, allow_machine_restore=True)
+        else:
+            res = quarantine.restore(run_id)
     except FileNotFoundError as exc:
         console.print(f"[red]{exc}[/red]")
         return 1
@@ -898,7 +1074,7 @@ def cmd_restore(args: argparse.Namespace, console: Console) -> int:
         f"[green]Restored {len(res['restored'])} item(s)[/green] from '{run_id}'."
     )
     for path, why in res["failed"]:
-        console.print(f"  [red]![/red] {path}: {why}")
+        console.print(f"  [red]![/red] {escape(str(path))}: {escape(str(why))}")
     return 0 if not res["failed"] else 2
 
 
@@ -1156,6 +1332,12 @@ def build_parser() -> argparse.ArgumentParser:
     # restore / quarantine
     p_restore = sub.add_parser("restore", help="undo a clean from quarantine")
     p_restore.add_argument("run_id", nargs="?", help="run id (default: latest)")
+    p_restore.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the typed confirmation for machine-wide registry entries "
+        "(only together with an explicit run id)",
+    )
     p_restore.set_defaults(func=cmd_restore)
 
     p_quar = sub.add_parser("quarantine", help="manage the quarantine store")
