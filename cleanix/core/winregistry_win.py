@@ -8,23 +8,35 @@ Rules every method follows:
 
 * ``hive`` is exactly ``"HKCU"`` or ``"HKLM"``; anything else is a
   :class:`ValueError` raised before any registry call. ``key`` is a physical
-  path below the hive (``WOW6432Node`` spelled out); malformed keys (empty,
-  empty components, NUL) are a :class:`ValueError` too.
+  path below the hive (``WOW6432Node`` spelled out); an empty key or an empty
+  component is a :class:`ValueError` (a caller bug).
+* A key or value name containing NUL (which only registry data can supply,
+  e.g. an odd subkey name met during a scan) raises
+  :class:`InvalidRegistryName`, which is both a :class:`RegistryError` and a
+  :class:`ValueError`, so a snapshot or detector skips it instead of crashing.
 * Every open, create and delete carries ``KEY_WOW64_64KEY``: there is no
   registry redirection, and the 32-bit view is reached only through explicit
   ``WOW6432Node`` paths.
-* Links are never followed where it matters: ``is_link`` opens the key itself
-  with ``REG_OPTION_OPEN_LINK``, and ``delete_key``/``delete_value``/
-  ``set_value`` refuse a key that is a registry link.
+* Links: ``is_link`` and ``key_exists`` open the key itself with
+  ``REG_OPTION_OPEN_LINK``; ``delete_key``, ``delete_value`` and ``set_value``
+  check the key through an ``REG_OPTION_OPEN_LINK`` handle and refuse a
+  registry link.
 * Deletes are leaf-only (``DeleteKeyEx``, never a tree delete) and values are
   deleted by exact name.
 * Every ``OSError`` becomes :class:`KeyMissing` (not found),
   :class:`AccessDenied` (denied) or :class:`RegistryError` (anything else,
-  e.g. in use / marked for deletion). Handles are always closed.
+  e.g. in use / marked for deletion). Handles are always closed; a failing
+  close never masks the error already in flight.
 
-The leaf and link checks in ``delete_key`` run immediately before
-``DeleteKeyEx``; the remaining window between the caller's final fingerprint
-check and the delete is accepted (plan ruling R17).
+Residual race (plan ruling R17): ``delete_key`` checks link-ness and
+leaf-ness on a handle immediately before ``DeleteKeyEx``, but ``DeleteKeyEx``
+resolves the path again. ``RegDeleteKeyEx`` very likely follows a link in the
+last path component, so if the leaf is replaced by a registry link inside that
+window, the link's TARGET key (when it is a leaf) may be deleted, not merely a
+stale entry. The window is kept minimal (no work between the check and the
+delete), the caller (Task 11) re-verifies the target's fingerprint
+immediately before calling ``delete_key``, and Task 14 measures the real
+behaviour.
 """
 
 from __future__ import annotations
@@ -49,7 +61,13 @@ _ERROR_NO_MORE_ITEMS = 259
 _LINK_VALUE = "SymbolicLinkValue"
 
 
-def _map_error(exc: OSError, what: str) -> RegistryError:
+class InvalidRegistryName(RegistryError, ValueError):
+    """A key or value name the registry API cannot take (embedded NUL)."""
+
+
+def _map_error(exc: BaseException, what: str) -> RegistryError:
+    if isinstance(exc, ValueError):
+        return InvalidRegistryName(f"invalid name: {what!r}")
     winerror = getattr(exc, "winerror", None)
     if isinstance(exc, FileNotFoundError) or winerror in (
         _ERROR_FILE_NOT_FOUND, _ERROR_PATH_NOT_FOUND
@@ -64,7 +82,9 @@ def _map_error(exc: OSError, what: str) -> RegistryError:
 def _mapped(what: str) -> Iterator[None]:
     try:
         yield
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, RegistryError):
+            raise
         raise _map_error(exc, what) from exc
 
 
@@ -83,14 +103,19 @@ def _is_end(exc: OSError) -> bool:
 
 
 def _check_key(key: Any) -> str:
-    if (
-        not isinstance(key, str)
-        or not key
-        or "\x00" in key
-        or any(part == "" for part in key.split("\\"))
-    ):
+    if not isinstance(key, str) or not key or any(p == "" for p in key.split("\\")):
         raise ValueError(f"malformed registry key: {key!r}")
+    if "\x00" in key:
+        raise InvalidRegistryName(f"invalid name: {key!r}")
     return key
+
+
+def _check_name(name: Any) -> str:
+    if not isinstance(name, str):
+        raise ValueError(f"malformed value name: {name!r}")
+    if "\x00" in name:
+        raise InvalidRegistryName(f"invalid name: {name!r}")
+    return name
 
 
 def _norm_data(data: Any) -> Any:
@@ -125,18 +150,35 @@ class WinRegBackend:
     def _view(self, access: int) -> int:
         return access | self._w.KEY_WOW64_64KEY
 
+    def _close(self, handle: Any, what: str) -> None:
+        """Close ``handle`` after a successful operation; a close failure is
+        a :class:`RegistryError`. (On the error path, see _close_quietly.)"""
+        try:
+            self._w.CloseKey(handle)
+        except OSError as exc:
+            raise RegistryError(f"{what}: closing the key failed: {exc}") from exc
+
     @contextmanager
     def _open(self, hive: str, key: str, access: int, options: int = 0) -> Iterator[Any]:
         """Open ``hive\\key`` (64-bit view) and always close the handle.
         Opening errors are mapped; errors inside the block propagate as is."""
         root = self._root(hive)
         _check_key(key)
-        with _mapped(f"{hive}\\{key}"):
+        what = f"{hive}\\{key}"
+        with _mapped(what):
             handle = self._w.OpenKeyEx(root, key, options, self._view(access))
         try:
             yield handle
-        finally:
+        except BaseException:
+            self._close_quietly(handle)
+            raise
+        self._close(handle, what)
+
+    def _close_quietly(self, handle: Any) -> None:
+        try:
             self._w.CloseKey(handle)
+        except OSError:
+            pass  # the exception already in flight is the one to report
 
     def _handle_is_link(self, h: Any, what: str) -> bool:
         try:
@@ -145,45 +187,42 @@ class WinRegBackend:
             if _is_missing(exc):
                 return False
             raise _map_error(exc, what) from exc
+        except ValueError as exc:
+            raise _map_error(exc, what) from exc
         return typ == REG_LINK
 
     def _refuse_link(self, h: Any, what: str) -> None:
         if self._handle_is_link(h, what):
             raise RegistryError(f"refusing to modify a registry link: {what}")
 
+    def _enumerate(self, h: Any, fn: Any, what: str) -> List[Any]:
+        out: List[Any] = []
+        i = 0
+        while True:
+            try:
+                out.append(fn(h, i))
+            except OSError as exc:
+                if _is_end(exc):
+                    return out
+                raise _map_error(exc, what) from exc
+            except ValueError as exc:
+                raise _map_error(exc, what) from exc
+            i += 1
+
     # -- RegistryBackend -----------------------------------------------------
     def subkeys(self, hive: str, key: str) -> List[str]:
         what = f"{hive}\\{key}"
-        out: List[str] = []
-        with self._open(hive, key, self._w.KEY_ENUMERATE_SUB_KEYS | self._w.KEY_QUERY_VALUE) as h:
-            i = 0
-            while True:
-                try:
-                    out.append(self._w.EnumKey(h, i))
-                except OSError as exc:
-                    if _is_end(exc):
-                        break
-                    raise _map_error(exc, what) from exc
-                i += 1
-        return out
+        with self._open(hive, key, self._w.KEY_ENUMERATE_SUB_KEYS) as h:
+            return self._enumerate(h, self._w.EnumKey, what)
 
     def values(self, hive: str, key: str) -> List[RegValue]:
         what = f"{hive}\\{key}"
-        out: List[RegValue] = []
         with self._open(hive, key, self._w.KEY_QUERY_VALUE) as h:
-            i = 0
-            while True:
-                try:
-                    name, data, typ = self._w.EnumValue(h, i)
-                except OSError as exc:
-                    if _is_end(exc):
-                        break
-                    raise _map_error(exc, what) from exc
-                out.append(RegValue(name, typ, _norm_data(data)))
-                i += 1
-        return out
+            raw = self._enumerate(h, self._w.EnumValue, what)
+        return [RegValue(name, typ, _norm_data(data)) for name, data, typ in raw]
 
     def key_exists(self, hive: str, key: str) -> bool:
+        """Whether the key itself exists; a link counts even if dangling."""
         try:
             with self._open(hive, key, self._w.KEY_QUERY_VALUE, self._w.REG_OPTION_OPEN_LINK):
                 return True
@@ -204,6 +243,7 @@ class WinRegBackend:
         if value is None:
             access = DELETE | self._w.KEY_ENUMERATE_SUB_KEYS | self._w.KEY_QUERY_VALUE
         else:
+            _check_name(value)
             access = self._w.KEY_SET_VALUE | self._w.KEY_QUERY_VALUE
         try:
             with self._open(hive, key, access) as h:
@@ -214,13 +254,16 @@ class WinRegBackend:
                         if _is_missing(exc) or _is_denied(exc):
                             return False
                         raise _map_error(exc, what) from exc
+                    except ValueError as exc:
+                        raise _map_error(exc, what) from exc
                 return True
         except (KeyMissing, AccessDenied):
             return False
 
     def delete_key(self, hive: str, key: str) -> None:
         """Delete a leaf key. A key with subkeys or a registry link is
-        refused with :class:`RegistryError` and nothing is deleted."""
+        refused with :class:`RegistryError` and nothing is deleted. See the
+        module docstring for the residual race (R17)."""
         root = self._root(hive)
         what = f"{hive}\\{key}"
         with self._open(
@@ -233,12 +276,11 @@ class WinRegBackend:
                 n_subkeys = self._w.QueryInfoKey(h)[0]
         if n_subkeys:
             raise RegistryError(f"key has subkeys: {what}")
-        with _mapped(what):
+        with _mapped(what):  # nothing else between the check and the delete
             self._w.DeleteKeyEx(root, key, self._w.KEY_WOW64_64KEY, 0)
 
     def delete_value(self, hive: str, key: str, name: str) -> None:
-        if not isinstance(name, str) or "\x00" in name:
-            raise ValueError(f"malformed value name: {name!r}")
+        _check_name(name)
         what = f"{hive}\\{key}"
         # One handle to the key itself (never a link target): the link check
         # and the delete act on the same key.
@@ -254,13 +296,13 @@ class WinRegBackend:
     def create_key(self, hive: str, key: str) -> None:
         root = self._root(hive)
         _check_key(key)
-        with _mapped(f"{hive}\\{key}"):
+        what = f"{hive}\\{key}"
+        with _mapped(what):
             handle = self._w.CreateKeyEx(root, key, 0, self._view(self._w.KEY_WRITE))
-        self._w.CloseKey(handle)
+        self._close(handle, what)
 
     def set_value(self, hive: str, key: str, value: RegValue) -> None:
-        if not isinstance(value.name, str) or "\x00" in value.name:
-            raise ValueError(f"malformed value name: {value.name!r}")
+        _check_name(value.name)
         what = f"{hive}\\{key}"
         data = value.data
         if value.type == REG_MULTI_SZ and isinstance(data, tuple):

@@ -71,11 +71,14 @@ class _Node:
 
 
 class _Handle:
-    def __init__(self, fake: "FakeWinreg", node: _Node) -> None:
+    def __init__(self, fake: "FakeWinreg", node: _Node, access: int, options: int = 0) -> None:
         self.fake = fake
         self.node = node
+        self.access = access
+        self.options = options
         self.closed = False
         fake.opened += 1
+        fake.handles.append(self)
 
     def Close(self) -> None:
         if not self.closed:
@@ -109,7 +112,13 @@ class FakeWinreg:
     REG_MULTI_SZ = REG_MULTI_SZ
     REG_QWORD = REG_QWORD
 
-    def __init__(self) -> None:
+    def __init__(self, delete_follows_final_link: bool = True) -> None:
+        # Pessimistic model of RegDeleteKeyEx: a link as the last path
+        # component is followed and its target (if a leaf) is deleted.
+        self.delete_follows_final_link = delete_follows_final_link
+        self.handles: List[_Handle] = []
+        self.before: Dict[str, object] = {}  # op -> callable run before it
+        self.close_fails = False
         self.HKEY_CURRENT_USER = _Hive("HKCU")
         self.HKEY_LOCAL_MACHINE = _Hive("HKLM")
         self.HKEY_CLASSES_ROOT = _Hive("HKCR")
@@ -156,6 +165,9 @@ class FakeWinreg:
     # -- internals -----------------------------------------------------------
     def _enter(self, op: str, *args) -> None:
         self.calls.append((op,) + args)
+        hook = self.before.pop(op, None)
+        if hook is not None:
+            hook()
         exc = self._fail.pop(op, None)
         if exc is not None:
             raise exc
@@ -163,6 +175,19 @@ class FakeWinreg:
     def _check_view(self, access: int) -> None:
         if not access & KEY_WOW64_64KEY or access & KEY_WOW64_32KEY:
             raise AssertionError(f"registry view not explicitly 64-bit: {access:#x}")
+
+    @staticmethod
+    def _need(h, right: int) -> None:
+        """Like Windows: an operation needs the right on the handle."""
+        if isinstance(h, _Handle) and not h.access & right:
+            raise _err(5, PermissionError, msg=f"handle lacks {right:#x}")
+
+    @staticmethod
+    def _name(name) -> None:
+        if not isinstance(name, str):
+            raise TypeError("name must be str")
+        if "\x00" in name:
+            raise ValueError("embedded null character")  # as CPython does
 
     def _base(self, key) -> _Node:
         if isinstance(key, _Handle):
@@ -205,14 +230,18 @@ class FakeWinreg:
     def OpenKeyEx(self, key, sub_key, reserved=0, access=KEY_READ):
         self._enter("OpenKeyEx", key, sub_key, reserved, access)
         self._check_view(access)
+        self._name(sub_key)
         node = self._resolve(key, sub_key, follow_last=not reserved & REG_OPTION_OPEN_LINK)
         if node.deny_mask & access:
             raise _err(5, PermissionError)
-        return _Handle(self, node)
+        return _Handle(self, node, access, reserved)
 
     def CreateKeyEx(self, key, sub_key, reserved=0, access=KEY_WRITE):
         self._enter("CreateKeyEx", key, sub_key, reserved, access)
         self._check_view(access)
+        self._name(sub_key)
+        if reserved != 0:  # RegCreateKeyEx's Reserved must be zero
+            raise _err(87, msg="invalid parameter")
         node = self._base(key)
         for part in sub_key.split("\\"):
             nxt = node.children.get(part.casefold())
@@ -223,14 +252,17 @@ class FakeWinreg:
             node = nxt
             if node.link_to is not None:
                 node = self._resolve(node.link_to[0], node.link_to[1], True)
-        return _Handle(self, node)
+        return _Handle(self, node, access)
 
     def CloseKey(self, h) -> None:
         if isinstance(h, _Handle):
             h.Close()
+            if self.close_fails:
+                raise _err(6, msg="invalid handle")
 
     def EnumKey(self, h, index: int) -> str:
         self._enter("EnumKey", h, index)
+        self._need(h, KEY_ENUMERATE_SUB_KEYS)
         kids = list(self._base(h).children.values())
         if index >= len(kids):
             raise _err(259, msg="no more data")
@@ -238,6 +270,7 @@ class FakeWinreg:
 
     def EnumValue(self, h, index: int):
         self._enter("EnumValue", h, index)
+        self._need(h, KEY_QUERY_VALUE)
         vals = list(self._base(h).values.values())
         if index >= len(vals):
             raise _err(259, msg="no more data")
@@ -246,6 +279,8 @@ class FakeWinreg:
 
     def QueryValueEx(self, h, name: str):
         self._enter("QueryValueEx", h, name)
+        self._name(name)
+        self._need(h, KEY_QUERY_VALUE)
         found = self._base(h).values.get(name.casefold())
         if found is None:
             raise _err(2, FileNotFoundError)
@@ -253,22 +288,32 @@ class FakeWinreg:
 
     def QueryInfoKey(self, h):
         self._enter("QueryInfoKey", h)
+        self._need(h, KEY_QUERY_VALUE)
         node = self._base(h)
         return len(node.children), len(node.values), 0
 
     def DeleteKeyEx(self, key, sub_key, access=KEY_WOW64_64KEY, reserved=0):
         self._enter("DeleteKeyEx", key, sub_key, access, reserved)
         self._check_view(access)
+        self._name(sub_key)
         parent, leaf = self._parent_and_name(key, sub_key)
         node = parent.children.get(leaf.casefold())
         if node is None:
             raise _err(2, FileNotFoundError)
+        if node.link_to is not None and self.delete_follows_final_link:
+            tkey, tpath = node.link_to
+            parent, leaf = self._parent_and_name(tkey, tpath)
+            node = parent.children.get(leaf.casefold())
+            if node is None:
+                raise _err(2, FileNotFoundError)
         if node.children or node.deny_delete:
             raise _err(5, PermissionError)  # Windows reports non-leaf as denied
         del parent.children[leaf.casefold()]
 
     def DeleteValue(self, h, name: str) -> None:
         self._enter("DeleteValue", h, name)
+        self._name(name)
+        self._need(h, KEY_SET_VALUE)
         node = self._base(h)
         if node.deny_delete:
             raise _err(5, PermissionError)
@@ -278,6 +323,8 @@ class FakeWinreg:
 
     def SetValueEx(self, h, name, reserved, typ, data) -> None:
         self._enter("SetValueEx", h, name, reserved, typ, data)
+        self._name(name)
+        self._need(h, KEY_SET_VALUE)
         if typ == REG_MULTI_SZ and not isinstance(data, list):
             raise TypeError("Objects of type 'tuple' can not be used as a REG_MULTI_SZ")
         self._base(h).values[name.casefold()] = (name, data, typ)
@@ -751,3 +798,147 @@ def test_matches_fake_registry_semantics(w, be):
         assert b.can_delete("HKCU", APP + r"\No", None) is False
         with pytest.raises(ValueError):
             b.subkeys("HKEY_CURRENT_USER", APP)
+
+
+# -- fix round 1 -----------------------------------------------------------------
+def _link(w, path=r"SOFTWARE\Vendor\Link", target=r"SOFTWARE\Target", values=()):
+    w.add(w.HKEY_CURRENT_USER, target, values)
+    w.add(w.HKEY_CURRENT_USER, path, link_to=(w.HKEY_CURRENT_USER, target))
+
+
+def test_set_value_refuses_link_key(w, be):
+    _link(w, values=[("A", "x", REG_SZ)])
+    with pytest.raises(RegistryError):
+        be.set_value("HKCU", r"SOFTWARE\Vendor\Link", RegValue("A", REG_SZ, "evil"))
+    assert w.find(w.HKEY_CURRENT_USER, r"SOFTWARE\Target").values == {"a": ("A", "x", REG_SZ)}
+    assert not [c for c in w.calls if c[0] == "SetValueEx"]
+    opens = [c for c in w.calls if c[0] == "OpenKeyEx"]
+    assert opens and all(c[3] & REG_OPTION_OPEN_LINK for c in opens)
+    assert w.leaked == 0
+
+
+def test_writes_open_the_key_itself_with_needed_rights(w, be):
+    w.add(w.HKEY_CURRENT_USER, APP, [("A", "x", REG_SZ)])
+    be.set_value("HKCU", APP, RegValue("B", REG_SZ, "y"))
+    be.delete_value("HKCU", APP, "A")
+    assert len(w.handles) == 2
+    for h in w.handles:
+        assert h.options == REG_OPTION_OPEN_LINK
+        assert h.access == KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY
+    assert w.leaked == 0
+
+
+def test_delete_key_check_handle_rights(w, be):
+    w.add(w.HKEY_CURRENT_USER, APP + r"\Leaf")
+    be.delete_key("HKCU", APP + r"\Leaf")
+    (h,) = w.handles  # DeleteKeyEx itself takes a path, not a handle
+    assert h.options == REG_OPTION_OPEN_LINK
+    assert h.access & KEY_QUERY_VALUE and h.access & KEY_WOW64_64KEY
+
+
+def test_subkeys_requests_only_enumerate(w, be):
+    w.add(w.HKEY_CURRENT_USER, APP + r"\One", deny_mask=KEY_QUERY_VALUE)
+    w.add(w.HKEY_CURRENT_USER, APP, deny_mask=KEY_QUERY_VALUE)
+    assert be.subkeys("HKCU", APP) == ["One"]
+    assert [h.access for h in w.handles] == [KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY]
+
+
+def test_create_key_passes_no_options(w, be):
+    be.create_key("HKCU", APP)
+    (c,) = [c for c in w.calls if c[0] == "CreateKeyEx"]
+    assert c[3] == 0
+
+
+def test_key_exists_does_not_follow_links(w, be):
+    # A dangling link exists as a key (the link itself); following it would
+    # wrongly report the key as missing.
+    w.add(w.HKEY_CURRENT_USER, r"SOFTWARE\Vendor\Dangling",
+          link_to=(w.HKEY_CURRENT_USER, r"SOFTWARE\Gone"))
+    assert be.key_exists("HKCU", r"SOFTWARE\Vendor\Dangling") is True
+    assert be.is_link("HKCU", r"SOFTWARE\Vendor\Dangling") is True
+    assert all(h.options == REG_OPTION_OPEN_LINK for h in w.handles)
+    assert w.leaked == 0
+
+
+def test_fake_delete_key_ex_follows_final_link_pessimistically(w):
+    _link(w)
+    w.DeleteKeyEx(w.HKEY_CURRENT_USER, r"SOFTWARE\Vendor\Link", KEY_WOW64_64KEY, 0)
+    assert w.find(w.HKEY_CURRENT_USER, r"SOFTWARE\Target") is None
+    assert w.find(w.HKEY_CURRENT_USER, r"SOFTWARE\Vendor\Link") is not None
+    safe = FakeWinreg(delete_follows_final_link=False)
+    _link(safe)
+    safe.DeleteKeyEx(safe.HKEY_CURRENT_USER, r"SOFTWARE\Vendor\Link", KEY_WOW64_64KEY, 0)
+    assert safe.find(safe.HKEY_CURRENT_USER, r"SOFTWARE\Target") is not None
+
+
+def test_r17_link_swapped_in_after_check_deletes_target(w, be):
+    """Documents the accepted residual race (ruling R17); not a guarantee.
+
+    delete_key checks link-ness and leaf-ness on a handle immediately before
+    DeleteKeyEx, which resolves the path again. If the leaf is replaced by a
+    registry link in between and RegDeleteKeyEx follows a final-component
+    link (the pessimistic model here), the link TARGET leaf is deleted. The
+    real behaviour must be measured in Task 14; Task 11 re-verifies the
+    target's fingerprint immediately before calling delete_key."""
+    w.add(w.HKEY_CURRENT_USER, r"SOFTWARE\Victim")
+    w.add(w.HKEY_CURRENT_USER, APP + r"\Leaf")
+
+    def swap():
+        parent = w.find(w.HKEY_CURRENT_USER, APP)
+        del parent.children["leaf"]
+        w.add(w.HKEY_CURRENT_USER, APP + r"\Leaf",
+              link_to=(w.HKEY_CURRENT_USER, r"SOFTWARE\Victim"))
+
+    w.before["DeleteKeyEx"] = swap
+    be.delete_key("HKCU", APP + r"\Leaf")
+    assert w.find(w.HKEY_CURRENT_USER, r"SOFTWARE\Victim") is None  # the consequence
+    assert w.find(w.HKEY_CURRENT_USER, APP + r"\Leaf") is not None
+
+
+def test_close_failure_does_not_mask_original_error(w, be):
+    w.add(w.HKEY_CURRENT_USER, APP + r"\One")
+    w.close_fails = True
+    w.fail_next("EnumKey", _err(5, PermissionError))
+    with pytest.raises(AccessDenied):
+        be.subkeys("HKCU", APP)
+    with pytest.raises(RegistryError) as info:  # clean body: the close error surfaces
+        be.subkeys("HKCU", APP)
+    assert type(info.value) is RegistryError
+    with pytest.raises(RegistryError):
+        be.create_key("HKCU", APP + r"\New")
+    assert w.leaked == 0
+
+
+def test_nul_names_are_registry_errors(w, be):
+    from cleanix.core.models import RegTarget
+    from cleanix.core.regsnap import SnapshotError, snapshot
+
+    bad = APP + "\\Bad\x00Name"
+    w.add(w.HKEY_CURRENT_USER, bad)
+    w.add(w.HKEY_CURRENT_USER, APP + r"\Good")
+    assert sorted(be.subkeys("HKCU", APP)) == ["Bad\x00Name", "Good"]
+    for call in (
+        lambda: be.values("HKCU", bad),
+        lambda: be.subkeys("HKCU", bad),
+        lambda: be.is_link("HKCU", bad),
+        lambda: be.key_exists("HKCU", bad),
+        lambda: be.can_delete("HKCU", bad, None),
+        lambda: be.can_delete("HKCU", APP, "V\x00"),
+        lambda: be.delete_value("HKCU", APP, "V\x00"),
+    ):
+        with pytest.raises(RegistryError) as info:
+            call()
+        assert isinstance(info.value, ValueError)  # still a ValueError for callers
+    with pytest.raises(SnapshotError):  # a scan sees a skip, not a crash
+        snapshot(be, RegTarget("HKCU", APP, None, ""))
+    # A ValueError raised by winreg itself is mapped too.
+    for op, call in (
+        ("EnumValue", lambda: be.values("HKCU", APP)),
+        ("EnumKey", lambda: be.subkeys("HKCU", APP)),
+        ("QueryValueEx", lambda: be.is_link("HKCU", APP)),
+        ("OpenKeyEx", lambda: be.can_delete("HKCU", APP, None)),
+    ):
+        w.fail_next(op, ValueError("embedded null character"))
+        with pytest.raises(RegistryError):
+            call()
+    assert w.leaked == 0
