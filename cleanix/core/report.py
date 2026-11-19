@@ -10,7 +10,14 @@ from rich.markup import escape
 from rich.table import Table
 
 from cleanix.core import regpromises
-from cleanix.core.models import CleanResult, ItemKind, ScanResult, item_target
+from cleanix.core.catalog import REGISTRY_IDS
+from cleanix.core.models import (
+    CleanResult,
+    ItemKind,
+    ScanResult,
+    _visible,
+    item_target,
+)
 from cleanix.core.utils import human_size
 
 
@@ -36,19 +43,19 @@ def render_scan_table(
 
     for report in reports:
         if not report.ran:
-            table.add_row(report.name, "-", "-", report.skipped_reason or "skipped")
+            table.add_row(safe(report.name), "-", "-", safe(report.skipped_reason or "skipped"))
             continue
         if report.count == 0:
-            table.add_row(report.name, "0", "-", "clean")
+            table.add_row(safe(report.name), "0", "-", "clean")
             continue
-        note = report.description
+        note = safe(report.description)
         if report.incomplete:
-            note = f"[yellow]incomplete: {report.incomplete}[/yellow]"
+            note = f"[yellow]incomplete: {safe(report.incomplete)}[/yellow]"
         size_cell = human_size(report.total_size)
         if report.report_only:
             note = "[yellow]report only — review manually[/yellow]"
             size_cell = f"[yellow]{size_cell}[/yellow]"
-        table.add_row(report.name, str(report.count), size_cell, note)
+        table.add_row(safe(report.name), str(report.count), size_cell, note)
 
     table.add_section()
     table.add_row(
@@ -65,6 +72,14 @@ def render_scan_table(
             "[dim]not deleted by cleanix[/dim]",
         )
     console.print(table)
+
+
+def safe(text) -> str:
+    """Make any externally derived string (item descriptions, targets, errors,
+    hints, run ids) safe to embed in rich markup: control, format and bidi
+    characters are shown as escapes and markup brackets are escaped. The single
+    output layer for everything that may come from the registry."""
+    return escape(_visible(str(text)))
 
 
 def registry_notice() -> str:
@@ -95,12 +110,12 @@ def render_registry_items(items: list, console: Console) -> None:
     for i in items:
         table.add_row(
             i.reg.hive if i.reg else "",
-            escape(item_target(i)),
-            escape(i.description),
-            escape(i.hint or ""),
+            safe(item_target(i)),
+            safe(i.description),
+            safe(i.hint or ""),
         )
     console.print(table)
-    console.print(f"[yellow]{escape(registry_notice())}[/yellow]")
+    console.print(f"[yellow]{safe(registry_notice())}[/yellow]")
 
 
 def render_report_only(result: ScanResult, console: Console) -> None:
@@ -116,7 +131,7 @@ def render_report_only(result: ScanResult, console: Console) -> None:
     table.add_column("What", style="cyan")
     table.add_column("How to remove", style="dim")
     for i in sorted(items, key=lambda x: x.size, reverse=True):
-        table.add_row(human_size(i.size), i.description, i.hint or "")
+        table.add_row(human_size(i.size), safe(i.description), safe(i.hint or ""))
     console.print(table)
 
 
@@ -130,7 +145,7 @@ def render_clean_summary(result: CleanResult, console: Console) -> None:
     )
     for outcome in result.errors:
         console.print(
-            f"  [red]![/red] {outcome.item.description}: {outcome.error}"
+            f"  [red]![/red] {safe(outcome.item.description)}: {safe(outcome.error)}"
         )
 
 
@@ -169,7 +184,7 @@ def scan_to_dict(result: ScanResult) -> Dict[str, Any]:
                 "ran": r.ran,
                 "skipped_reason": r.skipped_reason,
                 "incomplete": r.incomplete,
-                "registry": any(i.kind is ItemKind.REGISTRY for i in r.items),
+                "registry": r.cleaner_id in REGISTRY_IDS,
                 "count": r.count,
                 "bytes": r.total_size,
                 "human": human_size(r.total_size),
