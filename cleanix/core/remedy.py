@@ -83,6 +83,11 @@ def verify_path(path: str, fingerprint: object, *, allow_dir: bool = True) -> Op
     its (size, mtime_ns, inode, dev) must equal ``fingerprint``. The
     ``(0, 0, 0, 0)`` placeholder is never a path identity. Any error reading
     it fails closed.
+
+    Every reparse point is refused, including cloud-file placeholders
+    (OneDrive "files on demand" carry FILE_ATTRIBUTE_REPARSE_POINT): such a
+    finding is skipped fail-closed with "link or reparse point" (wording may
+    need refining once seen on real machines).
     """
     try:
         fp = tuple(int(x) for x in fingerprint)  # type: ignore[union-attr]
@@ -97,7 +102,7 @@ def verify_path(path: str, fingerprint: object, *, allow_dir: bool = True) -> Op
     mode = st.st_mode
     attrs = getattr(st, "st_file_attributes", 0) or 0
     if stat.S_ISLNK(mode) or attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
-        return f"{CHANGED} (now a link)"
+        return f"{CHANGED} (now a link or reparse point)"
     if not (stat.S_ISREG(mode) or (allow_dir and stat.S_ISDIR(mode))):
         return f"{CHANGED} (not a regular file" + (" or folder)" if allow_dir else ")")
     if (st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev) != fp:

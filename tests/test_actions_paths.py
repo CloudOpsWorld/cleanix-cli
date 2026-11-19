@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
 import stat
 import sys
@@ -50,15 +51,22 @@ def _finding(p, *, group=None, cleaner="big_files", size=None, **kw):
     )
 
 
-def _errors(summary):
-    return [o.error for o in summary.result.outcomes if o.error]
+def _skips(summary):
+    """Skip reasons; a skipped item is never also an outcome or error."""
+    keys = {id(o.item) for o in summary.result.outcomes}
+    assert not any(id(i) in keys for i, _r in summary.skipped)
+    return [r for _i, r in summary.skipped]
+
+
+_G = hashlib.sha256(b"d" * 8192).hexdigest()
 
 
 def _dups(tmp_path, n=3, data=b"d" * 8192):
     """n identical copies; copy i is older the smaller i is."""
     base = 1_600_000_000 * 10**9
     paths = [_file(tmp_path, f"copy{i}.iso", data, mtime_ns=base + i * 10**9) for i in range(n)]
-    items = [_finding(p, group="sha-1", cleaner="duplicates") for p in paths]
+    group = hashlib.sha256(data).hexdigest()
+    items = [_finding(p, group=group, cleaner="duplicates") for p in paths]
     return paths, items
 
 
@@ -84,7 +92,7 @@ def test_act_quarantines_directory_finding(tmp_path):
     (d / "a.txt").write_text("a")
     item = _finding(d, cleaner="orphan_app_data")
     summary = actions.act([item], Config(), dry_run=False)
-    assert summary.removed == 1, _errors(summary)
+    assert summary.removed == 1, _skips(summary)
     assert not d.exists()
 
 
@@ -111,7 +119,7 @@ def test_act_skips_changed_file(tmp_path):
     summary = actions.act([item], Config(), dry_run=False)
     assert p.exists()
     assert summary.removed == 0
-    assert _errors(summary)[0].startswith("skipped: changed since scan")
+    assert _skips(summary)[0].startswith("changed since scan")
     assert history.load() == []
 
 
@@ -126,7 +134,7 @@ def test_act_skips_symlink_swap(tmp_path):
     assert summary.removed == 0
     assert os.path.islink(str(p))
     assert target.read_bytes() == b"precious"
-    assert _errors(summary)[0].startswith("skipped: changed since scan")
+    assert _skips(summary)[0].startswith("changed since scan")
 
 
 def test_act_skips_directory_replaced_by_file(tmp_path):
@@ -155,7 +163,7 @@ def test_act_skips_special_file_with_matching_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(remedy, "_lstat", lambda path: _fake_stat(real, stat.S_IFIFO | 0o644))
     summary = actions.act([item], Config(), dry_run=False, permanent=True)
     assert summary.removed == 0 and p.exists()
-    assert "not a regular file" in _errors(summary)[0]
+    assert "not a regular file" in _skips(summary)[0]
 
 
 def test_act_skips_link_with_matching_identity(tmp_path, monkeypatch):
@@ -165,7 +173,7 @@ def test_act_skips_link_with_matching_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(remedy, "_lstat", lambda path: _fake_stat(real, stat.S_IFLNK | 0o777))
     summary = actions.act([item], Config(), dry_run=False, permanent=True)
     assert summary.removed == 0 and p.exists()
-    assert "now a link" in _errors(summary)[0]
+    assert "now a link or reparse point" in _skips(summary)[0]
 
 
 @pytest.mark.parametrize("exc", [PermissionError("denied"), ValueError("embedded null")])
@@ -179,7 +187,7 @@ def test_act_stat_oserror_is_skip(tmp_path, monkeypatch, exc):
     monkeypatch.setattr(remedy, "_lstat", boom)
     summary = actions.act([item], Config(), dry_run=False, permanent=True)
     assert summary.removed == 0 and p.exists()
-    assert _errors(summary)[0].startswith("skipped: changed since scan")
+    assert _skips(summary)[0].startswith("changed since scan")
 
 
 def test_act_refuses_guard_blocked_path(tmp_path):
@@ -188,7 +196,7 @@ def test_act_refuses_guard_blocked_path(tmp_path):
                           dry_run=False, permanent=True)
     assert p.exists()
     assert summary.removed == 0
-    assert _errors(summary) == ["skipped: " + actions.BLOCKED]
+    assert _skips(summary) == [actions.BLOCKED]
 
 
 def test_act_skips_item_without_remedy(tmp_path):
@@ -200,7 +208,7 @@ def test_act_skips_item_without_remedy(tmp_path):
     summary = actions.act([report_only, ordinary], Config(), dry_run=False, permanent=True)
     assert a.exists() and b.exists()
     assert summary.removed == 0
-    assert _errors(summary) == ["skipped: " + actions.NOT_A_FINDING] * 2
+    assert _skips(summary) == [actions.NOT_A_FINDING] * 2
 
 
 def test_act_skips_requires_root_item(tmp_path):
@@ -208,7 +216,7 @@ def test_act_skips_requires_root_item(tmp_path):
     item = _finding(p, requires_root=True)
     summary = actions.act([item], Config(), dry_run=False, permanent=True)
     assert p.exists()
-    assert _errors(summary) == ["skipped: needs an elevated run"]
+    assert _skips(summary) == ["needs an elevated run"]
 
 
 def test_act_skips_placeholder_fingerprint(tmp_path):
@@ -222,9 +230,9 @@ def test_act_skips_placeholder_fingerprint(tmp_path):
 def test_act_same_path_twice_acts_once(tmp_path):
     p = _file(tmp_path)
     item = _finding(p)
-    summary = actions.act([item, item], Config(), dry_run=False, permanent=True)
+    summary = actions.act([item, dataclasses.replace(item)], Config(), dry_run=False, permanent=True)
     assert summary.removed == 1
-    assert _errors(summary) == ["skipped: listed twice"]
+    assert _skips(summary) == ["listed twice"]
 
 
 def test_engine_still_refuses_report_only_items(tmp_path):
@@ -268,7 +276,7 @@ def test_duplicates_keep_oldest(tmp_path):
     assert sorted(i.path for i in plan.items) == sorted(str(p) for p in paths[1:])
     assert plan.skipped == [(items[0], findings.KEPT)]
     summary = actions.act(plan.items, Config(), dry_run=False)
-    assert summary.removed == 2, _errors(summary)
+    assert summary.removed == 2, _skips(summary)
     assert paths[0].exists() and not paths[1].exists() and not paths[2].exists()
 
 
@@ -277,7 +285,7 @@ def test_duplicates_keep_newest_and_shortest_path(tmp_path):
     newest = actions.plan_duplicates(items, "newest")
     assert newest.skipped == [(items[2], findings.KEPT)]
     short = _file(tmp_path, "c.iso", b"d" * 8192, mtime_ns=1_700_000_000 * 10**9)
-    s_item = _finding(short, group="sha-1", cleaner="duplicates")
+    s_item = _finding(short, group=_G, cleaner="duplicates")
     shortest = actions.plan_duplicates(items + [s_item], "shortest-path")
     assert shortest.skipped == [(s_item, findings.KEPT)]
     assert len(shortest.items) == 3
@@ -321,7 +329,7 @@ def test_duplicates_kept_copy_safe_from_other_cleaners_items(tmp_path, first):
     batch = others + plan.items if first else plan.items + others
     summary = actions.act(batch, Config(), dry_run=False, permanent=True)
     assert paths[0].exists()
-    assert ("skipped: " + actions.KEEPS_COPY) in _errors(summary)
+    assert (actions.KEEPS_COPY) in _skips(summary)
 
 
 def test_duplicates_kept_copy_safe_from_containing_folder(tmp_path):
@@ -330,7 +338,7 @@ def test_duplicates_kept_copy_safe_from_containing_folder(tmp_path):
     folder = _finding(tmp_path / "home", cleaner="downloads")
     summary = actions.act(plan.items + [folder], Config(), dry_run=False, permanent=True)
     assert paths[0].exists() and (tmp_path / "home").is_dir()
-    assert summary.result.outcomes[-1].error == "skipped: " + actions.KEEPS_COPY
+    assert summary.skipped == [(folder, actions.KEEPS_COPY)]
     assert summary.removed == 2
 
 
@@ -341,7 +349,7 @@ def test_duplicates_hard_link_of_kept_copy_not_removed(tmp_path):
         os.link(str(paths[0]), str(link))
     except (OSError, NotImplementedError):
         pytest.skip("hard links unsupported here")
-    items.append(_finding(link, group="sha-1", cleaner="duplicates"))
+    items.append(_finding(link, group=_G, cleaner="duplicates"))
     plan = actions.plan_duplicates(items, "oldest")
     assert plan.items == []
     assert link.exists() and paths[0].exists()
@@ -354,7 +362,7 @@ def test_duplicates_survivor_missing_fails_closed(tmp_path):
     summary = actions.act(plan.items, Config(), dry_run=False, permanent=True)
     assert summary.removed == 0
     assert paths[1].exists() and paths[2].exists()
-    assert all("the copy to keep" in e for e in _errors(summary))
+    assert all("the copy to keep" in e for e in _skips(summary))
     # Planning again: the oldest is still chosen (scan-time data) and missing,
     # so the whole group is skipped rather than promoting the next copy.
     replan = actions.plan_duplicates(items, "oldest")
@@ -383,3 +391,196 @@ def test_plan_duplicates_skips_non_duplicates(tmp_path):
     p = _file(tmp_path)
     plan = actions.plan_duplicates([_finding(p)], "oldest")
     assert plan.items == [] and plan.skipped == [(_finding(p), "not a duplicate copy")]
+
+
+# -- fix round 1: re-check right before each removal, forged stamps ----------
+
+
+@pytest.mark.parametrize("permanent", [True, False])
+def test_kept_copy_removed_mid_batch_stops_further_deletes(tmp_path, permanent):
+    # An outside process removes the kept copy after the batch was verified
+    # (here: as the first removal starts). Nothing further may be deleted.
+    paths, items = _dups(tmp_path)
+    plan = actions.plan_duplicates(items, "oldest")
+
+    def progress(desc, done, total):
+        if paths[0].exists():
+            paths[0].unlink()
+
+    summary = actions.act(plan.items, Config(), dry_run=False, permanent=permanent,
+                          progress=progress)
+    assert summary.removed == 0
+    assert paths[1].exists() and paths[2].exists()
+    assert len(summary.skipped) == 2 and summary.errors == []
+    assert all("the copy to keep" in r for r in _skips(summary))
+
+
+def test_kept_copy_changed_after_first_removal(tmp_path):
+    paths, items = _dups(tmp_path)
+    plan = actions.plan_duplicates(items, "oldest")
+
+    def progress(desc, done, total):
+        if done == 2:
+            paths[0].write_bytes(b"edited")
+
+    summary = actions.act(plan.items, Config(), dry_run=False, permanent=True,
+                          progress=progress)
+    assert summary.removed == 1
+    assert sum(p.exists() for p in paths[1:]) == 1  # a real copy is left
+
+
+def test_file_rewritten_mid_batch_is_skipped(tmp_path):
+    a = _file(tmp_path, "a.bin")
+    b = _file(tmp_path, "b.bin")
+    items = [_finding(a), _finding(b)]
+
+    def progress(desc, done, total):
+        if done == 1:
+            b.write_bytes(b"new content written during the batch")
+
+    summary = actions.act(items, Config(), dry_run=False, permanent=True, progress=progress)
+    assert not a.exists()
+    assert b.read_bytes() == b"new content written during the batch"
+    assert summary.removed == 1
+    assert summary.skipped == [(items[1], "changed since scan")]
+    assert summary.errors == []
+
+
+def test_precheck_skips_keep_one_quarantine_run_and_history_entry(tmp_path):
+    a = _file(tmp_path, "a.bin")
+    b = _file(tmp_path, "b.bin")
+    c = _file(tmp_path, "c.bin")
+    items = [_finding(a), _finding(b), _finding(c)]
+
+    def progress(desc, done, total):
+        if done == 1:
+            b.write_bytes(b"changed")
+
+    summary = actions.act(items, Config(), dry_run=False, progress=progress)
+    assert summary.removed == 2 and b.exists()
+    assert len(quarantine.list_runs()) == 1
+    assert len(history.load()) == 1
+    quarantine.restore(summary.quarantine_run)
+    assert a.exists() and c.exists()
+
+
+def test_folder_then_file_inside_reports_file_skipped(tmp_path):
+    d = tmp_path / "home" / "old_app"
+    d.mkdir(parents=True)
+    inner = d / "inner.bin"
+    inner.write_bytes(b"i" * 5000)
+    folder_item = _finding(d, cleaner="orphan_app_data")
+    file_item = _finding(inner)
+    summary = actions.act([folder_item, file_item], Config(), dry_run=False, permanent=True)
+    assert not d.exists()
+    assert summary.removed == 1
+    assert [o.item for o in summary.result.outcomes] == [folder_item]
+    assert summary.skipped == [(file_item, "changed since scan (missing or unreadable)")]
+    assert summary.errors == []
+
+
+def test_engine_precheck_none_is_unchanged_and_report_only_still_refused(tmp_path):
+    p = _file(tmp_path)
+    plain = CleanableItem(cleaner_id="t", description="p", path=str(p), size=1)
+    seen = []
+    res = Engine([]).clean([_finding(p)], dry_run=False, allow_root_items=False,
+                           precheck=lambda i: seen.append(i) or None)
+    assert res.outcomes[0].error == "report only (remove manually)" and p.exists()
+    assert seen == []  # the report-only refusal comes first
+    res = Engine([]).clean([plain], dry_run=False, allow_root_items=False,
+                           precheck=lambda i: "nope")
+    assert res.outcomes[0].error == "skipped: nope" and p.exists()
+    res = Engine([]).clean([plain], dry_run=False, allow_root_items=False)
+    assert res.removed_count == 1 and not p.exists()
+
+
+def test_engine_precheck_exception_fails_closed(tmp_path):
+    p = _file(tmp_path)
+    plain = CleanableItem(cleaner_id="t", description="p", path=str(p))
+
+    def boom(item):
+        raise RuntimeError("bad")
+
+    res = Engine([]).clean([plain], dry_run=False, allow_root_items=False, precheck=boom)
+    assert p.exists() and res.outcomes[0].error.startswith("skipped: could not be verified")
+
+
+def test_forged_stamp_with_unrelated_survivor_refused(tmp_path):
+    # c0 is the ONLY copy; a caller stamps it with an unrelated file of the
+    # same size as "the copy to keep". It must not be deleted.
+    paths, items = _dups(tmp_path, n=1)
+    other = _file(tmp_path, "unrelated.bin", b"u" * 8192)
+    other_item = _finding(other, group=_G, cleaner="duplicates")
+    forged = findings._stamp(items[0], other_item)
+    summary = actions.act([forged], Config(), dry_run=False, permanent=True)
+    assert paths[0].exists() and other.exists()
+    assert summary.removed == 0
+    assert "same content" in _skips(summary)[0]
+
+
+def test_stamp_from_another_group_or_size_refused(tmp_path):
+    paths, items = _dups(tmp_path)
+    plan = actions.plan_duplicates(items, "oldest")
+    victim = plan.items[0]
+    extra = tuple((k, ("0" * 64 if k == findings.SURVIVOR_GROUP else v))
+                  for k, v in victim.remedy.extra)
+    wrong_group = dataclasses.replace(victim, remedy=dataclasses.replace(victim.remedy, extra=extra))
+    fp = findings.survivor_of(victim).fingerprint
+    bigger = ",".join(str(x) for x in (fp[0] + 1,) + tuple(fp[1:]))
+    extra = tuple((k, (bigger if k == findings.SURVIVOR_FINGERPRINT else v))
+                  for k, v in victim.remedy.extra)
+    wrong_size = dataclasses.replace(victim, remedy=dataclasses.replace(victim.remedy, extra=extra))
+    for bad, why in ((wrong_group, "not from this duplicate group"), (wrong_size, "differs in size")):
+        summary = actions.act([bad], Config(), dry_run=False, permanent=True)
+        assert summary.removed == 0 and all(p.exists() for p in paths)
+        assert why in _skips(summary)[0]
+
+
+def test_plan_duplicates_keeping_explicit_survivor(tmp_path):
+    paths, items = _dups(tmp_path)
+    plan = actions.plan_duplicates_keeping(items, {_G: items[1]})
+    assert (items[1], findings.KEPT) in plan.skipped
+    actions.act(plan.items, Config(), dry_run=False, permanent=True)
+    assert [p.exists() for p in paths] == [False, True, False]
+
+
+def test_plan_duplicates_keeping_requires_supplied_survivor(tmp_path):
+    paths, items = _dups(tmp_path)
+    none_chosen = actions.plan_duplicates_keeping(items, {})
+    assert none_chosen.items == [] and len(none_chosen.skipped) == 3
+    # The chosen copy is not among the supplied copies: nothing planned.
+    outside = actions.plan_duplicates_keeping(items[1:], {_G: items[0]})
+    assert outside.items == [] and len(outside.skipped) == 2
+
+
+def test_kept_copy_protected_by_inode(tmp_path):
+    # A hard link to the kept copy (another spelling of the same file, as on
+    # a case-insensitive volume) found by another cleaner is not removed.
+    paths, items = _dups(tmp_path)
+    link = tmp_path / "home" / "alias.iso"
+    try:
+        os.link(str(paths[0]), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("hard links unsupported here")
+    plan = actions.plan_duplicates(items, "oldest")
+    alias = _finding(link)
+    summary = actions.act(plan.items + [alias], Config(), dry_run=False, permanent=True)
+    assert link.exists() and paths[0].exists()
+    assert (alias, actions.KEEPS_COPY) in summary.skipped
+
+
+def test_verify_path_refuses_reparse_point(tmp_path, monkeypatch):
+    import types
+
+    p = _file(tmp_path)
+    item = _finding(p)
+    real = os.lstat(str(p))
+    fake = types.SimpleNamespace(
+        st_mode=real.st_mode, st_size=real.st_size, st_mtime_ns=real.st_mtime_ns,
+        st_ino=real.st_ino, st_dev=real.st_dev, st_file_attributes=0x400,
+    )
+    monkeypatch.setattr(remedy, "_lstat", lambda path: fake)
+    assert remedy.verify_path(str(p), item.remedy.fingerprint) == \
+        "changed since scan (now a link or reparse point)"
+    summary = actions.act([item], Config(), dry_run=False, permanent=True)
+    assert p.exists() and summary.removed == 0

@@ -9,10 +9,10 @@ they stay visible) but are not actionable. Grouping is pure logic;
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
-import stat
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from cleanix.core.curation import copy_for
 from cleanix.core.models import CleanableItem, ScanResult
@@ -104,9 +104,11 @@ def group_findings(scan: ScanResult) -> List[FindingGroup]:
 KEEP_POLICIES: Tuple[str, ...] = ("oldest", "newest", "shortest-path")
 
 # Remedy.extra keys stamped by plan_duplicates on each copy to remove: the copy
-# that must still exist (unchanged) when the copy is removed.
+# that must still exist (unchanged) when the copy is removed, and the group
+# both belong to.
 SURVIVOR_PATH = "survivor_path"
 SURVIVOR_FINGERPRINT = "survivor_fingerprint"
+SURVIVOR_GROUP = "survivor_group"
 
 KEPT = "kept: this is the copy that stays"
 
@@ -117,6 +119,14 @@ class ActPlan:
 
     items: List[CleanableItem] = field(default_factory=list)
     skipped: List[Tuple[CleanableItem, str]] = field(default_factory=list)
+
+
+class Survivor(NamedTuple):
+    """The copy of a duplicate group that must stay (as stamped)."""
+
+    path: str
+    fingerprint: Tuple[int, ...]
+    group: str
 
 
 def path_key(path: str) -> str:
@@ -139,15 +149,17 @@ def _rank_key(keep: str):
     return lambda i: (len(i.path or ""), i.path or "")
 
 
-def survivor_of(item: CleanableItem) -> Optional[Tuple[str, Tuple[int, ...]]]:
-    """The (path, fingerprint) stamped by :func:`plan_duplicates`, else None."""
+def survivor_of(item: CleanableItem) -> Optional[Survivor]:
+    """The kept copy stamped by :func:`plan_duplicates`, else None
+    (also None for a malformed stamp)."""
     remedy = item.remedy
     if remedy is None:
         return None
     extra = dict(remedy.extra)
     path = extra.get(SURVIVOR_PATH)
     raw = extra.get(SURVIVOR_FINGERPRINT)
-    if not path or not raw:
+    group = extra.get(SURVIVOR_GROUP)
+    if not path or not raw or not group:
         return None
     try:
         fp = tuple(int(x) for x in raw.split(","))
@@ -155,17 +167,18 @@ def survivor_of(item: CleanableItem) -> Optional[Tuple[str, Tuple[int, ...]]]:
         return None
     if len(fp) != 4:
         return None
-    return path, fp
+    return Survivor(path, fp, group)
 
 
 def _stamp(item: CleanableItem, survivor: CleanableItem) -> CleanableItem:
     remedy = item.remedy
-    assert remedy is not None and survivor.remedy is not None
-    extra = tuple(kv for kv in remedy.extra
-                  if kv[0] not in (SURVIVOR_PATH, SURVIVOR_FINGERPRINT))
+    assert remedy is not None and survivor.remedy is not None and remedy.group
+    keys = (SURVIVOR_PATH, SURVIVOR_FINGERPRINT, SURVIVOR_GROUP)
+    extra = tuple(kv for kv in remedy.extra if kv[0] not in keys)
     extra += (
         (SURVIVOR_PATH, survivor.path or ""),
         (SURVIVOR_FINGERPRINT, ",".join(str(int(x)) for x in survivor.remedy.fingerprint)),
+        (SURVIVOR_GROUP, remedy.group),
     )
     return dataclasses.replace(item, remedy=dataclasses.replace(remedy, extra=extra))
 
@@ -176,6 +189,116 @@ def check_survivor(path: str, fingerprint: Sequence[int]) -> Optional[str]:
     return verify_path(path, fingerprint, allow_dir=False)
 
 
+def copy_vs_survivor(copy_fp: Sequence[int], copy_group: Optional[str],
+                     survivor: Survivor) -> Optional[str]:
+    """Why a copy may not be removed in favour of ``survivor``, judged from
+    the recorded data alone (None when it may): same group, same size, and
+    not the very same file (a hard link)."""
+    try:
+        cfp = tuple(int(x) for x in copy_fp)
+        sfp = tuple(int(x) for x in survivor.fingerprint)
+    except (TypeError, ValueError):
+        return "no usable fingerprint"
+    if len(cfp) != 4 or len(sfp) != 4:
+        return "no usable fingerprint"
+    if not copy_group or survivor.group != copy_group:
+        return "the copy to keep is not from this duplicate group; nothing removed"
+    if cfp[0] != sfp[0]:
+        return "the copy to keep differs in size; nothing removed"
+    if cfp[2:] == sfp[2:]:
+        return "same file as the copy to keep (a hard link); nothing removed"
+    return None
+
+
+_HEX = frozenset("0123456789abcdef")
+_CHUNK = 1024 * 1024
+
+
+def content_matches_group(path: str, group: str) -> Optional[str]:
+    """Why ``path``'s content is not proven to be the group's (None when it
+    is). A duplicate group id is the full SHA-256 of the content (see
+    cleaners/duplicates.py); the file is streamed and hashed. Anything else
+    (not a SHA-256 id, unreadable file) fails closed."""
+    if len(group) != 64 or not set(group) <= _HEX:
+        return "cannot confirm the copy to keep has the same content; nothing removed"
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(_CHUNK), b""):
+                h.update(chunk)
+    except (OSError, ValueError):
+        return "the copy to keep could not be read; nothing removed"
+    if h.hexdigest() != group:
+        return "the copy to keep no longer has the same content; nothing removed"
+    return None
+
+
+def _as_survivor(item: CleanableItem) -> Survivor:
+    remedy = item.remedy
+    assert remedy is not None
+    return Survivor(item.path or "", tuple(remedy.fingerprint), remedy.group or "")
+
+
+def _group_copies(items: Sequence[CleanableItem], plan: ActPlan
+                  ) -> Dict[str, List[CleanableItem]]:
+    """Supplied duplicate copies by group (each path once); others skipped."""
+    groups: Dict[str, List[CleanableItem]] = {}
+    seen = set()
+    for item in items:
+        remedy = item.remedy
+        if (not is_finding(item) or remedy is None or remedy.kind is not RemedyKind.PATH
+                or not remedy.group or not item.path):
+            plan.skipped.append((item, "not a duplicate copy"))
+            continue
+        k = path_key(item.path)
+        if k in seen:
+            plan.skipped.append((item, "listed twice"))
+            continue
+        seen.add(k)
+        groups.setdefault(remedy.group, []).append(item)
+    return groups
+
+
+def _plan_group(copies: List[CleanableItem], survivor: CleanableItem, plan: ActPlan) -> None:
+    """Plan one group around ``survivor`` (one of ``copies``), fail closed."""
+    reason: Optional[str] = None
+    if len(copies) < 2:
+        reason = "fewer than two copies of this file were chosen; nothing removed"
+    else:
+        why = check_survivor(survivor.path or "", survivor.remedy.fingerprint)  # type: ignore[union-attr]
+        if why is None and not unchanged(survivor):
+            why = CHANGED
+        if why is not None:
+            reason = (f"the copy to keep ({survivor.path}) {why}; "
+                      f"nothing in this group was removed")
+    removable: List[CleanableItem] = []
+    bad: List[Tuple[CleanableItem, str]] = []
+    if reason is None:
+        kept = _as_survivor(survivor)
+        for c in copies:
+            if c is survivor:
+                continue
+            remedy = c.remedy
+            assert remedy is not None
+            why = verify_path(c.path or "", remedy.fingerprint, allow_dir=False)
+            if why is None and not unchanged(c):
+                why = CHANGED
+            if why is None:
+                why = copy_vs_survivor(remedy.fingerprint, remedy.group, kept)
+            if why is None:
+                removable.append(c)
+            else:
+                bad.append((c, why))
+        if not removable:
+            reason = "fewer than two copies of this file remain; nothing removed"
+    if reason is not None:
+        plan.skipped.extend((c, reason) for c in copies)
+        return
+    plan.skipped.append((survivor, KEPT))
+    plan.skipped.extend(bad)
+    plan.items.extend(_stamp(c, survivor) for c in removable)
+
+
 def plan_duplicates(items: Sequence[CleanableItem], keep: str) -> ActPlan:
     """Choose one copy to keep per duplicate group; plan removing the rest.
 
@@ -184,67 +307,41 @@ def plan_duplicates(items: Sequence[CleanableItem], keep: str) -> ActPlan:
     at least one supplied copy of every group is never removed. A group whose
     chosen copy is missing, unreadable, not a regular file or changed, or
     with fewer than two usable copies, puts ALL its items in ``skipped``.
-    Copies to remove are stamped with the kept copy so :func:`actions.act`
-    re-checks it at delete time. Never deletes anything itself.
+    Copies to remove are stamped with the kept copy and their group so
+    :func:`actions.act` re-checks it at delete time. Never deletes anything.
     """
     if keep not in KEEP_POLICIES:
         raise ValueError(
             f"keep must be one of {', '.join(KEEP_POLICIES)}, not {keep!r}")
     plan = ActPlan()
-    groups: Dict[str, List[CleanableItem]] = {}
-    for item in items:
-        remedy = item.remedy
-        if (not is_finding(item) or remedy is None or remedy.kind is not RemedyKind.PATH
-                or not remedy.group or not item.path):
-            plan.skipped.append((item, "not a duplicate copy"))
-            continue
-        groups.setdefault(remedy.group, []).append(item)
-
     rank = _rank_key(keep)
-    for copies in groups.values():
-        uniq: List[CleanableItem] = []
-        seen = set()
-        for c in copies:
-            k = path_key(c.path or "")
-            if k in seen:
-                plan.skipped.append((c, "listed twice"))
-                continue
-            seen.add(k)
-            uniq.append(c)
+    for copies in _group_copies(items, plan).values():
+        _plan_group(copies, min(copies, key=rank), plan)
+    return plan
 
-        survivor = min(uniq, key=rank)
-        reason: Optional[str] = None
-        if len(uniq) < 2:
-            reason = "fewer than two copies of this file were chosen; nothing removed"
-        else:
-            why = check_survivor(survivor.path or "", survivor.remedy.fingerprint)  # type: ignore[union-attr]
-            if why is None and not unchanged(survivor):
-                why = CHANGED
-            if why is not None:
-                reason = (f"the copy to keep ({survivor.path}) {why}; "
-                          f"nothing in this group was removed")
-        removable: List[CleanableItem] = []
-        bad: List[Tuple[CleanableItem, str]] = []
-        if reason is None:
-            for c in uniq:
-                if c is survivor:
-                    continue
-                why = verify_path(c.path or "", c.remedy.fingerprint, allow_dir=False)  # type: ignore[union-attr]
-                if why is None and not unchanged(c):
-                    why = CHANGED
-                if why is None and (tuple(c.remedy.fingerprint)[2:]  # type: ignore[union-attr]
-                                    == tuple(survivor.remedy.fingerprint)[2:]):  # type: ignore[union-attr]
-                    why = "same file as the copy to keep (a hard link)"
-                if why is None:
-                    removable.append(c)
-                else:
-                    bad.append((c, why))
-            if not removable:
-                reason = "fewer than two copies of this file remain; nothing removed"
-        if reason is not None:
-            plan.skipped.extend((c, reason) for c in uniq)
+
+def plan_duplicates_keeping(items: Sequence[CleanableItem],
+                            survivors: Mapping[str, CleanableItem]) -> ActPlan:
+    """Like :func:`plan_duplicates`, with the copy to keep chosen by the
+    caller (the GUI/review pick) per group id: ``survivors[group]``.
+
+    The chosen copy must be one of the supplied copies of that group (same
+    path); otherwise, or when a group has no choice, ALL its items are
+    skipped. The same checks as :func:`plan_duplicates` then apply.
+    """
+    plan = ActPlan()
+    for group, copies in _group_copies(items, plan).items():
+        chosen = survivors.get(group)
+        match = None
+        if chosen is not None and chosen.path:
+            want = path_key(chosen.path)
+            match = next((c for c in copies if path_key(c.path or "") == want), None)
+        if match is None:
+            reason = ("no copy to keep was chosen for this group; nothing removed"
+                      if chosen is None else
+                      "the copy to keep is not one of the chosen copies of this group; "
+                      "nothing removed")
+            plan.skipped.extend((c, reason) for c in copies)
             continue
-        plan.skipped.append((survivor, KEPT))
-        plan.skipped.extend(bad)
-        plan.items.extend(_stamp(c, survivor) for c in removable)
+        _plan_group(copies, match, plan)
     return plan

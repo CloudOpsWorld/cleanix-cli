@@ -27,6 +27,8 @@ from cleanix.core.utils import is_root, path_size, run_command
 
 ProgressCB = Optional[Callable[[str], None]]
 CancelCB = Optional[Callable[[], bool]]
+# Returns why the item must not be removed now, or None (see Engine.clean).
+PrecheckCB = Optional[Callable[[CleanableItem], Optional[str]]]
 
 
 class Engine:
@@ -107,8 +109,15 @@ class Engine:
         quarantine=None,
         cancel: CancelCB = None,
         registry_backup: Optional[RegistryBackupSink] = None,
+        precheck: PrecheckCB = None,
     ) -> CleanResult:
         """Remove (or simulate removing) the given items.
+
+        ``precheck`` (PATH items only; default None = no extra check) is
+        called right before each path is moved or deleted, after the safety
+        guard; a non-None return (or an exception) is the reason the item is
+        skipped: ``removed=False``, ``error="skipped: <reason>"``, nothing
+        touched. It never makes an unsafe item deletable.
 
         Root-requiring items are skipped with an error unless the process is
         root (or ``allow_root_items`` is forced True). If ``quarantine`` is a
@@ -133,6 +142,7 @@ class Engine:
                 self._clean_one(
                     item, dry_run=dry_run, allow_root=allow_root_items,
                     quarantine=quarantine, registry_backup=registry_backup,
+                    precheck=precheck,
                 )
             )
         return result
@@ -140,6 +150,7 @@ class Engine:
     def _clean_one(
         self, item: CleanableItem, *, dry_run: bool, allow_root: bool, quarantine=None,
         registry_backup: Optional[RegistryBackupSink] = None,
+        precheck: PrecheckCB = None,
     ) -> CleanOutcome:
         # Report-only items are never deleted, even if one slips into a clean set.
         if item.report_only:
@@ -160,7 +171,8 @@ class Engine:
             )
 
         if item.kind is ItemKind.PATH:
-            return self._clean_path(item, dry_run=dry_run, quarantine=quarantine)
+            return self._clean_path(item, dry_run=dry_run, quarantine=quarantine,
+                                    precheck=precheck)
         if item.kind is ItemKind.COMMAND:
             return self._clean_command(item, dry_run=dry_run)
         if item.kind is ItemKind.REGISTRY:
@@ -180,7 +192,8 @@ class Engine:
         )
 
     def _clean_path(
-        self, item: CleanableItem, *, dry_run: bool, quarantine=None
+        self, item: CleanableItem, *, dry_run: bool, quarantine=None,
+        precheck: PrecheckCB = None,
     ) -> CleanOutcome:
         path = item.path or ""
         if not safety.is_safe_to_delete(path):
@@ -190,6 +203,14 @@ class Engine:
                 error="blocked by safety guard (protected path)",
                 dry_run=dry_run,
             )
+        if precheck is not None:
+            try:
+                reason = precheck(item)
+            except Exception as exc:  # noqa: BLE001 - fail closed
+                reason = f"could not be verified ({str(exc) or type(exc).__name__})"
+            if reason is not None:
+                return CleanOutcome(item=item, removed=False, dry_run=dry_run,
+                                    error=f"skipped: {reason}")
 
         p = Path(path)
         freed = item.size or path_size(p)
