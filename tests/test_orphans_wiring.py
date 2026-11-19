@@ -43,6 +43,13 @@ def test_orphan_cleaners_are_review_report_only(cid):
     assert info.category == "review"
 
 
+@pytest.mark.parametrize("cid", ["orphan_launch_jobs", "orphan_app_data", "stale_receipts"])
+def test_macos_copy_does_not_mention_package_manager(cid):
+    blurb = COPY[cid].blurb
+    assert "package manager" not in blurb
+    assert "confirm before removing" in blurb
+
+
 def test_copy_does_not_claim_etc_or_srv_for_orphan_files():
     blurb = COPY["orphan_files"].blurb
     assert "/etc" not in blurb and "/srv" not in blurb

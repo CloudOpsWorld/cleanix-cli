@@ -152,9 +152,10 @@ directories and the generic `~/.cache` catch-all defers to them.
 
 Seven detectors look for things that were left behind when a program was
 removed. They only **report**: nothing is deleted, nothing is preselected, and
-there is no way to clean them from Cleanix. Each finding names the exact path
-and the command that confirms it first (`dpkg-query -S`, `rpm -qf`,
-`pacman -Qo`, `pkgutil`), so you decide. They appear under "Needs your review"
+there is no way to clean them from Cleanix. Each finding names the exact path;
+system-level findings also include a command that confirms ownership
+(`dpkg-query -S`, `rpm -qf`, `pacman -Qo`, `pkgutil`) where a package backend
+exists, while user-level ones may not, so you decide. They appear under "Needs your review"
 and in `cleanix scan`. They work without root; anything they cannot read is
 listed as a "Not checked" note instead of being guessed, and a command that
 fails or prints something unexpected never counts as "orphaned".
@@ -181,8 +182,8 @@ Known limits, read these before acting on a finding:
   (`com.vendor.App`); folders named after the app ("Slack") are never reported.
 - The macOS detectors have only been tested against fake data, not on a real
   Mac. Treat their findings with extra care.
-- Any finding may be a false positive; confirm with your package manager
-  before removing anything.
+- Any finding may be a false positive; confirm before removing anything
+  (with your package manager where one applies).
 
 Already covered by other cleaners and therefore not repeated here: dpkg `rc`
 packages (`apt`), `.dpkg-old`/`.rpmsave`/`.pacnew` files (`config_leftovers`),

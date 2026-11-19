@@ -197,6 +197,20 @@ def test_empty_result_says_nothing_found(qtbot):
     assert not v.clean_button.isEnabled()
 
 
+def test_zero_size_findings_summary_says_nothing_to_free(qtbot):
+    v = make_view(qtbot)
+    v.set_scan_result(result(
+        item("temp", 0, report_only=True, hint="Not checked", path="/a"),
+        item("temp", 0, report_only=True, hint="Not checked", path="/b")))
+    assert v.results_summary.text() == "2 findings to review (nothing to free)."
+
+
+def test_sized_result_keeps_found_summary(qtbot):
+    v = make_view(qtbot)
+    v.set_scan_result(result(item("temp", 1000)))
+    assert v.results_summary.text() == f"Found {simple_view.human_size(1000)} in 1 items."
+
+
 def test_review_groups_in_own_collapsed_unticked_section(qtbot):
     v = make_view(qtbot)
     v.set_scan_result(result(

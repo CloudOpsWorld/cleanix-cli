@@ -159,9 +159,9 @@ _RAW = {
     "stale_services": ("Services for removed programs", "Startup services whose program or unit file is gone (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
     "stale_launchers": ("Menu entries for removed programs", "App menu and autostart entries whose program is missing (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
     "stale_alternatives": ("Broken default-program links", "System default-program links that point at removed programs (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
-    "orphan_launch_jobs": ("Background jobs of removed apps", "Mac launch agents and daemons whose program is gone (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
-    "orphan_app_data": ("Data of removed apps", "Settings and data left by Mac apps that are no longer installed (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
-    "stale_receipts": ("Install records of removed packages", "Mac installer receipts whose files are all gone (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
+    "orphan_launch_jobs": ("Background jobs of removed apps", "Mac launch agents and daemons whose program is gone (may be a false positive; confirm before removing). " + _REVIEW_TAIL),
+    "orphan_app_data": ("Data of removed apps", "Settings and data left by Mac apps that are no longer installed (may be a false positive; confirm before removing). " + _REVIEW_TAIL),
+    "stale_receipts": ("Install records of removed packages", "Mac installer receipts whose files are all gone (may be a false positive; confirm before removing). " + _REVIEW_TAIL),
 }
 
 COPY: Dict[str, Copy] = {k: Copy(*v) for k, v in _RAW.items()}
