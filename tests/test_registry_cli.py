@@ -351,11 +351,16 @@ def test_clean_hklm_and_hkcu_nonelevated_cleans_only_hkcu(env, monkeypatch, caps
     _foo(reg)
     _foo(reg, hive="HKLM", key=UNINST + r"\Bar")
     _patch_scan(monkeypatch, [_item(reg), _item(reg, hive="HKLM", key=UNINST + r"\Bar")])
+    reg.calls.clear()
     rc = cli.main(["clean", "--only", "win_reg_uninstall", "--execute", "--yes"])
     out = _out(capsys)
+    hklm_calls = [c for c in reg.calls if len(c) > 1 and c[1] == "HKLM"]
+    assert hklm_calls == []  # the backend never saw an HKLM entry
+    assert rc == 1
     assert "Administrator" in out
     assert not reg.key_exists("HKCU", FOO)
     assert reg.key_exists("HKLM", UNINST + r"\Bar")
+    assert "require root" not in out
 
 
 def test_clean_requires_explicit_selection(env, monkeypatch, capsys):
@@ -525,3 +530,258 @@ def test_manpage_in_sync(capsys):
     committed = (root / "cleanix.1").read_text(encoding="utf-8")
     assert body(fresh).strip() == body(committed).strip()
     assert "\\-\\-yes" in committed
+
+
+
+# -- fix round 1 ------------------------------------------------------------------
+def _capture_only(monkeypatch):
+    seen = []
+
+    def fake_build(config, only=None, exclude=None):
+        seen.append(None if only is None else list(only))
+        return [_FakeCleaner(c, []) for c in (only or ["temp"])]
+
+    monkeypatch.setattr(cli, "build_cleaners", fake_build)
+    return seen
+
+
+def test_registry_flag_selects_only_registry_ids(env, monkeypatch, capsys):
+    seen = _capture_only(monkeypatch)
+    assert cli.main(["scan", "--registry", "--json"]) == 0
+    assert seen[-1] == list(catalog.REGISTRY_IDS)
+    assert cli.main(["scan", "--registry", "--only", "temp", "--json"]) == 0
+    assert seen[-1] == ["temp"] + list(catalog.REGISTRY_IDS)
+    assert cli.main(["scan", "--registry", "--only", "win_reg_startup", "--json"]) == 0
+    assert seen[-1].count("win_reg_startup") == 1
+    assert cli.main(["scan", "--json"]) == 0 and seen[-1] is None
+    assert cli.main(["scan", "--profile", "aggressive", "--json"]) == 0
+    assert seen[-1] is None
+
+
+def test_registry_flag_non_windows_exits_2(monkeypatch, capsys):
+    monkeypatch.setattr(plat, "is_windows", lambda: False)
+    for cmd in ("scan", "clean"):
+        with pytest.raises(SystemExit) as ei:
+            cli.main([cmd, "--registry"])
+        assert ei.value.code == 2
+        assert "Registry cleanup is only available on Windows." in capsys.readouterr().out
+
+
+def test_registry_flag_counts_as_explicit_selection_for_clean(env, monkeypatch, capsys):
+    reg = env
+    _foo(reg)
+    item = _item(reg)
+    monkeypatch.setattr(cli, "build_cleaners", lambda config, only=None, exclude=None:
+                        [_FakeCleaner(c, [item] if c == "win_reg_uninstall" else [])
+                         for c in only])
+    assert cli.main(["clean", "--registry", "--execute", "--yes"]) == 0
+    assert not reg.key_exists("HKCU", FOO)
+
+
+def test_completion_and_manpage_have_registry_flag():
+    assert "--registry" in completion.SCAN_CLEAN_OPTS
+    for sh in ("bash", "zsh"):
+        assert "--registry" in completion.generate(sh)
+    import pathlib
+    man = (pathlib.Path(__file__).resolve().parent.parent / "cleanix.1").read_text(encoding="utf-8")
+    assert "\\-\\-registry" in man
+
+
+def _two_items(reg):
+    _foo(reg)
+    reg.add_key("HKCU", RUN, {"V": (REG_SZ, "x")})
+    return [_item(reg), _item(reg, cid="win_reg_startup", key=RUN, value="V")]
+
+
+def _tty(monkeypatch, answer):
+    from rich.console import Console
+    monkeypatch.setattr(Console, "is_terminal", property(lambda self: True))
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *a, **k: answer)
+
+
+def test_interactive_deselected_registry_item_not_listed_nor_deleted(env, monkeypatch, capsys):
+    reg = env
+    items = _two_items(reg)
+    _patch_scan(monkeypatch, items)
+    _tty(monkeypatch, "1")  # skip the first (uninstall) entry
+    monkeypatch.setattr(cli.Confirm, "ask", lambda *a, **k: True)
+    rc = cli.main(["clean", "--only", "win_reg_uninstall,win_reg_startup",
+                   "--execute", "--interactive"])
+    import re
+    out = re.sub(r"\[[0-9;]*m", "", capsys.readouterr().out)
+    assert rc == 0
+    assert reg.key_exists("HKCU", FOO)
+    assert not reg.tree("HKCU", RUN)["values"]
+    after = out.split("These registry entries will be removed:")[1]
+    assert "Run [V]" in after and "Uninstall" not in after.split("Run [V]")[0]
+
+
+def test_interactive_deselect_all_registry_no_notice(env, monkeypatch, capsys):
+    reg = env
+    _foo(reg)
+    path_item = CleanableItem(cleaner_id="temp", description="t", size=999, path="C:\\none")
+    _patch_scan(monkeypatch, [_item(reg), path_item])
+    _tty(monkeypatch, "2")
+    monkeypatch.setattr(cli.Confirm, "ask", lambda *a, **k: False)
+    cli.main(["clean", "--only", "win_reg_uninstall,temp", "--execute", "--interactive"])
+    out = capsys.readouterr().out
+    assert "These registry entries will be removed" not in out
+    assert reg.key_exists("HKCU", FOO)
+
+
+EVIL = "evil[/].exe [red]x\u202etxt"
+
+
+def _evil_item(reg, **kw):
+    return _item(reg, desc="d " + EVIL, hint="h " + EVIL, **kw)
+
+
+def _assert_literal(out):
+    flat = out.replace("\n", "")
+    assert "\u202e" not in out
+    assert "evil[/].exe" in flat
+
+
+def test_markup_safe_at_every_site(env, monkeypatch, capsys):
+    reg = env
+    _foo(reg)
+    reg.add_key("HKCU", RUN, {"V" + EVIL: (REG_SZ, "x")})
+    reg_item = _evil_item(reg)
+    val_item = _evil_item(reg, cid="win_reg_startup", key=RUN, value="V" + EVIL)
+    ro = CleanableItem(cleaner_id="temp", description="ro " + EVIL, size=1,
+                       path="C:\\r", report_only=True, hint="how " + EVIL)
+    _patch_scan(monkeypatch, [reg_item, val_item, ro])
+    ids = "win_reg_uninstall,win_reg_startup,temp"
+    # scan table + registry table + report-only list
+    assert cli.main(["scan", "--only", ids]) == 0
+    _assert_literal(capsys.readouterr().out)
+    # explain
+    assert cli.main(["explain", "win_reg_startup"]) == 0
+    _assert_literal(capsys.readouterr().out)
+    # simulation
+    assert cli.main(["clean", "--only", ids, "--simulate"]) == 0
+    _assert_literal(capsys.readouterr().out)
+    # dry run + confirmation list (declined) + interactive labels
+    assert cli.main(["clean", "--only", ids]) == 0
+    _assert_literal(capsys.readouterr().out)
+    monkeypatch.setattr(cli.Confirm, "ask", lambda *a, **k: False)
+    assert cli.main(["clean", "--only", ids, "--execute"]) == 1
+    _assert_literal(capsys.readouterr().out)
+    _tty(monkeypatch, "")
+    assert cli.main(["clean", "--only", ids, "--execute", "--interactive"]) == 1
+    _assert_literal(capsys.readouterr().out)
+
+
+def test_clean_summary_errors_are_markup_safe_and_run_id_survives(env, shipped, monkeypatch, capsys):
+    reg = env
+    _foo(reg)
+    ok = _evil_item(reg)
+    bad_reg = _evil_item(reg)
+    reg.add_key("HKCU", FOO, {"DisplayVersion": (REG_SZ, "2.0")})  # changed since scan
+    # `ok` now also fails its fingerprint; add a fresh good entry
+    reg.add_key("HKCU", UNINST + r"\Good", {"DisplayName": (REG_SZ, "g")})
+    good = _evil_item(reg, key=UNINST + r"\Good")
+    _patch_scan(monkeypatch, [ok, good])
+    rc = cli.main(["clean", "--only", "win_reg_uninstall", "--execute", "--yes"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "evil[/].exe" in out.replace("\n", "")
+    assert "\u202e" not in out
+    run_id = quarantine.list_runs()[0]["run_id"]
+    assert f"cleanix restore {run_id}" in out.replace("\n", "")
+
+
+def test_run_id_and_undo_error_survive_summary_failure(env, shipped, monkeypatch, capsys):
+    from cleanix.core import service
+
+    reg = env
+    _foo(reg)
+    _patch_scan(monkeypatch, [_item(reg)])
+    real = service.clean
+
+    def wrapped(*a, **k):
+        s = real(*a, **k)
+        s.undo_record_error = "boom [red]x"
+        return s
+
+    monkeypatch.setattr(service, "clean", wrapped)
+
+    def explode(*a, **k):
+        raise RuntimeError("markup")
+
+    monkeypatch.setattr(cli, "render_clean_summary", explode)
+    cli.main(["clean", "--only", "win_reg_uninstall", "--execute", "--yes"])
+    out = capsys.readouterr().out.replace("\n", "")
+    run_id = quarantine.list_runs()[0]["run_id"]
+    assert f"undo with cleanix restore {run_id}" in out
+    assert "boom [red]x" in out
+
+
+def test_restore_failure_lines_markup_safe(env, monkeypatch, capsys):
+    monkeypatch.setattr(quarantine, "restore", lambda r, **k: {
+        "restored": [], "failed": [("HKCU\\k [v" + EVIL + "]", "why [/] " + EVIL)]})
+    monkeypatch.setattr(quarantine, "list_runs", lambda: [])
+    assert cli.main(["restore", "run1"]) == 2
+    _assert_literal(capsys.readouterr().out)
+
+
+def test_history_registry_count_recorded_by_service(env, tmp_path):
+    from cleanix.config import Config
+    from cleanix.core import service
+
+    reg = env
+    _foo(reg)
+    s = service.clean([_item(reg)], Config(), dry_run=False)
+    assert s.removed == 1
+    assert history.load()[-1]["registry"] == 1
+    assert not hasattr(history, "annotate_last_registry")
+
+
+def test_clean_no_terminal_without_yes_refuses_cleanly(env, monkeypatch, capsys):
+    reg = env
+    _foo(reg)
+    _patch_scan(monkeypatch, [_item(reg)])
+
+    def eof(*a, **k):
+        raise EOFError
+
+    monkeypatch.setattr(cli.Confirm, "ask", eof)
+    assert cli.main(["clean", "--only", "win_reg_uninstall", "--execute"]) == 2
+    assert reg.key_exists("HKCU", FOO)
+
+
+def test_restore_no_terminal_refuses_cleanly(env, monkeypatch, capsys):
+    reg, run_id = _hklm_run(env, monkeypatch)
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
+
+    def eof(*a, **k):
+        raise EOFError
+
+    monkeypatch.setattr(cli.Prompt, "ask", eof)
+    assert cli.main(["restore", run_id]) == 2
+    assert not reg.key_exists("HKLM", FOO)
+
+
+def test_dry_run_hklm_single_message_and_only_runnable_listed(env, monkeypatch, capsys):
+    reg = env
+    _foo(reg)
+    _foo(reg, hive="HKLM", key=UNINST + r"\Bar")
+    _patch_scan(monkeypatch, [_item(reg), _item(reg, hive="HKLM", key=UNINST + r"\Bar")])
+    cli.main(["clean", "--only", "win_reg_uninstall"])
+    out = capsys.readouterr().out.replace("\n", "")
+    assert "will be skipped" in out and "require root" not in out
+    tail = out.split("would be removed:")[1]
+    assert "Foo" in tail and "Bar" not in tail
+
+
+def test_confirmation_keeps_permanently_for_files(env, monkeypatch, capsys):
+    reg = env
+    _foo(reg)
+    p = CleanableItem(cleaner_id="temp", description="t", size=5, path="C:\\none")
+    _patch_scan(monkeypatch, [_item(reg), p])
+    asked = []
+    monkeypatch.setattr(cli.Confirm, "ask", lambda prompt, **k: asked.append(prompt) or False)
+    cli.main(["clean", "--only", "win_reg_uninstall,temp", "--execute"])
+    out = capsys.readouterr().out.replace("\n", "")
+    assert asked and asked[0].startswith("Permanently remove")
+    assert "permanently removed" in out

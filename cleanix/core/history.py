@@ -73,24 +73,6 @@ def record(freed: int, items: int, *, mode: str, registry: int = 0) -> None:
         pass  # history is best-effort; never fail a clean over it
 
 
-def annotate_last_registry(count: int) -> None:
-    """Add a ``registry`` count to the newest history entry (best effort; the
-    service layer records the run, the CLI knows the registry count)."""
-    path = _history_file()
-    try:
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
-        while lines and not lines[-1].strip():
-            lines.pop()
-        if not lines or count <= 0:
-            return
-        entry = json.loads(lines[-1])
-        entry["registry"] = int(count)
-        lines[-1] = json.dumps(entry)
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    except (OSError, ValueError):
-        pass
-
-
 def load() -> List[Dict]:
     path = _history_file()
     if not path.exists():

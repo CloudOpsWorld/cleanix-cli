@@ -71,7 +71,7 @@ def isolation(tmp_path, monkeypatch):
     monkeypatch.setattr(elevate, "make_request_dir", make_request_dir)
     recorded = []
     monkeypatch.setattr(history, "record",
-                        lambda freed, items, *, mode: recorded.append((freed, items, mode)))
+                        lambda freed, items, *, mode, registry=0: recorded.append((freed, items, mode)))
     return SimpleNamespace(made=made, history=recorded, tmp=tmp_path)
 
 
