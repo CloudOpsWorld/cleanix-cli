@@ -189,7 +189,13 @@ def _check_value(obj: Any, *, root_value: bool) -> RegValue:
     if not isinstance(obj, dict) or set(obj) != fields:
         raise _Invalid("malformed value")
     name, typ, data = obj["name"], obj["type"], obj["data"]
-    if not isinstance(name, str) or len(name) > MAX_VALUE_NAME or "\0" in name:
+    # CR/LF cannot be written faithfully to the .reg file (the HKLM Undo
+    # route), so such a name makes the entry un-backup-able, hence kept.
+    if (
+        not isinstance(name, str)
+        or len(name) > MAX_VALUE_NAME
+        or any(c in name for c in "\0\r\n")
+    ):
         raise _Invalid("invalid value name")
     if name.casefold() == "symboliclinkvalue":
         raise _Invalid("registry link value")

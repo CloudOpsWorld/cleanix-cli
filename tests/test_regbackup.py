@@ -535,14 +535,78 @@ TAMPER = {
         {"name": f"v{i}", "type": REG_DWORD, "data": 1} for i in range(5000)), True),
     "too-much-data": (lambda d: d["snapshot"]["values"].append(
         {"name": "big", "type": REG_SZ, "data": "x" * 600_000}), True),
+    "value-name-crlf": (lambda d: d["snapshot"]["values"].append(
+        {"name": "a\r\nb", "type": REG_SZ, "data": "x"}), True),
 }
+
+# The reason each case must be refused for; a regression that leaves only
+# the (forgeable) digest to catch a tampered entry fails these.
+REASONS = {
+    "modified-digest": "digest mismatch",
+    "digest-not-hex": "malformed digest",
+    "key-system": "not a valid registry location",
+    "key-hklm-system": "not a valid registry location",
+    "key-denied-winnt": "Windows-owned key",
+    "key-policies": "Windows-owned key",
+    "key-is-container": "a container key",
+    "key-two-below": "not inside an allowed registry location",
+    "key-traversal": "not a valid registry location",
+    "cleaner-not-owner": "not inside an allowed registry location",
+    "cleaner-unknown": "unknown registry cleaner",
+    "hive-hku": "registry hive not allowed",
+    "hive-long": "registry hive not allowed",
+    "hive-hkcr": "registry hive not allowed",
+    "subkey-backslash": "invalid subkey name",
+    "subkey-dotdot": "invalid subkey name",
+    "subkey-empty": "invalid subkey name",
+    "subkey-control": "invalid subkey name",
+    "subkey-policies": "Windows-owned key",
+    "subkey-dup": "duplicate subkey name",
+    "value-dup": "duplicate value name",
+    "root-name": "snapshot does not match the target",
+    "type-link": "registry link value",
+    "type-string": "unknown value type",
+    "type-bool": "unknown value type",
+    "type-negative": "unknown value type",
+    "type-huge": "unknown value type",
+    "dword-str": "does not match its type",
+    "dword-range": "does not match its type",
+    "dword-bool": "does not match its type",
+    "qword-negative": "does not match its type",
+    "multi-nonstr": "does not match its type",
+    "binary-bad-b64": "does not match its type",
+    "binary-str": "does not match its type",
+    "binary-extra-field": "does not match its type",
+    "value-name-nul": "invalid value name",
+    "value-name-crlf": "invalid value name",
+    "value-symlink-name": "registry link value",
+    "value-extra-field": "malformed value",
+    "kind-unknown": "unknown snapshot kind",
+    "kind-value-for-key": "snapshot does not match the target",
+    "format-2": "unknown backup format",
+    "format-bool": "unknown backup format",
+    "format-missing": "unknown backup format",
+    "extra-top-field": "unknown backup format",
+    "too-many-keys": "too many subkeys",
+    "too-many-values": "too many values",
+    "too-much-data": "too much data",
+}
+
+
+def test_every_tamper_case_has_a_reason():
+    assert set(REASONS) == set(TAMPER)
 
 
 @pytest.mark.parametrize("case", sorted(TAMPER))
 def test_restore_refuses_tampered(tmp_path, fake_registry, case):
     edit, refp = TAMPER[case]
     files = _tampered(tmp_path, fake_registry, edit, refingerprint=refp)
-    _expect_refused(fake_registry, files)
+    with pytest.raises(RestoreError) as ei:
+        restore_entry(files.json_path, fake_registry, is_admin=True)
+    assert REASONS[case] in str(ei.value)
+    if refp:
+        assert "digest" not in str(ei.value)
+    assert _writes(fake_registry) == []
 
 
 def test_restore_refuses_tampered_paths(tmp_path, fake_registry):
@@ -551,6 +615,17 @@ def test_restore_refuses_tampered_paths(tmp_path, fake_registry):
         edit, refp = TAMPER[case]
         files = _tampered(tmp_path / case, reg, edit, refingerprint=refp)
         _expect_refused(reg, files)
+
+
+def test_write_backup_refuses_value_name_with_newline(tmp_path, fake_registry):
+    """Such a name cannot be written to the .reg (the HKLM Undo route), so the
+    entry must not be backed up, and therefore not deleted."""
+    fake_registry.add_key("HKCU", APP, {"a\r\nb": (REG_SZ, "x")})
+    t = _target_for(fake_registry, "HKCU", APP)
+    with pytest.raises(BackupError):
+        _backup(tmp_path, fake_registry, t)
+    assert not (tmp_path / "run" / "1__registry.json").exists()
+    assert not (tmp_path / "run" / "1__registry.reg").exists()
 
 
 def test_restore_rejects_unknown_format(tmp_path, fake_registry):
