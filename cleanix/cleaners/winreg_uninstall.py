@@ -8,7 +8,6 @@ other command or icon it names is absent or MISSING. Unknown is not dead.
 
 from __future__ import annotations
 
-import dataclasses
 import re
 import unicodedata
 from typing import Iterable, List, Optional, Tuple
@@ -67,20 +66,6 @@ def _clean(text: str) -> str:
     return out[:_MAX_TEXT]
 
 
-def _scan_owner_matches() -> bool:
-    """Whether HKCU belongs to the user whose environment variables we expand.
-
-    Conservative: an elevated process (the helper, or a CLI run as another
-    administrator account) may read a different account's HKCU than the one
-    the environment describes, so per-user variables are then UNKNOWN."""
-    from cleanix.core import context
-
-    try:
-        return not context.is_effective_root()
-    except Exception:
-        return False
-
-
 def _text(values, name: str) -> Tuple[bool, Optional[str]]:
     """(present, string) where string is None when present but not a
     REG_SZ/REG_EXPAND_SZ value."""
@@ -100,9 +85,6 @@ class WinRegUninstall(RegistryDetector):
     def entries(
         self, container: Container, backend: RegistryBackend, ctx: DetectorContext
     ) -> Iterable[Finding]:
-        ctx = dataclasses.replace(
-            ctx, owner_matches=ctx.owner_matches and _scan_owner_matches()
-        )
         try:
             names = backend.subkeys(container.hive, container.key)
         except RegistryError:
