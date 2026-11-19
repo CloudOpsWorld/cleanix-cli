@@ -14,8 +14,10 @@ recorded before anything is deleted. Manifest entries carry
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import secrets
 import shutil
 import time
 from pathlib import Path
@@ -104,19 +106,56 @@ def quarantine_root() -> Path:
     return invoking_user().home / ".local" / "state" / "cleanix" / "quarantine"
 
 
+class ManifestConflict(OSError):
+    """The run's manifest on disk was not written by this run object."""
+
+
+def _make_run_id() -> str:
+    """Creation time first (runs sort chronologically), then the pid and a
+    random suffix so two runs created in the same second never collide."""
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{secrets.token_hex(2)}"
+
+
 class Quarantine:
-    """A single quarantine run (a batch of moved items)."""
+    """A single quarantine run (a batch of moved items).
+
+    The run directory is claimed (created with ``exist_ok=False``) before
+    the first write; if it already exists the run takes a fresh id, so two
+    runs can never share a directory. ``run_id``/``dir`` are final once
+    anything was written. :meth:`save` refuses to replace a manifest this
+    object did not write."""
 
     def __init__(self, run_id: str):
-        self.run_id = run_id
-        self.dir = quarantine_root() / run_id
-        self.files_dir = self.dir / "files"
+        self._set_id(run_id)
         self.items: List[Dict] = []
         # item_key -> index of its registry entry in ``items`` (this process only)
         self._reg_index: Dict[str, int] = {}
+        self._claimed = False
+        self._written: Optional[str] = None  # sha256 of the manifest we last wrote
+
+    def _set_id(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.dir = quarantine_root() / run_id
+        self.files_dir = self.dir / "files"
+
+    def _claim(self) -> None:
+        """Create this run's directory exclusively (retrying with a fresh id)."""
+        if self._claimed:
+            return
+        quarantine_root().mkdir(parents=True, exist_ok=True)
+        for _ in range(32):
+            try:
+                self.dir.mkdir(exist_ok=False)
+            except FileExistsError:
+                self._set_id(_make_run_id())
+                continue
+            self._claimed = True
+            return
+        raise FileExistsError(f"could not create a unique quarantine run under {quarantine_root()}")
 
     def store(self, path: os.PathLike | str) -> None:
         """Move ``path`` into this quarantine run, recording its origin."""
+        self._claim()
         if os.name == "nt":
             self._store_windows(path)
             return
@@ -213,6 +252,7 @@ class Quarantine:
             raise RegistryChanged(str(exc)) from exc
         if regsnap.fingerprint(reg, snap) != reg.fingerprint:
             raise RegistryChanged("the entry differs from the scan")
+        self._claim()
         idx = len(self.items)
         files = regbackup.write_backup(
             self.dir / "registry", idx, item.cleaner_id, reg, snap
@@ -242,14 +282,28 @@ class Quarantine:
         self._reg_index[item_key(item)] = idx
 
     def mark_registry(self, item, deleted: bool) -> None:
-        """Record whether the entry was deleted (False: certainly not)."""
+        """Record whether the entry was deleted (False: certainly not).
+
+        The save is tried twice. If it still fails, the in-memory flag is
+        put back to what is on disk (``None``, which restore treats as
+        restorable) and the error is raised for the caller to report."""
         from cleanix.core.models import item_key
 
         idx = self._reg_index.get(item_key(item))
         if idx is None:
             return
+        previous = self.items[idx]["deleted"]
         self.items[idx]["deleted"] = bool(deleted)
-        self.save()
+        last: Optional[BaseException] = None
+        for _ in range(2):
+            try:
+                self.save()
+                return
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+        self.items[idx]["deleted"] = previous
+        assert last is not None
+        raise last
 
     before_delete = store_registry
     after_delete = mark_registry
@@ -257,35 +311,69 @@ class Quarantine:
     def save(self) -> None:
         """Write the manifest atomically (temp file, fsync, replace): a
         failed save leaves the previous manifest intact, so entries already
-        recorded (e.g. deleted registry entries) stay restorable."""
-        self.dir.mkdir(parents=True, exist_ok=True)
+        recorded (e.g. deleted registry entries) stay restorable.
+
+        Raises :class:`ManifestConflict` instead of replacing a manifest
+        that this object did not write (another run with the same id)."""
+        self._claim()
         data = json.dumps(
             {"run_id": self.run_id, "created": time.time(), "items": self.items},
             indent=2,
         ).encode("utf-8")
         target = self.dir / "manifest.json"
-        tmp = self.dir / f".manifest.{os.getpid()}.{time.time_ns()}.tmp"
+        if os.path.lexists(str(target)):
+            current = target.read_bytes()
+            if self._written is None or hashlib.sha256(current).hexdigest() != self._written:
+                raise ManifestConflict(
+                    f"refusing to overwrite the manifest of quarantine run "
+                    f"'{self.run_id}': it was not written by this run"
+                )
+        tmp = self.dir / f".manifest.{os.getpid()}.{secrets.token_hex(6)}.tmp"
         try:
             with open(tmp, "wb") as fh:
                 fh.write(data)
                 fh.flush()
                 os.fsync(fh.fileno())
-            _replace(str(tmp), str(target))
+            for attempt in range(4):
+                try:
+                    _replace(str(tmp), str(target))
+                    break
+                except PermissionError:
+                    # Windows: a reader (AV, indexer, GUI) briefly holds it.
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.05 * (2 ** attempt))
         except BaseException:
             try:
                 os.unlink(str(tmp))
             except OSError:
                 pass
             raise
+        self._written = hashlib.sha256(data).hexdigest()
 
     @property
     def size(self) -> int:
         return sum(i["size"] for i in self.items)
 
+    def discard_if_empty(self) -> None:
+        """Remove this run's directory when nothing was recorded in it
+        (only empty directories are removed; nothing else is touched)."""
+        if not self._claimed or self.items:
+            return
+        for d in (self.dir / "registry", self.files_dir, self.dir):
+            try:
+                os.rmdir(str(d))
+            except OSError:
+                pass
+
+    @staticmethod
+    def describe_registry_entries(run_id: str) -> List[str]:
+        return describe_registry_entries(run_id)
+
 
 def new_run() -> Quarantine:
-    run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
-    return Quarantine(run_id)
+    """A new run. Nothing is created on disk until the first write."""
+    return Quarantine(_make_run_id())
 
 
 def _read_manifest(run_dir: Path) -> Optional[Dict]:
@@ -293,9 +381,10 @@ def _read_manifest(run_dir: Path) -> Optional[Dict]:
     if not mf.exists():
         return None
     try:
-        return json.loads(mf.read_text(encoding="utf-8-sig"))
+        data = json.loads(mf.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 def list_runs() -> List[Dict]:
@@ -307,19 +396,37 @@ def list_runs() -> List[Dict]:
         data = _read_manifest(run_dir)
         if not data:
             continue
-        items = data.get("items", [])
-        reg = [i for i in items if isinstance(i, dict) and i.get("type") == "registry"]
+        items = _items_of(data)
+        good = [i for i in items if isinstance(i, dict)]
+        reg = [i for i in good if i.get("type") == "registry"]
         runs.append(
             {
                 "run_id": data.get("run_id", run_dir.name),
                 "created": data.get("created", 0),
                 "count": len(items),
-                "size": sum(i.get("size", 0) for i in items),
+                "size": sum(_size_of(i) for i in good),
                 "registry": len(reg),
                 "registry_admin": sum(1 for i in reg if i.get("hive") == "HKLM"),
+                # Entries restore would act on: files, and registry entries
+                # not known to be untouched (deleted True, or None = unknown).
+                "removed_count": sum(
+                    1 for i in good
+                    if i.get("type") is None
+                    or (i.get("type") == "registry" and i.get("deleted") is not False)
+                ),
             }
         )
     return runs
+
+
+def _items_of(data: Dict) -> List:
+    items = data.get("items", []) if isinstance(data, dict) else []
+    return items if isinstance(items, list) else []
+
+
+def _size_of(item: Dict) -> int:
+    size = item.get("size", 0)
+    return size if isinstance(size, int) and not isinstance(size, bool) else 0
 
 
 def latest_run() -> Optional[str]:
@@ -327,20 +434,30 @@ def latest_run() -> Optional[str]:
     return runs[-1]["run_id"] if runs else None
 
 
-def restore(run_id: str) -> Dict:
-    """Move a run's items back to their original locations."""
+def restore(run_id: str, *, allow_machine_restore: bool = False) -> Dict:
+    """Move a run's items back to their original locations.
+
+    Registry entries are re-created from their validated backups. HKCU
+    entries are restored in-process. HKLM entries are restored only when the
+    process is elevated AND ``allow_machine_restore`` is True, which a caller
+    passes only after showing the user :func:`describe_registry_entries` and
+    getting confirmation; otherwise they fail with the Administrator-terminal
+    advice (ruling R6) and the run is kept."""
     run_dir = quarantine_root() / run_id
     data = _read_manifest(run_dir)
     if not data:
         raise FileNotFoundError(f"no quarantine run '{run_id}'")
 
     restored, failed = [], []
-    for item in data.get("items", []):
+    for item in _items_of(data):
+        if not isinstance(item, dict):
+            failed.append(("?", "invalid manifest entry"))
+            continue
         kind = item.get("type")
         if kind == "registry":
             if item.get("deleted") is False:
                 continue  # never deleted: nothing to restore
-            ok, text = _restore_registry(run_dir, run_id, item)
+            ok, text = _restore_registry(run_dir, run_id, item, allow_machine_restore)
             if ok:
                 restored.append(text)
             else:
@@ -370,26 +487,61 @@ def restore(run_id: str) -> Dict:
     return {"restored": restored, "failed": failed}
 
 
-def _restore_registry(run_dir: Path, run_id: str, item: Dict) -> Tuple[bool, str]:
+def _backup_json(run_dir: Path, item: Dict) -> Path:
+    """The entry's JSON, always inside this run's ``registry`` directory
+    (only the recorded file name is used)."""
+    return run_dir / "registry" / Path(str(item.get("json") or "")).name
+
+
+def _restore_registry(
+    run_dir: Path, run_id: str, item: Dict, allow_machine_restore: bool = False
+) -> Tuple[bool, str]:
     """``(True, display)`` or ``(False, reason)``. The backup is always read
-    from this run's own ``registry`` directory (only the recorded file name
-    is used), so a manifest cannot point restore at a file elsewhere. HKCU
-    entries are restored in-process; HKLM ones only when elevated, else the
-    refusal names the run and the ``reg import`` fallback (ruling R6)."""
+    from this run's own ``registry`` directory, so a manifest cannot point
+    restore at a file elsewhere, and a backup known to belong to another
+    account is refused (``require_owner``; for HKLM also unknown ownership).
+    HKCU entries are restored in-process; HKLM ones only when elevated and
+    confirmed, else the refusal names the run and the ``reg import``
+    fallback (ruling R6)."""
     from cleanix.core import regbackup, winenv, winregistry
 
-    name = Path(str(item.get("json") or "")).name
-    json_path = run_dir / "registry" / name
+    json_path = _backup_json(run_dir, item)
     try:
         shown = regbackup.restore_entry(
             json_path, winregistry.get_backend(),
-            is_admin=winenv.is_admin(), require_owner=True,
+            is_admin=bool(allow_machine_restore) and winenv.is_admin(),
+            require_owner=True,
         )
     except regbackup.RestoreRefused as exc:
         return False, exc.message_for(run_id)
     except Exception as exc:  # noqa: BLE001 - one entry never aborts the rest
         return False, str(exc) or type(exc).__name__
     return True, shown
+
+
+def describe_registry_entries(run_id: str) -> List[str]:
+    """Human-readable lines naming exactly what restoring ``run_id`` would
+    write to the registry: for each entry to restore, its target and every
+    key (``HIVE\\key``) and value (``HIVE\\key [name]``) in its validated
+    backup. An entry whose backup does not validate is listed as such (and
+    restore would refuse it). Callers show this before passing
+    ``allow_machine_restore=True`` to :func:`restore`."""
+    from cleanix.core import regbackup
+
+    data = _read_manifest(quarantine_root() / run_id)
+    if not data:
+        raise FileNotFoundError(f"no quarantine run '{run_id}'")
+    lines: List[str] = []
+    for item in _items_of(data):
+        if not isinstance(item, dict) or item.get("type") != "registry":
+            continue
+        if item.get("deleted") is False:
+            continue
+        try:
+            lines.extend(regbackup.describe_backup(_backup_json(quarantine_root() / run_id, item)))
+        except regbackup.RestoreError as exc:
+            lines.append(f"{item.get('original', '?')}: {exc}")
+    return lines
 
 
 def purge_detailed(run_id: str) -> Tuple[int, List[str]]:
