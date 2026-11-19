@@ -45,8 +45,9 @@ Merge order inside a wave is free. Merge each wave before starting the next.
 - The file deletion guard `cleanix/core/safety.py` is unchanged. Registry rules live in `cleanix/core/regsafety.py`.
 - Tests never touch the real registry. An autouse fixture installs a backend that raises on any call. Tests still never create `HKCU\Software\Cleanix` (QSettings isolation stands). The manual verification script uses only `HKCU\Software\CleanixTest` and removes it.
 - Undo is promised only where it is true:
-  - HKCU registry entries: restorable from the Quarantine tab, Simple Undo, or `cleanix restore`.
-  - HKLM entries: backed up, but restorable only from an Administrator terminal (`cleanix restore <run>`). See R6.
+  - HKCU registry entries: restorable from the Power Quarantine tab or `cleanix restore`. Simple mode never cleans registry items (R13).
+  - HKLM entries: backed up, but restorable only from an Administrator terminal, either `cleanix restore <run>` or `reg import "<absolute .reg path>"`. See R6.
+- The five ids are defined once, as `catalog.REGISTRY_IDS`. The CLI and the helper import that tuple and never repeat the list.
 - Commit trailer: `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`. Do not push or merge to main.
 - Test command (repo root): `QT_QPA_PLATFORM=offscreen PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider <paths>`. GUI tests skip cleanly without PySide6.
 
@@ -72,7 +73,7 @@ Merge order inside a wave is free. Merge each wave before starting the next.
 - **R6** For HKLM, the GUI (as the user) writes the backup into a quarantine run, then launches the helper.
   - The helper writes nothing: the existing rule 8 stands.
   - The helper deletes only items whose key, which embeds the fingerprint, matches its own fresh scan, and re-checks the fingerprint immediately before the delete.
-  - HKLM Undo is refused in a non-elevated process, with the instruction "run `cleanix restore <run>` from an Administrator terminal". The GUI never offers an elevated restore. An elevated import of a user-writable file would let a standard user plant HKLM entries, for example a Run entry.
+  - HKLM Undo is refused in a non-elevated process. The refusal names the run and the absolute `.reg` path, with both `cleanix restore <run>` and `reg import "<path>"` to be run from an Administrator terminal. `reg import` is the only route that works under over-the-shoulder UAC, where the administrator is a different account whose `%LOCALAPPDATA%` does not contain the run. The GUI never offers an elevated restore. An elevated import of a user-writable file would let a standard user plant HKLM entries, for example a Run entry.
   - *Cost:* no one-click Undo for machine entries (Open question 1).
 - **R7** Restore is an additive merge. It recreates missing keys and values. A value that exists with identical type and data counts as restored. Any differing value fails the whole entry **before** anything is written. Security descriptors are neither backed up nor restored, so recreated keys inherit the parent ACL. *Cost:* a restored key loses a custom ACL. Dead entries rarely have one.
 - **R8** The fingerprint is part of `item_key`, so a changed entry is "unmatched" in the helper. The request schema is unchanged. *Cost:* GUI selection does not survive a fingerprint change across rescans, which is correct behaviour.
@@ -88,7 +89,7 @@ Merge order inside a wave is free. Merge each wave before starting the next.
   - host executables (`msiexec`, `rundll32`, `cmd`, `powershell`, `pwsh`, `wscript`, `cscript`, `regsvr32`, `mshta`, `explorer`, `conhost`, `dllhost`, `wsl`);
   - a `~N` short-name component that does not resolve;
   - any path under `%SystemRoot%`, which also sidesteps System32/SysWOW64 redirection;
-  - `%ProgramFiles*%\WindowsApps`, `%ProgramFiles*%\Windows*`, `%ProgramFiles*%\Microsoft*`, `%ProgramFiles*%\Internet Explorer`, `%ProgramData%\Microsoft`, `%LOCALAPPDATA%\Microsoft` (Microsoft-owned, Features on Demand, App Execution Aliases);
+  - `<PF>\WindowsApps`, `<PF>\Windows*`, `<PF>\Microsoft*`, `<PF>\Internet Explorer`, `%ProgramData%\Microsoft`, `%LOCALAPPDATA%\Microsoft` (Microsoft-owned, Features on Demand, App Execution Aliases). `<PF>` covers each of `%ProgramW6432%`, `%ProgramFiles%` and `%ProgramFiles(x86)%`, plus the literals `<SystemDrive>\Program Files` and `<SystemDrive>\Program Files (x86)`. The literals matter because a 32-bit Python sees `%ProgramFiles%` as the x86 folder, and the helper's sanitized environment drops `ProgramW6432` and `PUBLIC`;
   - for HKLM entries, anything under the profiles root (`C:\Users`), because it is another user's per-user install.
 
   *Cost:* some real dead entries are missed. That is accepted.
@@ -214,6 +215,8 @@ Merge order inside a wave is free. Merge each wave before starting the next.
       - for each finding, it requires `check_target(..., backend) is None` and takes a snapshot, skipping the finding on `SnapshotError`, `RegistryError` or a non-None reason;
       - it yields `registry_item(finding, fingerprint)`, where `requires_root = hive == "HKLM"`, `size=0` and `hint=evidence`.
     - It also defines `entries(self, container, backend, ctx) -> Iterable[Finding]` (abstract; stubs yield nothing) and `context(self) -> DetectorContext` (returns `regtargets.default_context()`, overridable by tests).
+    - `available()` returns `"only available on Windows"` when `sys.platform != "win32"` and no backend override is set. This matters because `build_cleaners(only=...)` runs unsupported cleaners off Windows.
+  - `catalog.REGISTRY_IDS: Tuple[str, ...]`: the five ids, in Global Constraints order.
   - Stub classes: `WinRegUninstall`, `WinRegAppPaths`, `WinRegFileAssoc`, `WinRegStartup`, `WinRegSharedDlls`, with ids as in Global Constraints and names "Registry: dead uninstall entries", "Registry: dead App Paths", "Registry: dead file-type handlers", "Registry: dead startup entries", "Registry: SharedDLLs counts for missing files".
   - `catalog.CATEGORIES["registry"] = "Registry leftovers"`; `_assign("registry", <five ids>)`; `"registry"` added to `_NEVER_PRESELECT`.
   - `curation` changes:
@@ -229,10 +232,10 @@ Merge order inside a wave is free. Merge each wave before starting the next.
   - Engine (fail-closed only): `_clean_one` dispatches PATH, then COMMAND, then REGISTRY. The REGISTRY branch returns `CleanOutcome(removed=False, error="registry cleaning is not available")` until T11. Any other kind returns `error="unknown item kind"`. Nothing ever runs `run_command([])`.
   - `tests/_fakereg.py`:
     - `FakeRegistry`, implementing the Protocol in memory with case-insensitive names. It provides `add_key(hive, key, values: Mapping[str, Tuple[int, object]] = {}, *, link=False, deny_delete=False, deny_read=False)`, `fail_next(op: str, exc: Exception)`, `calls: List[Tuple]`, and `tree(hive, key) -> dict` for assertions.
-    - `ForbiddenBackend`: every method raises `AssertionError("tests must never touch the real registry")`.
+    - `ForbiddenBackend`: every method appends to `self.calls` and raises `AssertionError("tests must never touch the real registry")`. The append matters because `Cleaner.scan` catches `Exception`, which would otherwise swallow the error.
     - `FakeProber(states: Mapping[str, Existence], default=Existence.UNKNOWN)`, with paths casefolded.
   - `tests/conftest.py`:
-    - autouse `_no_real_registry` sets `winregistry.set_backend(ForbiddenBackend())` and resets it after the test;
+    - autouse `_no_real_registry` sets `winregistry.set_backend(ForbiddenBackend())`. At teardown it fails the test when `calls` is non-empty, then resets the backend;
     - fixture `fake_registry` installs and returns a `FakeRegistry`.
 
 - [ ] **Step 1: Write the failing tests** in `tests/test_registry_foundation.py`:
@@ -255,12 +258,14 @@ Merge order inside a wave is free. Merge each wave before starting the next.
   - `test_engine_never_runs_registry_as_command`: a monkeypatched `run_command` is never called, and the error text matches.
   - `test_stub_detectors_registered_opt_in`: all five are in `ALL_CLEANERS`, `default_enabled` is False, scope is SYSTEM, platforms is `(WINDOWS,)`, and a default `build_cleaners(Config())` on any OS contains none of them.
   - `test_detector_base_builds_items`: a test subclass yields two findings and one denied finding; the items carry the fingerprint, `requires_root` follows the hive, and the denied finding is dropped.
-  - `test_forbidden_backend_active`: `winregistry.get_backend().subkeys("HKCU","SOFTWARE")` raises `AssertionError`.
+  - `test_forbidden_backend_active`: `winregistry.get_backend().subkeys("HKCU","SOFTWARE")` raises `AssertionError` and is recorded in `calls`. Clear `calls` at the end of the test so teardown passes.
+  - `test_detectors_unavailable_off_windows` (with `sys.platform` monkeypatched to `linux` and no override): `scan()` returns `skipped_reason == "only available on Windows"` and makes zero backend calls.
   - `test_core_imports_without_winreg`: in a subprocess with `sys.modules["winreg"] = None`, import `cleanix.core.winregistry`, `regsafety`, `regsnap`, `regtargets`, `cleanix.cleaners`.
   - `test_winreg_imported_only_in_backend_module`: grep `cleanix/` for `import winreg` and `from winreg`; the only hit is `winregistry_win.py`, and zero hits is allowed until T3.
 - [ ] **Step 2: Run** `tests/test_registry_foundation.py`. Expect FAIL (modules missing).
 - [ ] **Step 3: Implement** the Produces list. `regsafety` reasons are short plain sentences, for example "not inside an allowed registry location" or "Windows-owned key".
-- [ ] **Step 4: Run** `tests/test_registry_foundation.py tests/test_curation.py tests/test_catalog.py tests/test_cleanix.py`. Expect PASS. Also run the full suite: nothing existing breaks. `test_no_cleaner_in_other_category` and the copy test cover the new ids.
+- [ ] **Step 4: Run** `tests/test_registry_foundation.py tests/test_curation.py tests/test_catalog.py tests/test_cleanix.py`. Expect PASS. `test_no_cleaner_in_other_category` and the copy test cover the new ids.
+- [ ] **Step 4b: Audit and run the full suite.** Grep `tests/` for `ALL_CLEANERS`, `describe_all` and `include_unsupported`. Known users today: `test_catalog.py`, `test_curation.py`, `test_elevate.py`, `test_admin_eligibility.py`. Make sure any test that *scans* every cleaner on win32 either installs `fake_registry` or excludes `catalog.REGISTRY_IDS`. Then run the full suite on Windows: zero failures, and no `_no_real_registry` teardown failures.
 - [ ] **Step 5: Commit** `feat(core): registry item model, backend protocol, safety rules and opt-in detector stubs`.
 
 ---
@@ -291,6 +296,7 @@ Merge order inside a wave is free. Merge each wave before starting the next.
     - for a command: parse, and return UNKNOWN when `host` or `relative`;
     - for a machine entry: any candidate under `ctx.profiles_root` gives UNKNOWN;
     - then any candidate PRESENT gives PRESENT, all candidates MISSING give MISSING, otherwise UNKNOWN.
+  - `microsoft_roots(env: Mapping[str, str], system_drive: str) -> Tuple[str, ...]`: the `<PF>` set from R11, built from `ProgramW6432`, `ProgramFiles` and `ProgramFiles(x86)` when present, plus the two `<SystemDrive>` literals. Duplicates are removed case-insensitively. `WinProber.program_files` receives this set.
   - `default_context() -> DetectorContext`:
     - env is `os.environ` (the Windows API values come from `winenv`);
     - the prober is `WinProber` with `GetDriveTypeW` via ctypes, imported lazily;
@@ -330,6 +336,8 @@ Merge order inside a wave is free. Merge each wave before starting the next.
     24. `rundll32 C:\gone.dll,X` [UNKNOWN]
     25. empty string [UNKNOWN]
     26. `"C:\a.exe` with an unterminated quote [UNKNOWN]
+    27. 32-bit process (env `ProgramFiles=C:\Program Files (x86)`, no `ProgramW6432`), `C:\Program Files\Microsoft Office\root\x.exe` missing [UNKNOWN]
+    28. helper-style env without `PUBLIC` and `ProgramW6432`: `C:\Program Files\WindowsApps\a.exe` [UNKNOWN], and `profiles_root` falls back to `C:\Users`
   - `test_default_context_unavailable_off_windows` (skipif win32).
 - [ ] **Step 2: Run** `tests/test_regtargets.py`. Expect FAIL.
 - [ ] **Step 3: Implement.** Use `ntpath` for every path operation, so the tests run identically on POSIX.
@@ -405,7 +413,7 @@ Merge order inside a wave is free. Merge each wave before starting the next.
   - `restore_entry(json_path: Path, backend: RegistryBackend, *, is_admin: bool) -> str`. It returns the display string. In order, it:
     1. parses and validates the JSON (format 1, known types, sizes within the regsnap limits);
     2. checks that `check_target(cleaner_id, target)` is None and that every key in the snapshot lies at or under the target key;
-    3. refuses HKLM when `not is_admin`, with "needs administrator: run `cleanix restore <run>` from an Administrator terminal" (the caller fills in `<run>`);
+    3. refuses HKLM when `not is_admin`. The message is `f'needs administrator: from an Administrator terminal run cleanix restore {{run}} or reg import "{reg_path}"'`, where `reg_path` is the absolute path of the sibling `.reg` file and the caller fills in `{run}`;
     4. runs a pre-check pass that fails the whole entry when any existing value differs (R7);
     5. runs a write pass that creates the missing keys and values;
     6. re-snapshots and returns only if the fingerprint equals the backup's, else raises `RestoreError("restored, but the result differs from the backup")`.
@@ -420,7 +428,7 @@ Merge order inside a wave is free. Merge each wave before starting the next.
   - `test_restore_merges_after_partial_delete`: one subkey still exists and is identical; it succeeds.
   - `test_restore_conflict_writes_nothing`: one existing value differs; `RestoreError` is raised and `calls` contains no `set_value` or `create_key`.
   - `test_restore_refuses_tampered_paths`: the key is rewritten to `SYSTEM\x`, a snapshot subkey escapes the target, or the cleaner id does not own the container. Each raises with zero writes.
-  - `test_restore_hklm_needs_admin`
+  - `test_restore_hklm_needs_admin`: zero writes, and the message contains the absolute `.reg` path and `reg import`.
   - `test_restore_rejects_unknown_format`
 - [ ] **Step 2: Run** `tests/test_regbackup.py`. Expect FAIL.
 - [ ] **Step 3: Implement.**
@@ -475,7 +483,7 @@ Merge order inside a wave is free. Merge each wave before starting the next.
 
 ### Tasks 6–10: Detectors (W2, five parallel tasks)
 
-Every detector task follows the same structure.
+Every detector task follows the same structure. **The common block below (Files, Interfaces, fixture, steps) is part of each detector task's brief. Hand it to the implementer together with that task's own subsection.**
 
 **Files:** Modify the detector's own module only. Test: its own file.
 
@@ -691,7 +699,7 @@ Tests:
 **Interfaces:**
 - Consumes: `Engine.clean(registry_backup=...)`, `quarantine.new_run/store_registry/save` (T11); `item_target` (T1); `catalog` ids.
 - Produces:
-  - `cli.REGISTRY_IDS: Tuple[str, ...]`, the five ids in Global Constraints order.
+  - The CLI uses `catalog.REGISTRY_IDS`.
   - `--registry` (`store_true`) on `scan` and `clean`, implementing R14.
   - `cmd_clean` real-clean behaviour when REGISTRY items are present:
     - `reg_run = quarantine if args.quarantine else qmod.new_run()`, passed as `registry_backup`;
@@ -722,15 +730,18 @@ Tests:
 **Files:**
 - Modify:
   - `cleanix/elevated.py`: `REGISTRY_ADMIN_IDS`, `admin_cleaner_ids`, `_eligible`, `static_admin_problem`, the `_execute` REGISTRY branch, and docstring points 5, 7 and 8.
-  - `cleanix/gui/elevation.py`: pre-launch backups, `ElevatedOutcome` fields, outcome lines.
+  - `cleanix/gui/elevation.py`: pre-launch backups, `ElevatedOutcome` fields, outcome and preview lines.
+  - `cleanix/gui/workers.py`: only the `admin_preview_registry` count in `_run_dry`.
   - `tests/test_elevate.py`: update `test_allowlist_rules_hold_for_this_platform` and `test_allowlist_on_windows`.
   - `tests/test_admin_eligibility.py`: registry parity.
+  - `tests/gui/test_admin_eligibility.py`: its parity helpers build REGISTRY HKLM items for registry ids when on Windows.
+  - `tests/gui/test_elevated_flow.py`, but only if it asserts the allowlist or the "cannot be undone" wording.
 - Test: `tests/test_registry_helper.py`
 
 **Interfaces:**
 - Consumes: `service.clean(registry_backup_elsewhere=True)`, `quarantine.new_run/store_registry/save/purge` (T11); `regsafety.check_target` (T1).
 - Produces:
-  - `elevated.REGISTRY_ADMIN_IDS = frozenset({"win_reg_uninstall","win_reg_app_paths","win_reg_file_assoc","win_reg_startup","win_reg_shared_dlls"})`. `admin_cleaner_ids()` adds them on Windows when `supported()`, bypassing the system-category, class-`requires_root` and `default_enabled` rules, and only for these ids.
+  - `elevated.REGISTRY_ADMIN_IDS = frozenset(catalog.REGISTRY_IDS)`. `admin_cleaner_ids()` adds them on Windows when `supported()`, bypassing the system-category, class-`requires_root` and `default_enabled` rules, and only for these ids.
   - `_eligible(item, allowed)`: for an id in `REGISTRY_ADMIN_IDS`, it additionally requires `item.kind is REGISTRY`, `item.reg.hive == "HKLM"` and `check_target(...) is None`. Any REGISTRY item from another id is refused.
   - `static_admin_problem` mirrors this. The plain reasons are "Only machine-wide (HKLM) registry entries are cleaned with administrator permission" and "Blocked by registry safety rules".
   - `_execute`: REGISTRY items skip `_path_chain_problem`, are refused unless HKLM, and are cleaned with `service.clean([item], config, dry_run=False, use_quarantine=False, record_history=False, registry_backup_elsewhere=True, cancel=cancel)`. The helper writes nothing.
@@ -739,8 +750,9 @@ Tests:
     - before writing the request, it creates one quarantine run for the REGISTRY admin items, calls `store_registry` for each, and drops any item whose backup fails from the selection (counted in `registry_backup_failed`; if nothing remains, the outcome is FAILED with "Registry backup failed; nothing was removed.");
     - after the launch, it purges the run when the status is DECLINED or UNAVAILABLE, or when cancel stopped it before launch, and otherwise keeps it with `deleted: None` entries.
   - `admin_outcome_lines` adds:
-    - when a run is kept: `f"Registry entries were backed up to quarantine run {run}; restoring them needs an Administrator terminal: cleanix restore {run}"`;
+    - when a run is kept: `f"Registry entries were backed up to quarantine run {run} ({run_dir}); to restore, from an Administrator terminal run cleanix restore {run} or reg import each .reg file there"`. `run_dir` is the absolute run directory;
     - the existing "Administrator items are removed permanently" line becomes "Administrator files and commands are removed permanently; they cannot be undone." when any registry admin item was sent.
+  - `admin_preview_line(count, size, registry: int = 0)`, the dry run: when `registry` is greater than 0, it says `f"... would be removed after one administrator prompt; files and commands cannot be undone, {registry} registry entr(y/ies) are backed up first"`. `CombinedSummary` gains `admin_preview_registry: int = 0`, set by `ElevatedCleanWorker._run_dry`. This edits `cleanix/gui/workers.py`, so add that file to this task.
 
 - [ ] **Step 1: Write the failing tests**:
   - `test_registry_ids_allowlisted_on_windows_only` (monkeypatch `plat.is_windows` both ways).
@@ -752,7 +764,8 @@ Tests:
   - `test_gui_writes_backup_before_launch`: the launcher stub asserts that the backup files exist when it is called.
   - `test_backup_failure_drops_item_from_request`
   - `test_declined_purges_backup_run`
-  - `test_outcome_lines_registry_wording`
+  - `test_outcome_lines_registry_wording`: the line contains the absolute run dir and `reg import`.
+  - `test_dry_run_preview_registry_not_called_permanent`
   - Updated `test_allowlist_rules_hold_for_this_platform`: `category == "system" or cid == "temp" or cid in REGISTRY_ADMIN_IDS`, with the registry ids required to be `win_*` and supported.
   - Updated `test_static_problem_matches_helper_for_every_cleaner`: a REGISTRY HKLM item is used for registry ids.
 - [ ] **Step 2: Run** `tests/test_registry_helper.py tests/test_elevate.py tests/test_admin_eligibility.py`. Expect FAIL.
@@ -784,12 +797,15 @@ Tests:
   - `class ReRootedBackend`, `__init__(self, inner, root_hive="HKCU", root_key=r"SOFTWARE\CleanixTest")`. It maps each logical `(hive, key)` to `(root_hive, f"{root_key}\\{hive}\\{key}")`. `is_link` answers for the mapped key. It raises `ValueError` for any mapped key not under the root.
   - `main() -> int`, which:
     1. refuses unless `sys.platform == "win32"`, and refuses if `HKCU\SOFTWARE\CleanixTest` already exists (exit 2);
-    2. creates fixtures under the root: one dead and one live entry per detector, plus controls (UNC, `%UNDEFINED%`, a target under `C:\Windows`, an existing temp exe), pointing at a temp directory that it deletes to make the targets dead;
+    2. creates fixtures under the root: one dead and one live entry per detector, plus controls (UNC, `%UNDEFINED%`, a target under `C:\Windows`, an existing exe). Dead targets point into `<SystemDrive>\CleanixVerify-<uuid4>\`, which the script creates and then deletes to make them dead. This folder must be outside the profiles root: under R11, HKLM-logical targets in `C:\Users` are UNKNOWN. The script removes the folder on exit, including on failure;
     3. runs each detector with `using_backend(ReRootedBackend(WinRegBackend()))`, and with `quarantine_root` redirected to a temp dir;
     4. asserts exactly the dead entries are found;
     5. runs `service.clean` (HKLM-logical items with `allow_root_items` via `Engine` directly, since they are physically in HKCU);
     6. asserts dead removed, live kept, and both backup files exist with the UTF-16 BOM and header;
-    7. runs `quarantine.restore` and asserts the fingerprints are equal;
+    7. runs `quarantine.restore`:
+       - HKCU-logical entries are restored and their fingerprints are equal;
+       - in a non-admin run, HKLM-logical entries fail with the `reg import` instruction text;
+       - the script then restores those entries with `regbackup.restore_entry(..., is_admin=True)`, which is safe because they are physically under the HKCU test root, and asserts the fingerprints are equal;
     8. finally deletes the whole `HKCU\SOFTWARE\CleanixTest` tree;
     9. asserts the root is gone and that the exact key `HKCU\SOFTWARE\Cleanix` does not exist (not a prefix match);
     10. prints PASS or FAIL per step and exits 0 only if all pass.
@@ -809,5 +825,5 @@ Tests:
 
 ## Open questions for the user
 
-1. **One-click Undo for machine-wide (HKLM) entries?** The plan's default (R6): backups are kept, but restoring them needs `cleanix restore <run>` in an Administrator terminal. One-click Undo would need a new elevated "restore" helper action, plus an administrator-only integrity record of each backup, for example a digest stored under `HKLM\Software\Cleanix`. Without that record, a standard user could get the helper to write arbitrary HKLM entries.
+1. **One-click Undo for machine-wide (HKLM) entries?** The plan's default (R6): backups are kept, but restoring them needs `cleanix restore <run>`, or `reg import "<file>"`, in an Administrator terminal. With over-the-shoulder UAC (a separate administrator account), only `reg import` with the absolute path works, because the run lives in the standard user's profile. One-click Undo would need a new elevated "restore" helper action, plus an administrator-only integrity record of each backup, for example a digest stored under `HKLM\Software\Cleanix`. Without that record, a standard user could get the helper to write arbitrary HKLM entries.
 2. **Should Simple mode ever scan the registry?** The plan's default (R13): no. Simple shows "Registry leftovers are checked only in Power mode." The alternative is that Simple's Deep scan includes the registry detectors and lists them read-only, which makes Deep scan slower and adds registry reads.
