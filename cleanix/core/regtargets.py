@@ -40,6 +40,8 @@ class DetectorContext:
     system_root: str
     # False when the entries belong to someone other than the process owner
     # (helper, another user's hive): per-user variables are then UNKNOWN.
+    # NOTE: default_context() never sets this to False; detector code must
+    # pass owner_matches=False whenever the helper or another user is scanning.
     owner_matches: bool = True
 
 
@@ -104,6 +106,7 @@ PATHEXT = (".com", ".exe", ".bat", ".cmd", ".pif", ".lnk", ".msc", ".cpl")
 _LEGACY_NAMES = frozenset({"documents and settings", "all users", "default user"})
 _MAX_PATH_LEN = 240
 _REPARSE = 0x400
+_X86_RE = re.compile(r" \(x86\)(?=\\|$)", re.IGNORECASE)
 
 
 def _var_values(name: str, folded: Mapping[str, str]) -> Optional[List[str]]:
@@ -115,11 +118,15 @@ def _var_values(name: str, folded: Mapping[str, str]) -> Optional[List[str]]:
     if fam:
         w64, x86 = fam
         cands = [folded.get(w64), folded.get(x86)]
-        if folded.get(x86) is None and v.casefold().endswith(" (x86)"):
-            cands.append(v[: -len(" (x86)")])
         for c in cands:
             if c and c.casefold() not in {x.casefold() for x in vals}:
                 vals.append(c)
+    # Whatever the other variables say, a 32-bit folder may stand for the
+    # native one: always also try the path without the " (x86)" component.
+    for v0 in list(vals):
+        native = _X86_RE.sub("", v0)
+        if native.casefold() not in {x.casefold() for x in vals}:
+            vals.append(native)
     return vals
 
 

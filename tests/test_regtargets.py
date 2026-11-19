@@ -305,8 +305,9 @@ def test_c1_machine_allowlist_still_expands():
 
 
 def test_c1_owner_mismatch_blocks_per_user_variables_for_hkcu():
-    assert _ts(r"%APPDATA%\Foo\a.exe", env=USER_ENV, owner_matches=False) is U
-    assert _ts(r"%APPDATA%\Foo\a.exe", FakeFS(drives={"D:": 3}), env=USER_ENV) is M
+    d = FakeFS(drives={"D:": 3})
+    assert _ts(r"%APPDATA%\Foo\a.exe", d, env=USER_ENV, owner_matches=False) is U
+    assert _ts(r"%APPDATA%\Foo\a.exe", d, env=USER_ENV, owner_matches=True) is M
     assert _ts(r"%ProgramData%\Foo\a.exe", owner_matches=False) is M
 
 
@@ -328,6 +329,40 @@ def test_i1_wow_variants_32bit_interpreter():
     # UNKNOWN in one variant keeps the verdict out of MISSING.
     unk = FakeFS(errors={r"C:\Program Files\Foo\a.exe": 5})
     assert _ts(r"%ProgramFiles%\Foo\a.exe", unk, env=env) is U
+
+
+def test_x86_native_variant_always_tried():
+    env = dict(ENV, CommonProgramFiles=r"C:\Program Files (x86)\Common Files")
+    del env["ProgramW6432"]
+    live = FakeFS(present=[r"C:\Program Files\Common Files\Foo\a.exe"])
+    assert _ts(r"%CommonProgramFiles%\Foo\a.exe", live, env=env) is P
+    assert _ts(r"%CommonProgramFiles%\Foo\a.exe", env=env) is M
+    env2 = {
+        "ProgramFiles": r"C:\Program Files (x86)",
+        "ProgramFiles(x86)": r"C:\Program Files (x86)",
+        "SystemDrive": "C:",
+    }
+    live2 = FakeFS(present=[r"C:\Program Files\Foo\a.exe"])
+    assert _ts(r"%ProgramFiles%\Foo\a.exe", live2, env=env2) is P
+    assert _ts(r"%ProgramFiles%\Foo\a.exe", env=env2) is M
+
+
+def test_x86_variant_kept_in_64bit_env():
+    live = FakeFS(present=[r"C:\Program Files (x86)\Foo\a.exe"])
+    assert _ts(r"%ProgramFiles%\Foo\a.exe", live) is P
+    assert _ts(r"%ProgramFiles%\Foo\a.exe") is M
+
+
+def test_ancestor_non_notfound_error_is_unknown():
+    fs = FakeFS(errors={r"C:\dir": 5})
+    assert _ts(r"C:\dir\gone\a.exe", fs, command=True) is U
+
+
+def test_dotdot_normalised_before_guards():
+    assert _ts(r"C:\Apps\..\Windows\x.exe") is U
+    assert _ts(r"C:\Apps\..\Windows\x.exe", command=True) is U
+    assert _ts(r"D:\a\..\Users\x\y.exe", FakeFS(drives={"D:": 3}), machine=True) is U
+    assert _ts(r"D:\a\..\Users\x\y.exe", FakeFS(drives={"D:": 3})) is M
 
 
 def test_i2_reparse_ancestor_is_unknown():
