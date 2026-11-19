@@ -40,6 +40,9 @@ jobs:
             artifact_name: cleanix-linux-amd64
           - os: macos-latest
             artifact_name: cleanix-macos-arm64
+          - os: windows-latest
+            artifact_name: cleanix-windows-amd64
+            ext: .exe
 
     steps:
       - name: Checkout code
@@ -60,20 +63,22 @@ jobs:
         run: pyinstaller --onefile --name cleanix --clean scripts/cleanix_entry.py
 
       - name: Test binary
+        shell: bash
         run: |
-          chmod +x dist/cleanix
-          ./dist/cleanix --version
-          ./dist/cleanix --help
-          ./dist/cleanix list >/dev/null
+          chmod +x dist/cleanix${{ matrix.ext }}
+          ./dist/cleanix${{ matrix.ext }} --version
+          ./dist/cleanix${{ matrix.ext }} --help
+          ./dist/cleanix${{ matrix.ext }} list >/dev/null
 
       - name: Rename binary
-        run: mv dist/cleanix dist/${{ matrix.artifact_name }}
+        shell: bash
+        run: mv dist/cleanix${{ matrix.ext }} dist/${{ matrix.artifact_name }}${{ matrix.ext }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
-          path: dist/${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}${{ matrix.ext }}
           retention-days: 7
 
   build-package:
