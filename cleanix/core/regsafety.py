@@ -101,6 +101,38 @@ _DENY_CLASS_PREFIXES = (
 )
 
 
+# Well-known Windows / browser / Office ProgIds (casefolded). Exact names and
+# prefixes are merged once, at import time, into the deny tables below.
+WINDOWS_PROGIDS = frozenset(
+    {
+        "txtfile", "txtfilelegacy", "paint.picture", "wordpad.document.1",
+        "msinfo.document", "htafile", "msi.patch", "msi.package", "rtffile",
+        "regfile", "inffile", "inifile", "cmdfile", "vbsfile", "vbefile",
+        "jsfile", "jsefile", "wsffile", "wshfile", "chm.file", "cabfolder",
+        "giffile", "jpegfile", "pngfile", "bmpfile", "icofile", "htmlfile",
+        "mhtmlfile", "xmlfile", "msedgehtm", "chromehtml", "http", "https",
+        "ftp", "file", "mailto", "component categories", "helpfile", "cabfile",
+        "cdafile", "mscfile", "themefile", "curfile", "anifile", "dllfile",
+        "sysfile", "cplfile", "scrfile", "ocxfile", "pffile", "fonfile",
+        "ttffile", "otffile", "urlfile", "internetshortcut", "shortcut",
+        "shell", "search", "search-ms", "telnet", "news", "nntp", "snews",
+        "gopher", "tn3270", "sendto", "droptarget", "desktop", "network",
+        "printers", "recyclebin",
+    }
+)
+WINDOWS_PROGID_PREFIXES = ("firefoxhtml-", "ie.")
+WINDOWS_APPLICATIONS = frozenset(
+    f"{n}.exe"
+    for n in (
+        "explorer", "iexplore", "msedge", "notepad", "wordpad", "mspaint",
+        "mmc", "cmd", "powershell", "wscript", "cscript", "regedit", "control",
+        "calc", "write", "winword", "excel", "powerpnt", "outlook", "onenote",
+    )
+)
+_DENY_CLASS_EXACT = _DENY_CLASS_EXACT | WINDOWS_PROGIDS
+_DENY_CLASS_PREFIXES = _DENY_CLASS_PREFIXES + WINDOWS_PROGID_PREFIXES
+
+
 def normalize(hive: str, key: str) -> Tuple[str, Tuple[str, ...]]:
     """Canonical ``(hive, casefolded components)``; raises ``ValueError`` for
     anything outside HKCU/HKLM ``SOFTWARE`` or any malformed path."""
@@ -245,6 +277,10 @@ def check_target(
     if cleaner_id == "win_reg_file_assoc":
         name = parts[-1]
         if not name.isascii() or _class_name_denied(name):
+            return "Windows-owned file-type key"
+        if comps[-2] == "applications" and any(
+            f in WINDOWS_APPLICATIONS for f in _folds(name)
+        ):
             return "Windows-owned file-type key"
 
     if backend is not None:
