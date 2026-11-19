@@ -39,7 +39,7 @@ _SKIP = {
         "dhcp NetworkManager AccountsService PackageKit logrotate man-db "
         "plymouth sss nfs ubuntu-advantage cloud bluetooth boltd rpm-state "
         "shells.state swcatalog cups sddm gdm lightdm fwupd ModemManager "
-        "upower geoclue power-profiles-daemon".split()
+        "upower geoclue power-profiles-daemon app-info".split()
     ),
     "/var/cache": frozenset(
         "apt dnf yum pacman man fontconfig ldconfig debconf PackageKit cups "

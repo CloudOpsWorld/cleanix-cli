@@ -375,7 +375,7 @@ def test_new_var_lib_skip_entries(orphan_env, monkeypatch):
               "cups", "sddm", "gdm", "lightdm", "AccountsService", "fwupd",
               "PackageKit", "NetworkManager", "polkit-1", "ModemManager",
               "upower", "geoclue", "power-profiles-daemon", "plymouth", "ucf",
-              "cloud"):
+              "cloud", "app-info"):
         make(orphan_env, f"/var/lib/{d}")
     make(orphan_env, "/var/lib/zzzgenuine")
     assert paths(scan(orphan_env), orphan_env) == ["/var/lib/zzzgenuine"]
