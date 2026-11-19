@@ -136,12 +136,113 @@ def test_prober_error_means_unknown(fake_registry):
 def test_huge_container_is_bounded(fake_registry, monkeypatch):
     monkeypatch.setattr(mod, "MAX_CHECKED", 50)
     monkeypatch.setattr(mod, "MAX_FINDINGS", 10)
-    vals = {rf"C:\Gone\f{i}.dll": (REG_DWORD, 1) for i in range(300)}
-    items, prober = scan(fake_registry, vals)
-    assert len(items) <= 10
-    assert len(prober.calls) <= 50 * 2
-    reads = [c for c in fake_registry.calls if c[0] == "values"]
-    assert len(reads) <= 1 + 10 + 1  # the scan read, plus one per snapshot
+    vals = {rf"C:\Gone\f{i:03}.dll": (REG_DWORD, 1) for i in range(300)}
+    fake_registry.add_key("HKLM", CV, vals)
+    det, prober = make({})
+    report = det.scan()
+    names = [i.reg.value for i in report.items]
+    # the first ten in sorted order, and the cut is announced
+    assert names == [rf"C:\Gone\f{i:03}.dll" for i in range(10)]
+    assert report.ran and report.incomplete and "10" in report.incomplete
+    assert len(prober.calls) <= 50
+    # the container is read once, never once per finding
+    assert len([c for c in fake_registry.calls if c[0] == "values"]) <= 2
+
+
+def test_complete_scan_has_no_incomplete_note(fake_registry):
+    fake_registry.add_key("HKLM", CV, {GONE: (REG_DWORD, 1)})
+    det, _ = make({})
+    report = det.scan()
+    assert len(report.items) == 1 and report.incomplete is None
+
+
+def test_checked_cap_announced(fake_registry, monkeypatch):
+    monkeypatch.setattr(mod, "MAX_CHECKED", 5)
+    fake_registry.add_key(
+        "HKLM", CV, {rf"C:\Here\f{i}.dll": (REG_DWORD, 1) for i in range(9)}
+    )
+    det, _ = make({}, default=P)
+    report = det.scan()
+    assert report.items == [] and report.incomplete
+
+
+class Clock:
+    def __init__(self, step=0.0):
+        self.now = 0.0
+        self.step = step
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
+
+
+def test_deadline_stops_and_announces(fake_registry, monkeypatch):
+    monkeypatch.setattr(mod, "_clock", Clock(step=1.0))
+    monkeypatch.setattr(mod, "MAX_SECONDS", 5.0)
+    fake_registry.add_key(
+        "HKLM", CV, {rf"C:\Gone\f{i:03}.dll": (REG_DWORD, 1) for i in range(100)}
+    )
+    det, _ = make({})
+    report = det.scan()
+    assert 0 < len(report.items) < 100
+    assert report.incomplete and "time" in report.incomplete
+
+
+def test_deadline_ignores_time_suspended_at_yield(fake_registry, monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(mod, "_clock", clock)
+    monkeypatch.setattr(mod, "MAX_SECONDS", 5.0)
+    fake_registry.add_key(
+        "HKLM", CV, {rf"C:\Gone\f{i:03}.dll": (REG_DWORD, 1) for i in range(20)}
+    )
+    det, _ = make({})
+    n = 0
+    for _ in det.find_items():
+        n += 1
+        clock.now += 100.0  # a slow consumer
+    assert n == 20 and det.incomplete == []
+
+
+def test_findings_are_in_sorted_order(fake_registry):
+    names = [r"C:\Gone\b.dll", r"C:\Gone\A.dll", r"C:\Gone\c.dll"]
+    items, _ = scan(fake_registry, {n: (REG_DWORD, 1) for n in names})
+    assert [i.reg.value for i in items] == sorted(names, key=str.casefold)
+
+
+def test_per_user_path_not_listed(fake_registry):
+    items, _ = scan(fake_registry, {r"C:\Users\x\AppData\a.dll": (REG_DWORD, 1)})
+    assert items == []
+
+
+def test_qword_not_listed(fake_registry):
+    items, _ = scan(fake_registry, {GONE: (11, 1)})
+    assert items == []
+
+
+def test_backup_problem_is_consulted(fake_registry, monkeypatch):
+    seen = []
+
+    def refuse(cid, target, snap):
+        seen.append(target.value)
+        return "nope"
+
+    monkeypatch.setattr(mod.regbackup, "backup_problem", refuse)
+    items, _ = scan(fake_registry, {GONE: (REG_DWORD, 1)})
+    assert items == [] and seen == [GONE]
+
+
+def test_missing_container_not_read(fake_registry):
+    det, _ = make({})
+    assert list(det.find_items()) == []
+    assert not [c for c in fake_registry.calls if c[0] == "values"]
+
+
+def test_never_helper_eligible():
+    from cleanix import elevated
+
+    # class flag stays False: tests/test_catalog.py forbids requires_root outside
+    # the system/review categories; the items themselves carry requires_root
+    assert "win_reg_shared_dlls" not in elevated.admin_cleaner_ids()
 
 
 def test_never_touches_unlisted_containers(fake_registry):
