@@ -18,10 +18,12 @@ APP_LEFTOVERS = "Leftovers of removed apps"
 UNOWNED_FILES = "System files no package owns"
 SERVICES = "Services and background jobs"
 INSTALL_RECORDS = "Install records"
+OTHER_FINDINGS = "Other findings"
 
 # Presentation order of the categories.
 CATEGORY_ORDER: Tuple[str, ...] = (
     YOUR_FILES, APP_LEFTOVERS, UNOWNED_FILES, SERVICES, INSTALL_RECORDS,
+    OTHER_FINDINGS,
 )
 
 FINDING_CATEGORIES: Dict[str, str] = {}
@@ -50,6 +52,11 @@ def category_of(cleaner_id: str) -> str:
     return FINDING_CATEGORIES[cleaner_id]
 
 
+def category_or_fallback(cleaner_id: str) -> str:
+    """Category of ``cleaner_id``, or "Other findings" when it has none."""
+    return FINDING_CATEGORIES.get(cleaner_id, OTHER_FINDINGS)
+
+
 @dataclass
 class FindingGroup:
     category: str
@@ -70,18 +77,18 @@ def is_finding(item: CleanableItem) -> bool:
 def group_findings(scan: ScanResult) -> List[FindingGroup]:
     """Report-only items grouped per cleaner, ordered by category, then size.
 
-    Cleaners without a finding category and non-report-only items are left out.
+    Report-only items are never dropped: a cleaner without a category lands in
+    the "Other findings" fallback group. Non-report-only items are left out.
     """
     groups: List[FindingGroup] = []
     for rep in scan.reports:
-        category = FINDING_CATEGORIES.get(rep.cleaner_id)
-        if category is None:
-            continue
+        category = category_or_fallback(rep.cleaner_id)
         items = sorted(
             (i for i in rep.items if i.report_only), key=lambda i: -i.size)
         if not items:
             continue
-        title = copy_for(rep.cleaner_id, rep.name, rep.description).title
+        title = (copy_for(rep.cleaner_id, rep.name, rep.description).title
+                 or rep.cleaner_id)
         groups.append(FindingGroup(category, rep.cleaner_id, title, items))
     groups.sort(key=lambda g: (CATEGORY_ORDER.index(g.category), -g.total_size))
     return groups
