@@ -6,10 +6,13 @@ import dataclasses
 
 import pytest
 
-from test_regtargets import FakeFS, make_ctx
+from _fakeprobe import ENV, FakeFS, make_ctx
+from _fakereg import FakeProber
 from cleanix.cleaners.winreg_app_paths import WinRegAppPaths
 from cleanix.config import Config
+from cleanix.core.regtargets import DetectorContext, Existence
 from cleanix.core.winregistry import (
+    RegistryError,
     REG_BINARY,
     REG_DWORD,
     REG_EXPAND_SZ,
@@ -24,7 +27,9 @@ APW = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths"
 
 def _scan(monkeypatch, ctx):
     monkeypatch.setattr(WinRegAppPaths, "context", lambda self: ctx)
-    return list(WinRegAppPaths(Config()).find_items())
+    report = WinRegAppPaths(Config()).scan()
+    assert report.skipped_reason is None, report.skipped_reason
+    return list(report.items)
 
 
 def _fs_ctx(present=(), **kw):
@@ -198,10 +203,56 @@ def test_unbackupable_entry_skipped(fake_registry, monkeypatch):
     assert _scan(monkeypatch, _fs_ctx()) == []
 
 
-def test_evidence_lists_every_checked_target(fake_registry, monkeypatch):
-    fake_registry.add_key("HKCU", AP + r"\foo.exe", {"": (REG_SZ, r"C:\Gone\foo.exe")})
+def test_evidence_lists_expanded_checked_targets(fake_registry, monkeypatch):
+    fake_registry.add_key(
+        "HKLM", AP + r"\x.exe", {"": (REG_EXPAND_SZ, r"%ProgramFiles%\Gone\x.exe")}
+    )
     (it,) = _scan(monkeypatch, _fs_ctx())
-    assert it.hint.startswith("(Default) C:\\Gone\\foo.exe: missing")
+    assert it.hint.startswith("(Default) ")
+    assert r"C:\Program Files\Gone\x.exe: missing" in it.hint
+
+
+def _prober_ctx(present=()):
+    """Every path is MISSING except ``present``: only command parsing can
+    keep an entry in these tests."""
+    return DetectorContext(
+        env=ENV,
+        prober=FakeProber({p: Existence.PRESENT for p in present}, default=Existence.MISSING),
+        profiles_root=r"C:\Users",
+        system_root=r"C:\Windows",
+    )
+
+
+def test_command_semantics_whole_string_present_kept(fake_registry, monkeypatch):
+    path = r"C:\Program Files\App\a.exe"
+    fake_registry.add_key("HKCU", AP + r"\a.exe", {"": (REG_SZ, path)})
+    assert _scan(monkeypatch, _prober_ctx([path])) == []
+    # sanity: the same entry is listed when the file is missing
+    assert len(_scan(monkeypatch, _prober_ctx())) == 1
+
+
+def test_command_semantics_quoted_path_with_trailing_text(fake_registry, monkeypatch):
+    fake_registry.add_key(
+        "HKCU", AP + r"\a.exe", {"": (REG_SZ, r'"C:\Gone\a.exe" --flag value')}
+    )
+    assert _scan(monkeypatch, _prober_ctx([r"C:\Gone\a.exe"])) == []
+    assert len(_scan(monkeypatch, _prober_ctx())) == 1
+
+
+def test_command_semantics_host_executable_is_unknown(fake_registry, monkeypatch):
+    fake_registry.add_key("HKCU", AP + r"\cmd.exe", {"": (REG_SZ, r"C:\Tools\cmd.exe")})
+    assert _scan(monkeypatch, _prober_ctx()) == []
+
+
+def test_unreadable_container_yields_nothing(fake_registry, monkeypatch):
+    fake_registry.add_key("HKCU", AP + r"\foo.exe", {"": (REG_SZ, r"C:\Gone\foo.exe")})
+    fake_registry.fail_next("subkeys", RegistryError("boom"))
+    # the first container read (HKCU) fails: nothing from it, no crash
+    assert _scan(monkeypatch, _fs_ctx()) == []
+
+
+def test_kept_whitespace_only_default(fake_registry, monkeypatch):
+    _keep(fake_registry, monkeypatch, {"": (REG_SZ, "   ")})
 
 
 def test_owner_mismatch_makes_per_user_vars_unknown(fake_registry, monkeypatch):

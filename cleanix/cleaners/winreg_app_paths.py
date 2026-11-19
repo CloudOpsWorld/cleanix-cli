@@ -12,6 +12,7 @@ Alias location, or any read error leaves the entry alone.
 from __future__ import annotations
 
 import dataclasses
+import logging
 from typing import Iterable
 
 from cleanix.cleaners.winreg_base import Finding, RegistryDetector
@@ -19,8 +20,15 @@ from cleanix.core import regsnap
 from cleanix.core.models import RegTarget
 from cleanix.core.regbackup import backup_problem
 from cleanix.core.regsafety import Container
-from cleanix.core.regtargets import DetectorContext, Existence, target_state
+from cleanix.core.regtargets import (
+    DetectorContext,
+    Existence,
+    describe_target,
+    target_state,
+)
 from cleanix.core.winregistry import REG_EXPAND_SZ, REG_SZ, RegistryBackend, RegistryError
+
+_log = logging.getLogger(__name__)
 
 # Values that mean the entry is not a plain "run this file" mapping.
 _INDIRECT_VALUES = frozenset({"delegateexecute"})
@@ -90,5 +98,6 @@ class WinRegAppPaths(RegistryDetector):
             yield Finding(
                 target=target,
                 description=f"App Paths: {name}",
-                evidence=f"(Default) {raw}: {state.value}",
+                evidence="(Default) "
+                + describe_target(raw, command=True, ctx=ctx, machine=machine),
             )
