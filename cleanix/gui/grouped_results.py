@@ -13,6 +13,7 @@ from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QApplication, QHeaderView, QMenu, QTreeWidget, QTreeWidgetItem,
+    QTreeWidgetItemIterator,
 )
 
 from cleanix.core.curation import Group, Safety, display_label, shorten_path
@@ -96,6 +97,8 @@ class GroupedResults(QTreeWidget):
             hdr.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
 
         self.itemExpanded.connect(self._on_expanded)
+        self.itemExpanded.connect(lambda _row: self._fit_height())
+        self.itemCollapsed.connect(lambda _row: self._fit_height())
         self.itemChanged.connect(self._on_changed)
         self.itemDoubleClicked.connect(self._on_double_clicked)
         self.customContextMenuRequested.connect(self._on_menu)
@@ -135,7 +138,28 @@ class GroupedResults(QTreeWidget):
             self._rebuild_rows(set())
         finally:
             self._busy = prev
+        self._fit_height()
         self.selection_changed.emit()
+
+    MAX_FIT_ROWS = 14
+
+    def _fit_height(self) -> None:
+        """Size the tree to its visible rows (capped), so a handful of results
+        does not leave a page-high blank, striped area."""
+        rows = 0
+        it = QTreeWidgetItemIterator(self)
+        while it.value() is not None and rows < self.MAX_FIT_ROWS:
+            row = it.value()
+            parent, shown = row.parent(), not row.isHidden()
+            while shown and parent is not None:
+                shown = parent.isExpanded() and not parent.isHidden()
+                parent = parent.parent()
+            if shown:
+                rows += 1
+            it += 1
+        row_h = max(self.sizeHintForRow(0), 22) if self.topLevelItemCount() else 22
+        head = self.header().sizeHint().height()
+        self.setMaximumHeight(head + (rows + 1) * row_h + 2 * self.frameWidth() + 6)
 
     def set_allow_admin_items(self, allow: bool, reason: str = "") -> None:
         """Change admin availability at runtime; rows and selection follow."""
