@@ -232,6 +232,9 @@ def plan_duplicates(items: Sequence[CleanableItem], keep: str) -> ActPlan:
                 why = verify_path(c.path or "", c.remedy.fingerprint, allow_dir=False)  # type: ignore[union-attr]
                 if why is None and not unchanged(c):
                     why = CHANGED
+                if why is None and (tuple(c.remedy.fingerprint)[2:]  # type: ignore[union-attr]
+                                    == tuple(survivor.remedy.fingerprint)[2:]):  # type: ignore[union-attr]
+                    why = "same file as the copy to keep (a hard link)"
                 if why is None:
                     removable.append(c)
                 else:

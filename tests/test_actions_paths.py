@@ -311,6 +311,42 @@ def test_duplicates_never_remove_all_copies(tmp_path):
     assert [p.exists() for p in paths] == [False, False, True]
 
 
+@pytest.mark.parametrize("first", [True, False])
+def test_duplicates_kept_copy_safe_from_other_cleaners_items(tmp_path, first):
+    # The same file found by big_files too: its (ungrouped) finding for the
+    # kept copy, or for the other copies, must not remove the last copy.
+    paths, items = _dups(tmp_path)
+    plan = actions.plan_duplicates(items, "oldest")
+    others = [_finding(p, cleaner="big_files") for p in paths]
+    batch = others + plan.items if first else plan.items + others
+    summary = actions.act(batch, Config(), dry_run=False, permanent=True)
+    assert paths[0].exists()
+    assert ("skipped: " + actions.KEEPS_COPY) in _errors(summary)
+
+
+def test_duplicates_kept_copy_safe_from_containing_folder(tmp_path):
+    paths, items = _dups(tmp_path)
+    plan = actions.plan_duplicates(items, "oldest")
+    folder = _finding(tmp_path / "home", cleaner="downloads")
+    summary = actions.act(plan.items + [folder], Config(), dry_run=False, permanent=True)
+    assert paths[0].exists() and (tmp_path / "home").is_dir()
+    assert summary.result.outcomes[-1].error == "skipped: " + actions.KEEPS_COPY
+    assert summary.removed == 2
+
+
+def test_duplicates_hard_link_of_kept_copy_not_removed(tmp_path):
+    paths, items = _dups(tmp_path, n=1)
+    link = tmp_path / "home" / "copy_link.iso"
+    try:
+        os.link(str(paths[0]), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("hard links unsupported here")
+    items.append(_finding(link, group="sha-1", cleaner="duplicates"))
+    plan = actions.plan_duplicates(items, "oldest")
+    assert plan.items == []
+    assert link.exists() and paths[0].exists()
+
+
 def test_duplicates_survivor_missing_fails_closed(tmp_path):
     paths, items = _dups(tmp_path)
     plan = actions.plan_duplicates(items, "oldest")

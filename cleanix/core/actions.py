@@ -13,6 +13,7 @@ at scan time is skipped with a reason, never deleted.
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import Callable, List, Optional, Sequence, Set, Tuple
 
 from cleanix.config import Config
@@ -36,6 +37,7 @@ NOT_HANDLED = "this kind of finding is not handled here"
 NEEDS_ELEVATION = "needs an elevated run"
 BLOCKED = "blocked by safety guard (protected path)"
 NO_SURVIVOR = "duplicate copy without a chosen copy to keep; nothing removed"
+KEEPS_COPY = "it is, or contains, the copy kept of a duplicate group"
 
 
 def _activate(item: CleanableItem, size: int) -> CleanableItem:
@@ -77,10 +79,34 @@ def _verify(item: CleanableItem, batch: Set[str]) -> Optional[str]:
         if path_key(kept_path) in batch:
             return ("the copy to keep is also selected for removal; "
                     "nothing removed")
+        if tuple(remedy.fingerprint)[2:] == tuple(kept_fp)[2:]:
+            return "same file as the copy to keep (a hard link); nothing removed"
         why = check_survivor(kept_path, kept_fp)
         if why is not None:
             return f"the copy to keep ({kept_path}) {why}; nothing removed"
     return None
+
+
+def _spellings(path: str) -> Set[str]:
+    """``path_key(path)`` plus, best effort, the spelling with its parent
+    folders' links resolved (the final component is never followed)."""
+    keys = {path_key(path)}
+    try:
+        parent, name = os.path.split(os.path.abspath(path))
+        keys.add(os.path.normcase(os.path.join(os.path.realpath(parent), name)))
+    except (OSError, ValueError):
+        pass
+    return keys
+
+
+def _holds_kept_copy(path: str, kept: Set[str]) -> bool:
+    """True when ``path`` is a kept duplicate copy or a folder containing one
+    (compared on every spelling from :func:`_spellings`)."""
+    for key in _spellings(path):
+        prefix = key if key.endswith(os.sep) else key + os.sep
+        if any(k == key or k.startswith(prefix) for k in kept):
+            return True
+    return False
 
 
 def _size(path: str) -> int:
@@ -120,6 +146,14 @@ def act(
     safety.set_protected_globs(config.protected_globs)
 
     batch = {path_key(i.path) for i in items if i.path}
+    # Every copy any supplied duplicate names as "kept" (verified or not) is
+    # protected from EVERY item in the batch -- another cleaner's finding for
+    # the same file, or a folder finding containing it, must not remove it.
+    kept: Set[str] = set()
+    for i in items:
+        stamp = survivor_of(i)
+        if stamp is not None:
+            kept |= _spellings(stamp[0])
     slots: List[Optional[CleanOutcome]] = [None] * len(items)
     todo: List[Tuple[int, CleanableItem]] = []
     seen: Set[str] = set()
@@ -127,6 +161,8 @@ def act(
         key = path_key(item.path) if item.path else None
         if key is not None and key in seen:
             reason: Optional[str] = "listed twice"
+        elif item.path and _holds_kept_copy(item.path, kept):
+            reason = KEEPS_COPY
         else:
             try:
                 reason = _verify(item, batch)
