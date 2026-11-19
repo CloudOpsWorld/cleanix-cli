@@ -41,6 +41,9 @@ REVIEW_CLASSES = [
     "ProjectCruftCleaner", "BrowserProfileReporter", "WinPrefetchReporter",
     "WindowsOldReporter", "WslDiskReporter", "SnapshotReporter",
     "TimeMachineReporter", "DeviceBackupReporter",
+    "UnownedSystemFilesReporter", "StaleSystemdUnitReporter",
+    "StaleDesktopEntryReporter", "BrokenAlternativesReporter",
+    "OrphanLaunchJobReporter", "OrphanAppDataReporter", "StaleReceiptReporter",
 ]
 BY_NAME = {c.__name__: c for c in ALL_CLEANERS}
 

@@ -300,7 +300,7 @@ def cmd_list(args: argparse.Namespace, console: Console) -> int:
             continue
         table.add_row(
             cid,
-            cleaner.name,
+            cleaner.name + ("" if cleaner.default_enabled else " (opt-in)"),
             "yes" if cleaner.requires_root else "no",
             plats,
             "[green]✓[/green]" if here else "[dim]–[/dim]",
