@@ -148,6 +148,53 @@ directories and the generic `~/.cache` catch-all defers to them.
   Chrome/Chromium/Firefox profiles idle for `browser_profile_stale_days`, with a
   clear warning that a profile holds bookmarks/passwords/history.
 
+## System-wide leftovers (report-only, Linux/macOS)
+
+Seven detectors look for things that were left behind when a program was
+removed. They only **report**: nothing is deleted, nothing is preselected, and
+there is no way to clean them from Cleanix. Each finding names the exact path
+and the command that confirms it first (`dpkg-query -S`, `rpm -qf`,
+`pacman -Qo`, `pkgutil`), so you decide. They appear under "Needs your review"
+and in `cleanix scan`. They work without root; anything they cannot read is
+listed as a "Not checked" note instead of being guessed, and a command that
+fails or prints something unexpected never counts as "orphaned".
+
+| id | OS | Reports |
+|---|---|---|
+| `orphan_files` (opt-in, slow) | Linux | Folders in `/opt`, `/usr/local`, `/var/lib` and `/var/cache` that no installed package owns |
+| `stale_services` | Linux | systemd units, drop-ins and enable links in administrator-owned unit folders whose program or unit file is gone |
+| `stale_launchers` | Linux | `.desktop` menu and autostart entries whose program is missing |
+| `stale_alternatives` | Linux | Broken links in `/etc/alternatives` |
+| `orphan_launch_jobs` | macOS | LaunchAgents/LaunchDaemons whose program no longer exists |
+| `orphan_app_data` | macOS | Application Support, Containers and Preferences left by apps that are no longer installed |
+| `stale_receipts` | macOS | Installer receipts whose installed files are all gone |
+
+`orphan_files` is off by default because it walks several large trees. Run it
+explicitly with `cleanix scan --only orphan_files` (it shows as `(opt-in)` in
+`cleanix list`); Simple mode never runs it. The others run in a normal scan.
+
+Known limits, read these before acting on a finding:
+
+- Ownership lookups exist only for dpkg (Debian/Ubuntu), rpm (Fedora/openSUSE)
+  and pacman (Arch). On other distributions `orphan_files` reports nothing.
+- On macOS the app-data check understands only reverse-DNS names
+  (`com.vendor.App`); folders named after the app ("Slack") are never reported.
+- The macOS detectors have only been tested against fake data, not on a real
+  Mac. Treat their findings with extra care.
+- Any finding may be a false positive; confirm with your package manager
+  before removing anything.
+
+Already covered by other cleaners and therefore not repeated here: dpkg `rc`
+packages (`apt`), `.dpkg-old`/`.rpmsave`/`.pacnew` files (`config_leftovers`),
+AppImage menu entries (`appimage`), broken symlinks (`broken_symlinks`),
+`~/Library/Caches` (`macos_caches`), saved application state (`macos_extra`)
+and old Homebrew versions (`homebrew`).
+
+Three config keys tune the scans: `orphan_max_items` (default 200 findings per
+detector), `orphan_max_seconds` (default 60 s per detector; when it runs out
+one note says the results are incomplete) and `orphan_min_age_days` (default
+30; macOS app data younger than this is not reported).
+
 ## Working with what a scan finds
 
 - `cleanix explain <id>` — read-only, shows the **exact** paths/commands one
@@ -579,7 +626,8 @@ Report-only — review and remove manually (never auto-deleted)
 ```
 
 Covered report-only: Timeshift/Snapper snapshots, libvirt saved VM states,
-macOS Time Machine local snapshots, iOS device backups, macOS sleep image.
+macOS Time Machine local snapshots, iOS device backups, macOS sleep image,
+and the system-wide orphan reports (see above).
 
 ## Extended coverage
 
