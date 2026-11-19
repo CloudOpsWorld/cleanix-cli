@@ -857,3 +857,18 @@ def test_zero_size_command_item_visible_and_selectable_without_show_empty(
     assert v.item_model.checked_items() == []  # never preselected
     v.select_all_visible()
     assert [i.kind for i in v.item_model.checked_items()] == [ItemKind.COMMAND]
+
+
+def test_zero_size_report_only_finding_visible_but_never_selected(qtbot, sync_workers):
+    v = pv.PowerView(Config())
+    qtbot.addWidget(v)
+    ro = CleanableItem("stale_services", "foo.service orphaned", size=0,
+                       path="/etc/systemd/system/foo.service", report_only=True,
+                       hint="systemctl status foo")
+    v._on_scan_finished(ScanResult(reports=[
+        CleanerReport("stale_services", "Stale", "s", items=[ro]),
+        CleanerReport("temp", "Temp", "t", items=[
+            CleanableItem("temp", "empty", size=0, path="/t/empty")])]))
+    assert v.tree.group_count() == 1  # the plain zero-size group stays hidden
+    v.select_all_visible()
+    assert v.item_model.checked_items() == []

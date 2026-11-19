@@ -829,3 +829,18 @@ def test_shutdown_cancels_running_worker_and_blocks_new_work(qtbot):
     qtbot.waitUntil(lambda: v.state() is SimpleState.IDLE, timeout=3000)
     v.start_scan()
     assert len(created) == 1 and v.state() is SimpleState.IDLE
+
+
+def test_zero_size_report_only_finding_shown_read_only_in_review(qtbot):
+    v = make_view(qtbot)
+    it = CleanableItem("stale_services", "Unit foo.service points at a missing "
+                       "program", size=0, path="/etc/systemd/system/foo.service",
+                       report_only=True, hint="systemctl status foo")
+    v.set_scan_result(result(it))
+    assert v.review_tree.group_count() == 1
+    assert v.results_tree.group_count() == 0
+    assert v.review_tree.checked_items() == []
+    assert v.review_tree.refusal_reason(it)
+    for tree in all_trees(v):
+        tree.set_checked_keys({item_key(it)})
+    assert v.selected_items() == []

@@ -155,6 +155,13 @@ _RAW = {
     "device_backups": ("Phone and tablet backups", "iOS and Android device backups, often irreplaceable. " + _REVIEW_TAIL),
     "libvirt_saves": ("Saved virtual machine states", "Suspended VM memory images with real state. " + _REVIEW_TAIL),
     "macos_sleepimage": ("Mac sleep image", "Hibernation file recreated by macOS. " + _REVIEW_TAIL),
+    "orphan_files": ("Files not from any package", "Folders in /opt, /usr/local, /var/lib and /var/cache that no installed package owns (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
+    "stale_services": ("Services for removed programs", "Startup services whose program or unit file is gone (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
+    "stale_launchers": ("Menu entries for removed programs", "App menu and autostart entries whose program is missing (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
+    "stale_alternatives": ("Broken default-program links", "System default-program links that point at removed programs (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
+    "orphan_launch_jobs": ("Background jobs of removed apps", "Mac launch agents and daemons whose program is gone (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
+    "orphan_app_data": ("Data of removed apps", "Settings and data left by Mac apps that are no longer installed (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
+    "stale_receipts": ("Install records of removed packages", "Mac installer receipts whose files are all gone (may be a false positive; confirm with your package manager before removing). " + _REVIEW_TAIL),
 }
 
 COPY: Dict[str, Copy] = {k: Copy(*v) for k, v in _RAW.items()}
@@ -238,8 +245,11 @@ class Group:
 
 def is_empty(item: CleanableItem) -> bool:
     """True for items with nothing to show. A COMMAND item's size is unknown
-    (best effort, often 0), so it is never treated as empty."""
-    return item.size <= 0 and item.kind is not ItemKind.COMMAND
+    (best effort, often 0), so it is never treated as empty. A report-only
+    finding or "not checked" note legitimately has size 0 and must stay
+    visible (it can never be selected for deletion anyway)."""
+    return (item.size <= 0 and item.kind is not ItemKind.COMMAND
+            and not item.report_only)
 
 
 def build_groups(
