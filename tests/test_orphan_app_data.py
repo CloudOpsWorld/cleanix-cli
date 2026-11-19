@@ -78,6 +78,11 @@ def _scan(cfg=None):
     return oad.OrphanAppDataReporter(cfg or Config()).scan().items
 
 
+def _installed_ids(root, home_dir):
+    inv = oad._inventory(root, [home_dir])
+    return inv[0] if inv else None
+
+
 def _reported(items):
     return [i for i in items if i.description.startswith("Left by a removed app")]
 
@@ -148,7 +153,7 @@ def test_installed_ids(mac):
     (mac.root / "Library" / "LaunchDaemons").mkdir(parents=True)
     (mac.root / "Library" / "LaunchDaemons" / "com.daemonco.d.plist").write_text("x")
     mac.cmds.on(("pkgutil", "--pkgs"), 0, "com.pkgco.installer\n\n")
-    ids = oad.installed_ids(mac.root, mac.home)
+    ids = _installed_ids(mac.root, mac.home)
     assert {"com.acme.Editor", "com.helperco.agent", "com.agentco.job",
             "com.daemonco.d", "com.pkgco.installer"} <= ids
 
@@ -161,7 +166,7 @@ def test_installed_ids_other_locations_and_bundles(mac):
     _app(host / "Contents" / "PlugIns", "Ext.appex", "com.hostco.host.ext")
     _app(host / "Contents" / "XPCServices", "Svc.xpc", "com.xpcco.svc")
     _plist(host / "Contents" / "Info.plist", {"CFBundleIdentifier": "com.hostco.host"})
-    ids = oad.installed_ids(mac.root, mac.home)
+    ids = _installed_ids(mac.root, mac.home)
     assert {"com.sysco.sys", "com.mine.app", "com.setapp.sa", "com.hostco.host",
             "com.hostco.host.ext", "com.xpcco.svc"} <= ids
 
@@ -171,7 +176,7 @@ def test_broken_plist_app_protected_by_name(mac):
     bad = mac.root / "Applications" / "Bad Thing.app" / "Contents"
     bad.mkdir(parents=True)
     (bad / "Info.plist").write_text("not a plist")
-    assert "com.acme.Editor" in oad.installed_ids(mac.root, mac.home)
+    assert "com.acme.Editor" in _installed_ids(mac.root, mac.home)
     _old_dir(mac.support / "com.unknownvendor.BadThing")
     _old_dir(mac.support / "com.unknownvendor.Other")
     assert _ids(_scan()) == {"com.unknownvendor.Other"}
@@ -197,7 +202,7 @@ def test_too_many_unreadable_apps_means_not_checked(mac):
 def test_ios_wrapper_app_id_collected(mac):
     wrap = mac.root / "Applications" / "Foo.app" / "Wrapper"
     _plist(wrap / "Foo.app" / "Info.plist", {"CFBundleIdentifier": "com.wrapco.foo"})
-    assert "com.wrapco.foo" in oad.installed_ids(mac.root, mac.home)
+    assert "com.wrapco.foo" in _installed_ids(mac.root, mac.home)
     _old_dir(mac.support / "com.wrapco.foo.data")
     assert _reported(_scan()) == []
 
@@ -444,3 +449,56 @@ def test_budget_limits_results(mac):
     items = _scan(cfg)
     assert len(_reported(items)) == 2
     assert any("Scan stopped early" in i.description for i in items)
+
+
+# ------------------------------------------- command-line tools and games
+def _names(env, *rels):
+    for rel in rels:
+        (env.root / rel.lstrip("/")).mkdir(parents=True, exist_ok=True)
+
+
+@pytest.mark.parametrize("cellar", [
+    "/opt/homebrew/Cellar", "/opt/homebrew/opt", "/usr/local/Cellar",
+    "/usr/local/opt", "/opt/local/var/macports/software",
+])
+def test_cli_tool_folder_protected_by_formula_name(mac, cellar):
+    _names(mac, f"{cellar}/zellij", f"{cellar}/broot")
+    zel = _old_dir(mac.support / "org.Zellij-Contributors.Zellij")
+    bro = _old_dir(mac.support / "org.dystroy.broot")
+    gone = _old_dir(mac.support / "com.oldvendor.OldApp")
+    assert [i.path for i in _reported(_scan())] == [str(gone)]
+    assert zel.exists() and bro.exists()
+
+
+def test_cli_tool_protected_by_cargo_and_nix_bins(mac):
+    (mac.home / ".cargo/bin").mkdir(parents=True)
+    (mac.home / ".cargo/bin/atuin").write_text("x")
+    (mac.home / ".nix-profile/bin").mkdir(parents=True)
+    (mac.home / ".nix-profile/bin/Starship").write_text("x")
+    _old_dir(mac.support / "sh.atuin.atuin")
+    _old_dir(mac.support / "rs.starship.starship")
+    gone = _old_dir(mac.support / "com.oldvendor.OldApp")
+    assert [i.path for i in _reported(_scan())] == [str(gone)]
+
+
+def test_formula_name_match_ignores_case_and_punctuation(mac):
+    _names(mac, "/opt/homebrew/Cellar/Git-Delta")
+    _old_dir(mac.support / "com.dandavison.GIT_delta")
+    assert _reported(_scan()) == []
+
+
+def test_steam_games_protected(mac):
+    steam = mac.home / "Library/Application Support/Steam/steamapps"
+    (steam / "common/Hades").mkdir(parents=True)
+    (steam / "appmanifest_1.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"1"\n\t"name"\t\t"Celeste"\n}\n')
+    _old_dir(mac.support / "com.supergiant.Hades")
+    _old_dir(mac.support / "com.mattmakesgames.Celeste")
+    assert _reported(_scan()) == []
+
+
+def test_unity_prefix_denied(mac):
+    _old_dir(mac.support / "unity.DefaultCompany.MyGame")
+    _old_dir(mac.support / "unity.Some Studio.Game")  # not even an id
+    assert _reported(_scan()) == []
+    assert oad.is_excluded("unity.DefaultCompany.MyGame", set())

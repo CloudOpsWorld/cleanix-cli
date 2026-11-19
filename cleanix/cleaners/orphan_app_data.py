@@ -43,7 +43,11 @@ _SHARED_HOSTS = {
 }
 _APPLE_EXACT = {".globalpreferences", "loginwindow", "pbs", "com.apple"}
 # OS / command-line components that use non-Apple ids but have no app bundle.
-_OS_DENY_PREFIXES = ("org.cups.", "edu.mit.", "org.gnu.", "org.freedesktop.", "org.x.")
+# "unity." is the Unity engine's default bundle-id prefix for games (their
+# data lives beside Steam/itch installs that have no app bundle to inspect).
+_OS_DENY_PREFIXES = (
+    "org.cups.", "edu.mit.", "org.gnu.", "org.freedesktop.", "org.x.", "unity.",
+)
 _BUNDLE_SUFFIXES = (".app", ".appex", ".xpc")
 _NESTED_DIRS = (
     "Library/LoginItems", "Helpers", "Frameworks", "PlugIns",
@@ -55,6 +59,21 @@ _APP_ROOTS = (  # (logical folder, max depth below it for *.app)
     ("/opt/homebrew/Caskroom", 3),
     ("/usr/local/Caskroom", 3),
 )
+# Folders whose entry names are programs (no app bundle, no bundle id):
+# Homebrew / MacPorts formulae and cargo / nix binaries. Rust CLI tools using the
+# ``directories`` crate keep config in reverse-DNS folders named after them.
+_TOOL_DIRS = (
+    "/opt/homebrew/Cellar", "/opt/homebrew/opt", "/opt/homebrew/bin",
+    "/usr/local/Cellar", "/usr/local/opt",
+    "/opt/local/var/macports/software",
+    "/nix/var/nix/profiles/default/bin",
+)
+_HOME_TOOL_DIRS = (".cargo/bin", ".nix-profile/bin", ".local/bin")
+_STEAM_DIRS = (
+    "Library/Application Support/Steam/steamapps/common",
+)
+_STEAM_APPS = "Library/Application Support/Steam/steamapps"
+_ACF_NAME = re.compile(r'^\s*"name"\s+"([^"]{1,200})"', re.M)
 _LAUNCH_DIRS = ("/Library/LaunchAgents", "/Library/LaunchDaemons")
 
 
@@ -122,7 +141,7 @@ def is_excluded(bid: str, installed: Union[set, _Index]) -> bool:
     for k in range(1, len(parts)):  # bid starts with an installed id + "."
         if ".".join(parts[:k]) in idx.ids:
             return True
-    if idx.names and any(_norm_name(label) in idx.names for label in parts):
+    if idx.names and any(_norm_name(label) in idx.names for label in parts[1:]):
         return True  # an app whose id we could not read has this name
     return vendor_key(b) in idx.vendors
 
@@ -234,6 +253,35 @@ def _launch_stems(directory: Path, ids: set) -> None:
             ids.add(child.stem)
 
 
+def _tool_names(root, homes, ctx: "_Ctx") -> list:
+    """Names of command-line tools and Steam games (no bundle id to read)."""
+    names: list = []
+    dirs = [oc.in_root(root, d) for d in _TOOL_DIRS]
+    for h in homes:
+        dirs += [h / d for d in _HOME_TOOL_DIRS]
+        dirs += [h / d for d in _STEAM_DIRS]
+    for d in dirs:
+        ctx.check()
+        for child in oc.list_dir(d) or ():
+            if not oc.bad_name(child.name):
+                names.append(child.name)
+    for h in homes:
+        steam = h / _STEAM_APPS
+        for child in oc.list_dir(steam) or ():
+            ctx.check()
+            if not (child.name.startswith("appmanifest_") and child.suffix == ".acf"):
+                continue
+            try:
+                with open(child, "rb") as fh:
+                    text = fh.read(65536).decode("utf-8", "replace")
+            except OSError:
+                continue
+            m = _ACF_NAME.search(text)
+            if m:
+                names.append(m.group(1))
+    return names
+
+
 def _inventory(root, homes: Iterable[Path], budget=None) -> Optional[tuple]:
     """``(ids, names_of_apps_without_id)`` or None when the inventory cannot
     be trusted: ``/Applications`` unreadable, fewer than MIN_APPS distinct app
@@ -277,21 +325,11 @@ def _inventory(root, homes: Iterable[Path], budget=None) -> Optional[tuple]:
         rc, out, _ = oc.run(["pkgutil", "--pkgs"])
         if rc == 0:
             ctx.ids.update(ln.strip() for ln in out.splitlines() if ln.strip())
+        names = _tool_names(root, homes, ctx)
         ctx.check()
     except _Unknown:
         return None
-    return ctx.ids, list(ctx.noid)
-
-
-def installed_ids(root, home_dir) -> Optional[set]:
-    """Bundle ids of everything that looks installed, or None if unknown.
-
-    ``home_dir`` is one home or an iterable of homes (their ``~/Applications``
-    and LaunchAgents are all included).
-    """
-    homes = [home_dir] if isinstance(home_dir, (str, os.PathLike)) else list(home_dir)
-    inv = _inventory(root, homes)
-    return inv[0] if inv else None
+    return ctx.ids, list(ctx.noid) + names
 
 
 # ----------------------------------------------------------------- reporter
