@@ -611,6 +611,17 @@ def test_run_findings_request_never_prompts_for_an_invalid_request():
     assert launch.calls == []
 
 
+def test_run_findings_request_never_prompts_for_an_oversized_request():
+    launch = _fake_launcher()
+    long_dir = "/var/lib/" + "/".join(["d" * 250] * 4)  # 1012 chars, still valid
+    big = elevate.FindingsRequest(only=["orphan_files"], items=[
+        elevate.FindingSelection(f"orphan_files|path|{long_dir}/{i:04d}", (1, 2, 3, 4), "path")
+        for i in range(elevate.MAX_FINDING_ITEMS)])
+    with pytest.raises(ValueError, match="too large"):
+        elevate_launch.run_findings_request(big, "alice", launcher=launch)
+    assert launch.calls == []
+
+
 # --------------------------------------------------------------------------
 # the helper end to end (POSIX)
 # --------------------------------------------------------------------------
@@ -761,6 +772,34 @@ def test_helper_batch_single_quarantine_run_root_owned_dir(fx):
     assert not os.lstat(run_dir).st_mode & 0o077
     manifest = json.loads((run_dir / "manifest.json").read_text())
     assert sorted(Path(i["original"]).name for i in manifest["items"]) == ["a", "b", "dir"]
+
+
+@posix_only
+def test_root_quarantine_never_copies_across_filesystems(fx, monkeypatch):
+    import errno
+
+    a = make(fx, "a", "payload")
+    fx.cleaners.append(FakeCleaner("orphan_files", lambda: [finding(a)]))
+
+    def cross(src, dst):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(quarantine, "_rename", cross)
+
+    def no_copy(*a, **k):
+        pytest.fail("the root quarantine fell back to copying")
+
+    monkeypatch.setattr(quarantine.shutil, "move", no_copy)
+    monkeypatch.setattr(quarantine.shutil, "copy2", no_copy)
+    monkeypatch.setattr(quarantine.shutil, "copytree", no_copy)
+    rc, result = run_helper(fx, request([finding(a)]))
+    assert rc == elevated.EXIT_OK
+    assert a.read_text() == "payload"
+    out = result.findings[0]
+    assert out.status == "not_removed" and "another filesystem" in out.reason
+    assert result.removed == 0 and result.quarantine_run == ""
+    for run in os.listdir(fx.qbase):
+        assert tree(fx.qbase / run) in ([], ["files"])
 
 
 @posix_only

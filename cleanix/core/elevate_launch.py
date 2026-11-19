@@ -183,7 +183,10 @@ def run_findings_request(findings, invoking_user: str, *,
     request_dir = elevate.make_request_dir()
     try:
         request_path = elevate.write_request(request_dir, selection)
-        elevate.parse_request(request_path.read_bytes())
+        data = request_path.read_bytes()
+        if len(data) > elevate.MAX_REQUEST_BYTES:
+            raise ValueError("the request is too large; select fewer items")
+        elevate.parse_request(data)
         result_path = request_dir / elevate.RESULT_NAME
         argv = elevated_command(request_path, result_path, config_path)
         launch = launcher or launch_elevated

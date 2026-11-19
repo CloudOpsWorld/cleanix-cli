@@ -176,7 +176,21 @@ class Quarantine:
         self.files_dir.mkdir(parents=True, exist_ok=True)
         idx = len(self.items)
         dest = self.files_dir / f"{idx}__{src.name}"
-        shutil.move(str(src), str(dest))
+        if self._root is not None:
+            # The elevated helper's root quarantine: a rename only. Never the
+            # copy fallback, which as root could fill the system volume and
+            # leave a partial copy outside the manifest.
+            try:
+                _rename(str(src), str(dest))
+            except OSError as exc:
+                if _is_cross_volume(exc):
+                    raise OSError(
+                        "it is on another filesystem than the administrator "
+                        "quarantine; nothing was moved (delete it permanently instead)"
+                    ) from None
+                raise
+        else:
+            shutil.move(str(src), str(dest))
         self.items.append(
             {"original": str(src), "stored": str(dest), "size": size}
         )
