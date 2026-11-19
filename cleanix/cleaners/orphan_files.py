@@ -114,7 +114,7 @@ class UnownedSystemFilesReporter(OrphanReporter):
                 names.add(p.name.rsplit(".", 1)[0])
         return names
 
-    def _hint(self, backend: str, logical: str) -> str:
+    def _hint(self, backend: str, logical: str, sampled: bool = False) -> str:
         check = oc.owner_check_command(backend, logical)
         text = f"Nothing installed this through {backend}. Check first: {check}. "
         if logical.startswith("/usr/local"):
@@ -122,6 +122,8 @@ class UnownedSystemFilesReporter(OrphanReporter):
                 "It was probably installed manually (for example make install "
                 "or an installer script). "
             )
+        if sampled:
+            text += "Only a sample of this folder was checked for ownership. "
         return text + (
             f"If you no longer need it, remove {shlex.quote(logical)} by hand "
             "(administrator rights needed)."
@@ -165,23 +167,37 @@ class UnownedSystemFilesReporter(OrphanReporter):
                     skip = ()
                 yield from self._keep(c, skip)
 
-    def _probes(self, real: Path) -> list:
-        """Up to a few immediate children, for the vendor-parent check."""
+    def _probes(self, real: Path):
+        """Vendor-parent check input: ``(status, probes, sampled)``.
+
+        ``status`` is "ok" when the folder can be judged (a file, a symlink,
+        an empty folder, or a folder with usable children to query) and
+        "unknown" when its contents cannot be listed or none of its children
+        can be queried. Unknown folders are never reported. Large folders are
+        sampled (first 3 and last 2 by name).
+        """
         if os.path.islink(real) or not real.is_dir():
-            return []
-        kids = oc.list_dir(real) or []
-        out = []
-        for k in sorted(kids, key=lambda p: p.name):
-            if (
-                oc.bad_name(k.name)
-                or (_GLOB & set(k.name))
-                or os.path.islink(k)
-            ):
-                continue
-            out.append(oc.logical_path(self.sysroot, k))
-            if len(out) >= _PROBE_CHILDREN:
-                break
-        return out
+            return "ok", [], False
+        kids = oc.list_dir(real)
+        if kids is None:
+            return "unknown", [], False
+        if not kids:
+            return "ok", [], False
+        eligible = [
+            k for k in sorted(kids, key=lambda p: p.name)
+            if not (oc.bad_name(k.name) or (_GLOB & set(k.name))
+                    or os.path.islink(k))
+        ]
+        if not eligible:
+            return "unknown", [], False
+        sampled = len(eligible) > _PROBE_CHILDREN
+        if sampled:
+            eligible = eligible[:3] + eligible[-2:]
+        return (
+            "ok",
+            [oc.logical_path(self.sysroot, k) for k in eligible],
+            sampled,
+        )
 
     # ------------------------------------------------------------ scanning
     def system_findings(self) -> Iterable[Finding]:
@@ -246,19 +262,36 @@ class UnownedSystemFilesReporter(OrphanReporter):
                 break
             probes[logical] = self._probes(real)
         queried = [lg for lg, _ in cands]
-        queried += [c for ps in probes.values() for c in ps]
+        queried += [c for _st, ps, _sm in probes.values() for c in ps]
         unowned = oc.query_unowned(backend, queried, self.budget)
+        report = []
+        unknown = 0
         for logical, real in cands:
-            if logical not in unowned:
+            if logical not in unowned or logical not in probes:
                 continue
-            # vendor parent (/opt/vendor/app): any owned child owns the parent
-            if any(c not in unowned for c in probes.get(logical, ())):
+            status, ps, sampled = probes[logical]
+            if status != "ok":
+                unknown += 1
                 continue
+            # vendor parent (/opt/vendor/app): report only if every probed
+            # child was queried and came back unowned
+            if any(c not in unowned for c in ps):
+                continue
+            report.append((logical, real, sampled))
+        if unknown:
+            yield self.note(
+                Path(self.sysroot),
+                f"Not checked: {unknown} folders could not be listed or "
+                "checked for owned contents (may need administrator rights)",
+                "Run the scan as administrator to include them.",
+            )
+        for logical, real, sampled in report:
             label = (
                 f"Installed outside the package manager: {logical}"
                 if logical.startswith("/usr/local/")
                 else f"Not from any package: {logical}"
             )
             yield Finding(
-                real, label, self._hint(backend, logical), requires_root=True
+                real, label, self._hint(backend, logical, sampled),
+                requires_root=True,
             )

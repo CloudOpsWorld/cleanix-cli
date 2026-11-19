@@ -421,3 +421,74 @@ def test_each_root_listed_once(orphan_env, monkeypatch):
     scan(orphan_env)
     for root in ("/var/lib", "/var/cache"):
         assert sum(1 for x in listed if x.endswith(root)) == 1
+
+
+def test_unreadable_vendor_dir_is_unknown_not_reported(orphan_env, monkeypatch):
+    setup(orphan_env, monkeypatch)
+    make(orphan_env, "/opt/vendor/app")
+    make(orphan_env, "/opt/vendor2/app")
+    make(orphan_env, "/opt/plain")
+    real_list = oc.list_dir
+    monkeypatch.setattr(
+        oc, "list_dir",
+        lambda p: None
+        if str(p).replace("\\", "/").endswith(("/opt/vendor", "/opt/vendor2"))
+        else real_list(p),
+    )
+    r = scan(orphan_env)
+    real = [i for i in r.items if i.description.startswith("Not from any")]
+    assert [i.path.endswith("plain") for i in real] == [True]
+    notes = [i for i in r.items if i.description.startswith("Not checked: 2 folders")]
+    assert len(notes) == 1 and notes[0].size == 0  # one aggregated note
+
+
+@posix_only
+def test_dir_with_only_unprobeable_children_is_unknown(orphan_env, monkeypatch):
+    setup(orphan_env, monkeypatch)
+    make(orphan_env, "/opt/odd/a*b")
+    make(orphan_env, "/opt/linky")
+    (orphan_env.root / "opt" / "linky" / "l").symlink_to(orphan_env.root)
+    make(orphan_env, "/opt/plain")
+    r = scan(orphan_env)
+    real = [i for i in r.items if i.description.startswith("Not from any")]
+    assert [i.path.endswith("plain") for i in real] == [True]
+    assert any("Not checked: 2 folders" in i.description for i in r.items)
+
+
+def test_probe_sample_is_spread_and_hedged(orphan_env, monkeypatch):
+    setup(orphan_env, monkeypatch, owned={"/opt/big/c8"})
+    for n in range(9):
+        make(orphan_env, f"/opt/big/c{n}")
+    r = scan(orphan_env)
+    probed = sorted(q for q in orphan_env.queried if q.startswith("/opt/big/"))
+    assert probed == ["/opt/big/c0", "/opt/big/c1", "/opt/big/c2",
+                      "/opt/big/c7", "/opt/big/c8"]
+    assert r.items == []  # the last-sorted child is owned: parent owned
+
+
+def test_sampled_dir_all_unowned_reported_with_hedge(orphan_env, monkeypatch):
+    setup(orphan_env, monkeypatch)
+    for n in range(9):
+        make(orphan_env, f"/opt/big/c{n}")
+    make(orphan_env, "/opt/small/x")
+    items = {i.path.replace("\\", "/").rsplit("/", 1)[1]: i
+             for i in scan(orphan_env).items}
+    assert "only a sample" in items["big"].hint.lower()
+    assert "sample" not in items["small"].hint.lower()
+
+
+def test_probed_all_unowned_dir_is_reported(orphan_env, monkeypatch):
+    setup(orphan_env, monkeypatch)
+    make(orphan_env, "/opt/stale/a")
+    make(orphan_env, "/opt/stale/b")
+    assert paths(scan(orphan_env), orphan_env) == ["/opt/stale"]
+
+
+def test_unknown_probe_result_suppresses_parent(orphan_env, monkeypatch):
+    setup(orphan_env, monkeypatch)
+    make(orphan_env, "/opt/vendor/app")
+    # the query answers "unowned" for the parent only; the child is unknown
+    monkeypatch.setattr(
+        oc, "query_unowned", lambda backend, ps, budget, **k: {"/opt/vendor"}
+    )
+    assert scan(orphan_env).items == []
