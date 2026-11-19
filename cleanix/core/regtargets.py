@@ -10,6 +10,7 @@ so behaviour is identical on every OS.
 
 from __future__ import annotations
 
+import itertools
 import ntpath
 import os
 import re
@@ -37,6 +38,9 @@ class DetectorContext:
     prober: Prober
     profiles_root: str
     system_root: str
+    # False when the entries belong to someone other than the process owner
+    # (helper, another user's hive): per-user variables are then UNKNOWN.
+    owner_matches: bool = True
 
 
 DRIVE_FIXED = 3
@@ -59,10 +63,10 @@ HOST_EXES = frozenset(
     }
 )
 
-_ENV_RE = re.compile(r"%([^%\r\n]+)%")
-_ICON_RE = re.compile(r",\s*-?\d+\s*$")
+_ENV_RE = re.compile(r"%([A-Za-z_][^%\s\"'<>|&\\/:*?]*)%")
+_ICON_RE = re.compile(r",\s*-?\d+\s*(\")?\s*$")
 _DRIVE_ABS = re.compile(r"^[A-Za-z]:\\")
-_BAD_CHARS = re.compile(r'[<>"|?*:\x00-\x1f]')
+_BAD_CHARS = re.compile(r'[<>"|?*:%\x00-\x1f]')
 _SHORT_NAME = re.compile(r"~\d")
 _DEVICE_NAMES = frozenset(
     {"con", "prn", "aux", "nul", "conin$", "conout$", "clock$"}
@@ -72,26 +76,92 @@ _DEVICE_NAMES = frozenset(
 _EXTENDED = "\\\\?\\"
 
 
-def expand_env(text: str, env: Mapping[str, str]) -> Optional[str]:
-    """Expand ``%NAME%`` (case-insensitive); None if any reference is unresolved."""
+MACHINE_VARS = frozenset(
+    {
+        "systemroot",
+        "windir",
+        "systemdrive",
+        "programdata",
+        "allusersprofile",
+        "public",
+        "programfiles",
+        "programfiles(x86)",
+        "programw6432",
+        "commonprogramfiles",
+        "commonprogramfiles(x86)",
+        "commonprogramw6432",
+        "comspec",
+    }
+)
+
+# 32/64-bit family: variable -> (native 64-bit variable, x86 variable)
+_WOW_FAMILY = {
+    "programfiles": ("programw6432", "programfiles(x86)"),
+    "commonprogramfiles": ("commonprogramw6432", "commonprogramfiles(x86)"),
+}
+
+PATHEXT = (".com", ".exe", ".bat", ".cmd", ".pif", ".lnk", ".msc", ".cpl")
+_LEGACY_NAMES = frozenset({"documents and settings", "all users", "default user"})
+_MAX_PATH_LEN = 240
+_REPARSE = 0x400
+
+
+def _var_values(name: str, folded: Mapping[str, str]) -> Optional[List[str]]:
+    v = folded.get(name)
+    if v is None:
+        return None
+    vals = [v]
+    fam = _WOW_FAMILY.get(name)
+    if fam:
+        w64, x86 = fam
+        cands = [folded.get(w64), folded.get(x86)]
+        if folded.get(x86) is None and v.casefold().endswith(" (x86)"):
+            cands.append(v[: -len(" (x86)")])
+        for c in cands:
+            if c and c.casefold() not in {x.casefold() for x in vals}:
+                vals.append(c)
+    return vals
+
+
+def _expand_variants(
+    text: str, env: Mapping[str, str], allowed: Optional[frozenset] = None
+) -> Optional[List[str]]:
+    """All expansions of ``%NAME%`` (more than one when 32/64-bit folders are
+    ambiguous). None when any reference is unresolved or not allowed."""
     folded = {str(k).casefold(): str(v) for k, v in env.items()}
-    failed = False
+    names = []
+    for m in _ENV_RE.finditer(text):
+        n = m.group(1).casefold()
+        if n not in names:
+            names.append(n)
+    options = []
+    for n in names:
+        if allowed is not None and n not in allowed:
+            return None
+        vals = _var_values(n, folded)
+        if vals is None:
+            return None
+        options.append(vals)
+    out: List[str] = []
+    for combo in itertools.product(*options):
+        mapping = dict(zip(names, combo))
+        out.append(_ENV_RE.sub(lambda m: mapping[m.group(1).casefold()], text))
+    return out
 
-    def sub(m: "re.Match[str]") -> str:
-        nonlocal failed
-        val = folded.get(m.group(1).casefold())
-        if val is None:
-            failed = True
-            return m.group(0)
-        return val
 
-    out = _ENV_RE.sub(sub, text)
-    return None if failed else out
+def expand_env(text: str, env: Mapping[str, str]) -> Optional[str]:
+    """Expand ``%NAME%`` (case-insensitive); None if any reference is unresolved.
+
+    Placeholders such as ``%1``, ``%*`` or ``%~dp0`` are not variables and are
+    left as literal text.
+    """
+    v = _expand_variants(text, env)
+    return v[0] if v else None
 
 
 def strip_icon_index(text: str) -> str:
-    """Remove a trailing ``,<-?digits>`` icon index."""
-    return _ICON_RE.sub("", text)
+    """Remove a trailing ``,<-?digits>`` icon index (also inside quotes)."""
+    return _ICON_RE.sub(lambda m: m.group(1) or "", text)
 
 
 @dataclass(frozen=True)
@@ -265,9 +335,14 @@ class WinProber:
                 return Existence.UNKNOWN
         except Exception:
             return Existence.UNKNOWN
+        if len(norm) >= _MAX_PATH_LEN:
+            return Existence.UNKNOWN
         if self._microsoft_owned(norm):
             return Existence.PRESENT if self._exists(norm) else Existence.UNKNOWN
-        if any(_SHORT_NAME.search(c) for c in norm.split("\\")):
+        if any(
+            _SHORT_NAME.search(c) or c.casefold() in _LEGACY_NAMES
+            for c in norm.split("\\")
+        ):
             return Existence.PRESENT if self._exists(norm) else Existence.UNKNOWN
         try:
             self._lstat(norm)
@@ -277,32 +352,69 @@ class WinProber:
                 return Existence.UNKNOWN
         except Exception:
             return Existence.UNKNOWN
-        # Not found: only trust it when the drive root itself is readable.
-        return Existence.MISSING if self._exists(root) else Existence.UNKNOWN
+        # Not found: only trust it when the drive root itself is readable and
+        # no existing ancestor is a reparse point (junction/symlink target
+        # may live on an unplugged drive or be redirected).
+        if not self._exists(root):
+            return Existence.UNKNOWN
+        cur = root.rstrip("\\")
+        for comp in comps[:-1]:
+            cur = cur + "\\" + comp
+            try:
+                st = self._lstat(cur)
+            except OSError as exc:
+                if getattr(exc, "winerror", None) in (2, 3):
+                    break
+                return Existence.UNKNOWN
+            except Exception:
+                return Existence.UNKNOWN
+            if int(getattr(st, "st_file_attributes", 0) or 0) & _REPARSE:
+                return Existence.UNKNOWN
+        return Existence.MISSING
 
 
-def target_state(
-    raw: str, *, command: bool, ctx: DetectorContext, machine: bool
+def _combine(states: Sequence[Existence]) -> Existence:
+    if Existence.PRESENT in states:
+        return Existence.PRESENT
+    if states and all(st is Existence.MISSING for st in states):
+        return Existence.MISSING
+    return Existence.UNKNOWN
+
+
+def _with_pathext(cands: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    for c in cands:
+        if c not in out:
+            out.append(c)
+        if ntpath.splitext(ntpath.basename(c))[1].casefold() not in PATHEXT:
+            for ext in PATHEXT:
+                if c + ext not in out:
+                    out.append(c + ext)
+    return out
+
+
+def _one_state(
+    expanded: str, *, command: bool, ctx: DetectorContext, machine: bool
 ) -> Existence:
-    """Existence of the file a registry value points at."""
-    expanded = expand_env(raw, ctx.env)
-    if expanded is None:
-        return Existence.UNKNOWN
     if command:
         parsed = parse_command(expanded)
         if parsed.host or parsed.relative or not parsed.candidates:
             return Existence.UNKNOWN
-        cands: Tuple[str, ...] = parsed.candidates
+        cands: List[str] = _with_pathext(parsed.candidates)
     else:
         s = expanded.strip()
         if len(s) >= 2 and s[0] == s[-1] == '"':
             s = s[1:-1].strip()
         if not s:
             return Existence.UNKNOWN
-        cands = (s,)
+        cands = [s]
     if machine:
         for c in cands:
-            if _under(_canon(c), ctx.profiles_root):
+            canon = _canon(c)
+            if _under(canon, ctx.profiles_root):
+                return Existence.UNKNOWN
+            # Moved profiles: any \Users\ on any drive is per-user territory.
+            if _DRIVE_ABS.match(canon) and canon[3:].split("\\", 1)[0].casefold() == "users":
                 return Existence.UNKNOWN
     states = []
     for c in cands:
@@ -310,11 +422,30 @@ def target_state(
             states.append(ctx.prober.probe(c))
         except Exception:
             return Existence.UNKNOWN
-    if Existence.PRESENT in states:
-        return Existence.PRESENT
-    if states and all(st is Existence.MISSING for st in states):
-        return Existence.MISSING
-    return Existence.UNKNOWN
+    return _combine(states)
+
+
+def target_state(
+    raw: str, *, command: bool, ctx: DetectorContext, machine: bool
+) -> Existence:
+    """Existence of the file a registry value points at."""
+    if machine and (not ctx.profiles_root or not ctx.system_root):
+        return Existence.UNKNOWN
+    allowed = MACHINE_VARS if (machine or not ctx.owner_matches) else None
+    variants = _expand_variants(raw, ctx.env, allowed)
+    if not variants:
+        return Existence.UNKNOWN
+    return _combine(
+        [_one_state(v, command=command, ctx=ctx, machine=machine) for v in variants]
+    )
+
+
+def _profiles_root(env: Mapping[str, str], system_drive: str) -> str:
+    public = {str(k).casefold(): str(v) for k, v in env.items()}.get("public")
+    profiles = ntpath.dirname(ntpath.normpath(public)) if public else ""
+    if not _DRIVE_ABS.match(profiles + "\\"):
+        profiles = system_drive.rstrip("\\/") + "\\Users"
+    return profiles
 
 
 def default_context() -> DetectorContext:
@@ -338,10 +469,9 @@ def default_context() -> DetectorContext:
         local_appdata=str(winenv.local_appdata()),
         drive_type=drive_type,
     )
-    public = {k.casefold(): v for k, v in env.items()}.get("public")
-    profiles = ntpath.dirname(ntpath.normpath(public)) if public else ""
-    if not _DRIVE_ABS.match(profiles + "\\"):
-        profiles = sd.rstrip("\\/") + "\\Users"
     return DetectorContext(
-        env=env, prober=prober, profiles_root=profiles, system_root=system_root
+        env=env,
+        prober=prober,
+        profiles_root=_profiles_root(env, sd),
+        system_root=system_root,
     )

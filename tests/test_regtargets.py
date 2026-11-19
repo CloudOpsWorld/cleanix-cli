@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -46,13 +47,14 @@ class WinErr(OSError):
 class FakeFS:
     """Casefolded present set; everything else raises winerror 3 unless listed."""
 
-    def __init__(self, present=(), errors=None, drives=None, bad_roots=()):
+    def __init__(self, present=(), errors=None, drives=None, bad_roots=(), reparse=()):
         self.present = {p.casefold() for p in present}
+        self.reparse = {p.casefold() for p in reparse}
         self.errors = {k.casefold(): v for k, v in (errors or {}).items()}
         self.drives = {"C:": 3}
         self.drives.update(drives or {})
         self.bad_roots = {r.casefold() for r in bad_roots}
-        self.roots = {"c:\\"}
+        self.roots = {d.casefold() + "\\" for d in self.drives}
 
     def drive_type(self, root: str) -> int:
         return self.drives.get(root[:2].upper(), 1)  # 1 = no root dir
@@ -64,7 +66,8 @@ class FakeFS:
         if key in self.errors:
             raise WinErr(self.errors[key])
         if key in self.present or key in self.roots:
-            return object()
+            attrs = 0x400 if key in self.reparse else 0x10
+            return SimpleNamespace(st_file_attributes=attrs)
         raise WinErr(3)
 
 
@@ -258,3 +261,142 @@ def test_default_context_builds_on_windows(monkeypatch):
     ctx = rt.default_context()
     assert ctx.profiles_root.casefold().endswith("users")
     assert ctx.system_root
+
+
+# -- fix round 1 -------------------------------------------------------------
+def _ctx(fs, env=ENV, **kw):
+    c = make_ctx(fs, env)
+    return DetectorContext(
+        env=c.env,
+        prober=c.prober,
+        profiles_root=kw.get("profiles_root", c.profiles_root),
+        system_root=kw.get("system_root", c.system_root),
+        owner_matches=kw.get("owner_matches", True),
+    )
+
+
+def _ts(raw, fs=None, *, command=False, machine=False, env=ENV, **kw):
+    return target_state(
+        raw, command=command, ctx=_ctx(fs or FakeFS(), env, **kw), machine=machine
+    )
+
+
+USER_ENV = dict(
+    ENV,
+    APPDATA=r"D:\Redirected\AppData\Roaming",
+    LOCALAPPDATA=r"D:\Redirected\Local",
+    USERNAME="admin",
+    USERPROFILE=r"D:\Users\admin",
+    TEMP=r"D:\Temp",
+)
+
+
+def test_c1_machine_entries_never_use_per_user_variables():
+    assert _ts(r"%APPDATA%\Foo\foo.exe", machine=True, env=USER_ENV) is U
+    assert _ts(r"C:\Tools\%USERNAME%\agent.exe", machine=True, env=USER_ENV) is U
+    env = dict(USER_ENV, TMP=r"D:\t", HOMEPATH=r"\x", CUSTOM=r"D:\c")
+    for var in ("LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP", "HOMEPATH", "CUSTOM"):
+        assert _ts(rf"%{var}%\a.exe", machine=True, env=env, command=True) is U
+
+
+def test_c1_machine_allowlist_still_expands():
+    assert _ts(r"%ProgramData%\Foo\a.exe", machine=True) is M
+    assert _ts(r"%SystemDrive%\Tools\a.exe", machine=True) is M
+
+
+def test_c1_owner_mismatch_blocks_per_user_variables_for_hkcu():
+    assert _ts(r"%APPDATA%\Foo\a.exe", env=USER_ENV, owner_matches=False) is U
+    assert _ts(r"%APPDATA%\Foo\a.exe", FakeFS(drives={"D:": 3}), env=USER_ENV) is M
+    assert _ts(r"%ProgramData%\Foo\a.exe", owner_matches=False) is M
+
+
+def test_i1_wow_variants_32bit_interpreter():
+    env = dict(
+        ENV,
+        ProgramFiles=r"C:\Program Files (x86)",
+        CommonProgramFiles=r"C:\Program Files (x86)\Common Files",
+        CommonProgramW6432=r"C:\Program Files\Common Files",
+    )
+    live = FakeFS(present=[r"C:\Program Files\Foo\a.exe"])
+    assert _ts(r'"%ProgramFiles%\Foo\a.exe" /bg', live, command=True, env=env) is P
+    assert _ts(r'"%ProgramFiles%\Foo\a.exe" /bg', command=True, env=env) is M
+    live2 = FakeFS(present=[r"C:\Program Files\Common Files\Foo\a.exe"])
+    assert _ts(r"%CommonProgramFiles%\Foo\a.exe", live2, env=env) is P
+    # 32-bit without ProgramW6432: derive the native folder from the x86 one.
+    env2 = {"ProgramFiles": r"C:\Program Files (x86)", "SystemDrive": "C:"}
+    assert _ts(r"%ProgramFiles%\Foo\a.exe", live, env=env2) is P
+    # UNKNOWN in one variant keeps the verdict out of MISSING.
+    unk = FakeFS(errors={r"C:\Program Files\Foo\a.exe": 5})
+    assert _ts(r"%ProgramFiles%\Foo\a.exe", unk, env=env) is U
+
+
+def test_i2_reparse_ancestor_is_unknown():
+    fs = FakeFS(present=[r"C:\junc"], reparse=[r"C:\junc"])
+    assert _ts(r"C:\junc\gone\a.exe", fs, command=True) is U
+    plain = FakeFS(present=[r"C:\dir"])
+    assert _ts(r"C:\dir\gone\a.exe", plain, command=True) is M
+
+
+def test_i2_legacy_junction_names_unknown():
+    assert _ts(r"C:\Documents and Settings\bob\a.exe") is U
+    assert _ts(r"C:\Users\All Users\Foo\a.exe") is U
+    assert _ts(r"C:\Users\Default User\a.exe") is U
+    assert _ts(r"C:\Users\All Users\Microsoft\a.exe", machine=True) is U
+
+
+def test_i3_long_paths_unknown():
+    long_path = "C:\\" + "\\".join(["d" * 30] * 9) + "\\a.exe"
+    assert len(long_path) >= 240
+    assert _ts(long_path) is U
+    assert _ts("\\\\?\\" + long_path) is U
+    assert _ts("C:\\" + "d" * 200 + "\\a.exe") is M
+
+
+def test_i4_moved_profiles_and_empty_roots():
+    env = dict(USER_ENV)
+    d = FakeFS(drives={"D:": 3})
+    assert _ts(r"D:\Users\bob\AppData\Local\App\x.exe", d, machine=True,
+               command=True, env=env) is U
+    assert _ts(r"%USERPROFILE%\App\x.exe", d, machine=True, env=env) is U
+    assert _ts(r"C:\Tools\a.exe", machine=True, profiles_root="") is U
+    assert _ts(r"C:\Tools\a.exe", machine=True, system_root="") is U
+    assert _ts(r"C:\Tools\a.exe", machine=True) is M
+    assert _ts(r"D:\Users\bob\x.exe", d, machine=False) is M
+
+
+def test_i5_pathext():
+    only_cmd = FakeFS(present=[r"C:\Tools\backup.cmd"])
+    assert _ts(r"C:\Tools\backup", only_cmd, command=True) is P
+    assert _ts(r'"C:\Tools\backup" /x', only_cmd, command=True) is P
+    assert _ts(r"C:\Tools\backup", command=True) is M
+    bat = FakeFS(present=[r"C:\Tools\x.dat.bat"])
+    assert _ts(r"C:\Tools\x.dat", bat, command=True) is P
+
+
+def test_minor_strip_icon_index_inside_quotes():
+    assert strip_icon_index(r'"C:\App\app.exe,0"') == r'"C:\App\app.exe"'
+    assert strip_icon_index(r'"C:\App\app.exe",-3') == r'"C:\App\app.exe"'
+    assert strip_icon_index(r"C:\App\app.exe, 2") == r"C:\App\app.exe"
+
+
+def test_minor_placeholders_are_not_variables():
+    assert expand_env(r'"C:\a.exe" "%1" %*', ENV) == r'"C:\a.exe" "%1" %*'
+    assert expand_env(r"C:\a.exe %~dp0 %L %V %W", ENV) == r"C:\a.exe %~dp0 %L %V %W"
+    for cmd in (
+        r'"C:\gone\app.exe" "%1" %*',
+        r'"C:\gone\app.exe" "%L" %*',
+        r'"C:\gone\app.exe" %~dp0 %1',
+        r'"C:\gone\app.exe" "%V" "%W" %D',
+    ):
+        assert _ts(cmd, command=True) is M, cmd
+        assert _ts(cmd, command=True, machine=True) is M, cmd
+    live = FakeFS(present=[r"C:\here\app.exe"])
+    assert _ts(r'"C:\here\app.exe" "%1"', live, command=True) is P
+    for cmd in (r"%1 /x", r"%1\app.exe", r'"%1" /x', r"C:\%1\app.exe", r"%~dp0\app.exe"):
+        assert _ts(cmd, command=True) is U, cmd
+
+
+def test_minor_profiles_root_fallback_is_testable_anywhere():
+    assert rt._profiles_root({"SystemDrive": "C:"}, "C:") == r"C:\Users"
+    assert rt._profiles_root({"PUBLIC": r"D:\Users\Public"}, "C:") == r"D:\Users"
+    assert rt._profiles_root({"public": "garbage"}, "C:") == r"C:\Users"
