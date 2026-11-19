@@ -67,9 +67,9 @@ class ActSummary(service.CleanSummary):
     """
 
     skipped: List[Tuple[CleanableItem, str]] = field(default_factory=list)
-    # Permanent runs only: the quarantine run holding the copies of removed
-    # launch-job/unit files (manual recovery only; restore never acts on
-    # them, so this is not an Undo and not ``quarantine_run``).
+    # The copy-only run holding the copies of removed launch-job/unit files
+    # (manual recovery only; restore never acts on them, so this is not an
+    # Undo and never ``quarantine_run``).
     backup_run: Optional[str] = None
 
 
@@ -220,14 +220,16 @@ def act(
     run"). Dry run by default: then nothing is moved or written and no
     command is run.
 
-    User-level LAUNCH_JOB / SYSTEMD_UNIT findings take the same path: right
-    before the Engine removes the file, :func:`remedy_exec.check` re-verifies
-    it and :func:`remedy_exec.unload` stops it (best effort; a failure is a
-    warning in the outcome's ``note``). The file then goes into this batch's
-    quarantine run, or, with ``permanent``, is deleted after a copy was kept
-    in ``backup_run``. After the batch one ``systemctl --user daemon-reload``
-    runs if a unit was disabled. Their outcomes' ``note`` says "permanent (a
-    copy of the file is kept in <dir>)": nothing reloads a stopped job.
+    User-level LAUNCH_JOB / SYSTEMD_UNIT findings are in the same batch but
+    always permanent, whatever ``permanent`` says: right before the Engine
+    removes the file, :func:`remedy_exec.check` re-verifies it, a copy is
+    kept in ``backup_run`` (a copy-only run restore never acts on) and
+    :func:`remedy_exec.unload` stops it (best effort; a failure is a warning
+    in the outcome's ``note``); then the file is deleted, never quarantined.
+    After the batch one ``systemctl --user daemon-reload`` runs if a unit
+    was disabled. Their outcomes' ``note`` says what was done ("permanent:
+    ... a copy of the file is kept in <dir> ..."). ``quarantine_run`` only
+    ever holds PATH findings.
     """
     items = list(items)
     if not record_history and not permanent and not dry_run:
@@ -272,36 +274,38 @@ def act(
 
     outcomes: Dict[int, CleanOutcome] = {}
     inner = None
-    # Permanent runs: copies of launch-job/unit files (created on first use).
+    # Copies of launch-job/unit files: a copy-only run (created on first use),
+    # never the restorable quarantine run.
     backup: List[Optional[quarantine.Quarantine]] = [None]
     if todo:
         original = {id(a): items[idx] for idx, a in todo}
         late: Dict[int, str] = {}  # id(activated item) -> precheck reason
-        # id(activated) -> (kind, warnings, where the copy is) for every
-        # launch job / unit whose stop command was run.
-        prepared: Dict[int, Tuple[RemedyKind, List[str], Optional[str]]] = {}
+        jobs = {id(a) for _i, a in todo
+                if original[id(a)].remedy is not None
+                and original[id(a)].remedy.kind in remedy_exec.KINDS}  # type: ignore[union-attr]
+        # id(activated) -> (kind, stop result, where the copy is) for every
+        # launch job / unit that got as far as its stop attempt.
+        prepared: Dict[int, Tuple[RemedyKind, remedy_exec.Stop, str]] = {}
 
         def prepare(activated: CleanableItem, finding: CleanableItem) -> Optional[str]:
-            """Re-verify a launch job/unit; on a real run keep a copy (when
-            permanent) and stop it, right before the Engine removes its
-            file. Nothing after the stop command may raise."""
+            """Re-verify a launch job/unit; on a real run keep a copy and
+            stop it, right before the Engine deletes its file. Nothing after
+            the stop attempt may raise."""
             assert finding.remedy is not None and finding.path
             why, name = remedy_exec.check(finding, config)
             if why is not None or dry_run:
                 return why
             assert name is not None
-            where: Optional[str] = None
-            if permanent:
-                try:
-                    if backup[0] is None:
-                        backup[0] = quarantine.new_run()
-                    backup[0].store_copy(finding.path)
-                    where = str(backup[0].files_dir)
-                except Exception as exc:  # noqa: BLE001
-                    return ("could not keep a copy of the file, nothing removed "
-                            f"({str(exc) or type(exc).__name__})")
-            warnings = remedy_exec.unload(finding.remedy.kind, name)
-            prepared[id(activated)] = (finding.remedy.kind, warnings, where)
+            try:
+                if backup[0] is None:
+                    backup[0] = quarantine.new_run()
+                backup[0].store_copy(finding.path)
+                where = str(backup[0].files_dir)
+            except Exception as exc:  # noqa: BLE001
+                return ("could not keep a copy of the file, nothing removed "
+                        f"({str(exc) or type(exc).__name__})")
+            stop = remedy_exec.unload(finding.remedy.kind, name, finding.path)
+            prepared[id(activated)] = (finding.remedy.kind, stop, where)
             return None
 
         def precheck(activated: CleanableItem) -> Optional[str]:
@@ -321,20 +325,22 @@ def act(
                 late[id(activated)] = why
             return why
 
+        # Only PATH findings are quarantined (restorable); a batch of jobs
+        # alone opens no quarantine run at all.
+        quarantine_paths = not permanent and len(jobs) < len(todo)
         try:
             inner = service.clean(
                 [a for _i, a in todo], config, dry_run=dry_run,
-                use_quarantine=not permanent, progress=progress, cancel=cancel,
+                use_quarantine=quarantine_paths, progress=progress, cancel=cancel,
                 record_history=record_history, precheck=precheck,
+                delete_instead=lambda a: id(a) in jobs,
             )
         finally:
             if backup[0] is not None:
                 backup[0].discard_if_empty()
         reload_warnings: List[str] = []
-        if any(k is RemedyKind.SYSTEMD_UNIT for k, _w, _d in prepared.values()):
+        if any(k is RemedyKind.SYSTEMD_UNIT for k, _s, _d in prepared.values()):
             reload_warnings = remedy_exec.reload_units()
-        run_files = (str(quarantine.quarantine_root() / inner.quarantine_run / "files")
-                     if inner.quarantine_run else "the quarantine")
         # Engine yields one outcome per processed item, in order; a cancel
         # leaves the rest unprocessed (no outcome), as in a normal clean.
         for (idx, activated), outcome in zip(todo, inner.result.outcomes):
@@ -343,13 +349,14 @@ def act(
                 continue
             info = prepared.get(id(activated))
             if info is not None:
-                kind, warnings, where = info
-                if kind is RemedyKind.SYSTEMD_UNIT:
-                    warnings = warnings + reload_warnings
+                kind, stop, where = info
+                extra = reload_warnings if kind is RemedyKind.SYSTEMD_UNIT else []
                 if outcome.removed:
-                    note = remedy_exec.permanent_note(where or run_files, warnings)
+                    note = remedy_exec.permanent_note(where, stop, extra)
                 else:
-                    note = "the job was stopped, but its file was not removed"
+                    note = ("the job was stopped, but its file was not removed"
+                            if stop.stopped else "its file was not removed")
+                    warnings = stop.warnings + list(extra)
                     if warnings:
                         note += "; warning: " + "; ".join(warnings)
                 outcome = dataclasses.replace(outcome, note=note)

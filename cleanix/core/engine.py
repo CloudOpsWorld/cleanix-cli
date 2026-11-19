@@ -29,6 +29,8 @@ ProgressCB = Optional[Callable[[str], None]]
 CancelCB = Optional[Callable[[], bool]]
 # Returns why the item must not be removed now, or None (see Engine.clean).
 PrecheckCB = Optional[Callable[[CleanableItem], Optional[str]]]
+# True for a PATH item that is deleted even in a quarantine run (see Engine.clean).
+DeleteCB = Optional[Callable[[CleanableItem], bool]]
 
 
 class Engine:
@@ -110,6 +112,7 @@ class Engine:
         cancel: CancelCB = None,
         registry_backup: Optional[RegistryBackupSink] = None,
         precheck: PrecheckCB = None,
+        delete_instead: DeleteCB = None,
     ) -> CleanResult:
         """Remove (or simulate removing) the given items.
 
@@ -118,6 +121,10 @@ class Engine:
         guard; a non-None return (or an exception) is the reason the item is
         skipped: ``removed=False``, ``error="skipped: <reason>"``, nothing
         touched. It never makes an unsafe item deletable.
+
+        ``delete_instead`` (default None) names PATH items that are deleted
+        rather than moved even when ``quarantine`` is given (the caller kept
+        its own, non-restorable copy; e.g. launch-job files).
 
         Root-requiring items are skipped with an error unless the process is
         root (or ``allow_root_items`` is forced True). If ``quarantine`` is a
@@ -142,7 +149,7 @@ class Engine:
                 self._clean_one(
                     item, dry_run=dry_run, allow_root=allow_root_items,
                     quarantine=quarantine, registry_backup=registry_backup,
-                    precheck=precheck,
+                    precheck=precheck, delete_instead=delete_instead,
                 )
             )
         return result
@@ -151,6 +158,7 @@ class Engine:
         self, item: CleanableItem, *, dry_run: bool, allow_root: bool, quarantine=None,
         registry_backup: Optional[RegistryBackupSink] = None,
         precheck: PrecheckCB = None,
+        delete_instead: DeleteCB = None,
     ) -> CleanOutcome:
         # Report-only items are never deleted, even if one slips into a clean set.
         if item.report_only:
@@ -171,6 +179,8 @@ class Engine:
             )
 
         if item.kind is ItemKind.PATH:
+            if quarantine is not None and delete_instead is not None and delete_instead(item):
+                quarantine = None
             return self._clean_path(item, dry_run=dry_run, quarantine=quarantine,
                                     precheck=precheck)
         if item.kind is ItemKind.COMMAND:

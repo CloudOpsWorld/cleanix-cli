@@ -63,7 +63,7 @@ def env(orphan_env, tmp_path, monkeypatch):
     def _no_real_commands(*a, **k):  # pragma: no cover - must never run
         raise AssertionError("a real command was about to run")
 
-    monkeypatch.setattr(remedy_exec, "run_command", _no_real_commands)
+    monkeypatch.setattr(remedy_exec, "_spawn", _no_real_commands)
     (orphan_env.root / "usr/lib/systemd/system").mkdir(parents=True)
     orphan_env.rec = rec
     orphan_env.q = tmp_path / "q"
@@ -138,41 +138,48 @@ def _bootout(label):
 def test_launch_job_backup_then_remove(env):
     p, item = _job_item(env)
     data = p.read_bytes()
+    st = os.lstat(str(p))
     seen = []
-    env.rec.side_effect = lambda argv: seen.append(p.exists())
-    summary = actions.act([item], Config(), dry_run=False)
+
+    def at_stop(argv):
+        kept = list(env.q.glob("*/files/*"))
+        seen.append((p.exists(), [k.read_bytes() for k in kept]))
+
+    env.rec.side_effect = at_stop
+    summary = actions.act([item], Config(), dry_run=False)  # not --permanent
     assert _skips(summary) == []
     assert summary.removed == 1 and summary.errors == []
     assert env.rec.calls == [_bootout("com.gone.job")]
-    assert seen == [True]  # the job was stopped while its file still existed
+    # Backup first, then stop (while the file still exists), then remove.
+    assert seen == [(True, [data])]
     assert not p.exists()
-    # The file is kept in this batch's quarantine run, metadata preserved.
-    run_dir = env.q / summary.quarantine_run
-    (kept,) = list((run_dir / "files").iterdir())
-    assert kept.read_bytes() == data
-    (out,) = summary.result.outcomes
-    assert out.item is item and out.removed and out.error is None
-    assert out.note.startswith("permanent (a copy of the file is kept in ")
-    assert str(run_dir / "files") in out.note
-    assert [e["mode"] for e in history.load()] == ["quarantine"]
-
-
-def test_launch_job_permanent_keeps_a_copy_restore_does_not_claim_it(env):
-    p, item = _job_item(env)
-    data = p.read_bytes()
-    st = os.lstat(str(p))
-    summary = actions.act([item], Config(), dry_run=False, permanent=True)
-    assert summary.removed == 1 and summary.errors == [] and not p.exists()
-    assert summary.quarantine_run is None  # nothing here is undoable
-    assert summary.backup_run
+    # Always permanent: never a restorable quarantine move, even without
+    # --permanent; the copy is in a copy-only run.
+    assert summary.quarantine_run is None and summary.backup_run
     run_dir = env.q / summary.backup_run
     (kept,) = list((run_dir / "files").iterdir())
     assert kept.read_bytes() == data
     assert os.stat(str(kept)).st_mtime_ns // 10**6 == st.st_mtime_ns // 10**6
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert [i["type"] for i in manifest["items"]] == ["copy"]
-    assert str(run_dir / "files") in summary.result.outcomes[0].note
+    (out,) = summary.result.outcomes
+    assert out.item is item and out.removed and out.error is None
+    assert out.note == remedy_exec.planned_text(run_dir / "files")
+    assert out.note.startswith("permanent: the job is stopped and its file removed")
     assert [e["mode"] for e in history.load()] == ["delete"]
+    assert quarantine.latest_run() is None  # nothing to undo
+
+
+def test_launch_job_permanent_keeps_a_copy_restore_does_not_claim_it(env):
+    p, item = _job_item(env)
+    data = p.read_bytes()
+    summary = actions.act([item], Config(), dry_run=False, permanent=True)
+    assert summary.removed == 1 and summary.errors == [] and not p.exists()
+    assert summary.quarantine_run is None  # nothing here is undoable
+    run_dir = env.q / summary.backup_run
+    (kept,) = list((run_dir / "files").iterdir())
+    assert kept.read_bytes() == data
+    assert str(run_dir / "files") in summary.result.outcomes[0].note
     # A copy is not an Undo: restore leaves it alone and says so.
     res = quarantine.restore(summary.backup_run)
     assert res["restored"] == [] and res["failed"] == []
@@ -255,13 +262,14 @@ def test_runner_failure_does_not_block_file_removal_but_is_reported(env):
 def test_file_removal_failure_is_an_error(env, monkeypatch):
     p, item = _job_item(env)
 
-    def fail_store(self, path):
+    def fail_delete(path):
         raise OSError("disk full")
 
-    monkeypatch.setattr(quarantine.Quarantine, "store", fail_store)
+    monkeypatch.setattr(safety, "safe_rmtree", fail_delete)
     summary = actions.act([item], Config(), dry_run=False)
     assert summary.removed == 0 and len(summary.errors) == 1 and p.exists()
     assert "disk full" in summary.errors[0].error
+    assert summary.errors[0].note.startswith("the job was stopped, but its file was not removed")
 
 
 # -- extra coverage ----------------------------------------------------------------
@@ -360,7 +368,7 @@ def test_symlinked_launchagents_dir_refused(env, tmp_path):
     item = _forged(via, RemedyKind.LAUNCH_JOB, (("label", "com.gone.out"),))
     summary = actions.act([item], Config(), dry_run=False)
     assert summary.removed == 0 and p.exists() and env.rec.calls == []
-    assert "is a link" in _skips(summary)[0]
+    assert remedy_exec.LINK_ON_THE_WAY in _skips(summary)[0]
 
 
 @posix_only
@@ -420,15 +428,35 @@ def test_command_argv_shapes_are_fixed(env, monkeypatch):
         assert remedy_exec.run_mutating(argv)[0] == 126
     assert env.rec.calls == []  # refused shapes never reach the runner
 
-    # The default runner pins the locale, passes argv as a list (no shell)
-    # and a timeout.
+    # Template units have nothing to stop: disable without --now.
+    assert remedy_exec.disable_argv("tpl@.service") == [
+        "systemctl", "--user", "disable", "tpl@.service"]
+    assert remedy_exec.disable_argv("tpl@inst.service")[3] == "--now"
+    assert remedy_exec.argv_allowed(remedy_exec.disable_argv("tpl@.service"))
+    assert not remedy_exec.argv_allowed(["systemctl", "--user", "disable", "--now", "tpl@.service"])
+    assert not remedy_exec.argv_allowed(["systemctl", "--user", "disable", "mine.service"])
+
+    # The default runner: fixed absolute tool paths (which() only as a
+    # fallback), the C locale, argv as a list (no shell), a timeout.
     seen = []
-    monkeypatch.setattr(remedy_exec, "run_command",
+    monkeypatch.setattr(remedy_exec, "_spawn",
                         lambda argv, timeout: seen.append((list(argv), timeout)) or (0, "", ""))
+    monkeypatch.setattr(remedy_exec.os.path, "isfile",
+                        lambda p: p in ("/usr/bin/env", "/bin/systemctl"))
+    monkeypatch.setattr(remedy_exec.os, "access", lambda p, mode: True)
+    monkeypatch.setattr(remedy_exec, "which", lambda name: "/elsewhere/" + name)
     monkeypatch.setattr(remedy_exec, "runner", remedy_exec.default_runner)
     assert remedy_exec.run_mutating(remedy_exec.daemon_reload_argv())[0] == 0
-    assert seen == [(["env", "LC_ALL=C", "systemctl", "--user", "daemon-reload"],
-                     remedy_exec.COMMAND_TIMEOUT)]
+    assert remedy_exec.run_mutating(remedy_exec.bootout_argv(501, "com.x"))[0] == 0
+    assert seen == [
+        (["/usr/bin/env", "LC_ALL=C", "/bin/systemctl", "--user", "daemon-reload"],
+         remedy_exec.COMMAND_TIMEOUT),
+        (["/usr/bin/env", "LC_ALL=C", "/elsewhere/launchctl", "bootout", "gui/501/com.x"],
+         remedy_exec.COMMAND_TIMEOUT),
+    ]
+    monkeypatch.setattr(remedy_exec, "which", lambda name: None)
+    assert remedy_exec.run_mutating(remedy_exec.bootout_argv(501, "com.x"))[0] == 127
+    assert len(seen) == 2  # a missing tool is never started
 
     # In a real batch: bootout, disable --now, then one daemon-reload.
     monkeypatch.setattr(remedy_exec, "runner", env.rec)
@@ -501,12 +529,19 @@ def test_one_quarantine_run_for_mixed_batch(env, tmp_path):
     u, uitem = _unit_item(env)
     summary = actions.act([path_item, item, uitem], Config(), dry_run=False)
     assert summary.removed == 3 and summary.errors == [] and _skips(summary) == []
-    assert [d.name for d in env.q.iterdir()] == [summary.quarantine_run]
+    # One restorable run (the path) plus one copy-only run (job and unit).
+    assert sorted(d.name for d in env.q.iterdir()) == sorted(
+        [summary.quarantine_run, summary.backup_run])
     manifest = json.loads((env.q / summary.quarantine_run / "manifest.json").read_text("utf-8"))
-    assert len(manifest["items"]) == 3
+    assert [m.get("type") for m in manifest["items"]] == [None]
+    backup = json.loads((env.q / summary.backup_run / "manifest.json").read_text("utf-8"))
+    assert [m.get("type") for m in backup["items"]] == ["copy", "copy"]
     assert len(history.load()) == 1
     assert summary.result.outcomes[0].note is None  # an ordinary path: undoable
-    assert all("permanent" in o.note for o in summary.result.outcomes[1:])
+    assert all(o.note.startswith("permanent: ") for o in summary.result.outcomes[1:])
+    assert quarantine.latest_run() == summary.quarantine_run
+    res = quarantine.restore(summary.quarantine_run)
+    assert res["restored"] == [str(f)] and not p.exists() and not u.exists()
 
     # Permanent: paths deleted, job/unit copies kept in one backup run.
     f.write_bytes(b"y" * 4096)
@@ -538,3 +573,192 @@ def test_file_owned_by_another_account_refused(env, monkeypatch):
     summary = actions.act([item], Config(), dry_run=False)
     assert summary.removed == 0 and p.exists() and env.rec.calls == []
     assert _skips(summary) == [remedy_exec.NOT_OWNED]
+
+
+# -- review round 1: label/name clashes, Apple jobs, root, soft results ------------
+
+
+def test_label_used_by_another_job_is_not_stopped(env):
+    p, item = _job_item(env)
+    # Another plist (a live job loaded from elsewhere) declares the same Label.
+    other = _job(env, name="com.live.copy", label="com.gone.job")
+    summary = actions.act([item], Config(), dry_run=False)
+    assert summary.removed == 1 and not p.exists() and other.exists()
+    assert env.rec.calls == []  # bootout by label would hit the live job
+    note = summary.result.outcomes[0].note
+    assert note.startswith("permanent: its file was removed")
+    assert "another job uses this label" in note and "not stopped" in note
+
+    # The same for a system-wide agent with that label.
+    p2, item2 = _job_item(env, name="com.gone.two")
+    _job(env, name="com.vendor.agent", label="com.gone.two",
+         where=env.root / "System" / "Library" / "LaunchAgents")
+    summary = actions.act([item2], Config(), dry_run=False)
+    assert summary.removed == 1 and env.rec.calls == []
+    assert "another job uses this label" in summary.result.outcomes[0].note
+
+    # Unrelated or unparsable plists do not block the stop.
+    p3, item3 = _job_item(env, name="com.gone.three")
+    (_agents(env) / "junk.plist").write_bytes(b"not a plist")
+    summary = actions.act([item3], Config(), dry_run=False)
+    assert env.rec.calls == [_bootout("com.gone.three")]
+
+
+def test_unit_name_used_elsewhere_is_not_disabled(env):
+    u, uitem = _unit_item(env)
+    other = env.root / "etc" / "systemd" / "user" / "mine.service"
+    other.parent.mkdir(parents=True)
+    other.write_text("[Service]\nExecStart=/usr/bin/true\n", encoding="utf-8")
+    summary = actions.act([uitem], Config(), dry_run=False)
+    assert summary.removed == 1 and not u.exists() and other.exists()
+    assert env.rec.calls == [["systemctl", "--user", "daemon-reload"]]
+    assert "another unit file with this name exists" in summary.result.outcomes[0].note
+
+
+def test_template_unit_is_disabled_without_now(env):
+    u, uitem = _unit_item(env, name="tpl@.service", program="/opt/gone/t")
+    summary = actions.act([uitem], Config(), dry_run=False)
+    assert summary.removed == 1 and not u.exists()
+    assert env.rec.calls == [["systemctl", "--user", "disable", "tpl@.service"],
+                             ["systemctl", "--user", "daemon-reload"]]
+
+
+def test_apple_job_never_accepted_at_act_time(env):
+    a = _job(env, name="com.apple.foo", label="com.vendor.foo")
+    b = _job(env, name="vendor", label="com.apple.bar")
+    items = [_forged(a, RemedyKind.LAUNCH_JOB, (("label", "com.vendor.foo"),)),
+             _forged(b, RemedyKind.LAUNCH_JOB, (("label", "com.apple.bar"),))]
+    summary = actions.act(items, Config(), dry_run=False)
+    assert _skips(summary) == [remedy_exec.APPLE_JOB] * 2
+    assert a.exists() and b.exists() and env.rec.calls == []
+
+
+@posix_only
+def test_root_run_is_refused_with_advice(env, monkeypatch):
+    p, item = _job_item(env)
+    monkeypatch.setattr(remedy_exec, "_uid", lambda: 0)
+    summary = actions.act([item], Config(), dry_run=False)
+    assert _skips(summary) == [remedy_exec.AS_ROOT] and p.exists()
+    assert "without sudo" in remedy_exec.AS_ROOT and env.rec.calls == []
+
+
+def test_bootout_not_loaded_is_a_soft_note(env):
+    p, item = _job_item(env)
+    env.rec.result = (3, "", "Boot-out failed: 3: No such process\n")
+    summary = actions.act([item], Config(), dry_run=False)
+    note = summary.result.outcomes[0].note
+    assert summary.removed == 1 and "the job was not loaded" in note
+    assert "warning" not in note
+    p2, item2 = _job_item(env, name="com.gone.two")
+    env.rec.result = (113, "", "Could not find service\n")
+    summary = actions.act([item2], Config(), dry_run=False)
+    assert "warning" not in summary.result.outcomes[0].note
+
+
+# -- CLI and review wording ----------------------------------------------------------
+
+
+class _FakeCleaner:
+    def __init__(self, cid, items):
+        self.id = cid
+        self.name = cid
+        self._items = items
+
+    def scan(self):
+        from cleanix.core.models import CleanerReport
+
+        return CleanerReport(cleaner_id=self.id, name=self.name,
+                             description="test", items=list(self._items))
+
+
+@pytest.fixture
+def cli_env(env, monkeypatch):
+    from cleanix import cli
+
+    monkeypatch.setattr(cli, "_load_config", lambda: Config())
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+    monkeypatch.setenv("COLUMNS", "400")
+    env.cli = cli
+
+    def scan_gives(items):
+        by = {}
+        for i in items:
+            by.setdefault(i.cleaner_id, []).append(i)
+        monkeypatch.setattr(cli, "build_cleaners", lambda config, only=None, exclude=None: [
+            _FakeCleaner(c, by.get(c, [])) for c in (only or list(by))])
+
+    env.scan_gives = scan_gives
+    return env
+
+
+def _cli(env, capsys, *argv):
+    code = env.cli.main(list(argv))
+    return code, " ".join(capsys.readouterr().out.split())
+
+
+def test_cli_act_on_wording_notes_and_restore(cli_env, capsys):
+    env = cli_env
+    f = env.home / "big.bin"
+    f.write_bytes(b"x" * 4096)
+    path_item = CleanableItem(cleaner_id="big_files", description="big.bin", size=4096,
+                              path=str(f), report_only=True, remedy=path_remedy(str(f)))
+    p, item = _job_item(env)
+    env.scan_gives([path_item, item])
+
+    code, out = _cli(env, capsys, "clean", "--act-on", "big_files,orphan_launch_jobs")
+    assert code == 0 and p.exists() and env.rec.calls == []
+    planned = " ".join(remedy_exec.planned_text(env.q).split())
+    assert planned in out  # the job's line: permanent, copy kept
+    assert "kept in quarantine; undo with `cleanix restore`" in out  # the path's line
+    assert "1 of them are background jobs/services: stopped and removed permanently" in out
+
+    env.rec.result = (5, "", "Boot-out failed: 5: Input/output error")
+    code, out = _cli(env, capsys, "clean", "--act-on", "big_files,orphan_launch_jobs",
+                     "--execute", "--yes")
+    assert code == 0 and not p.exists() and not f.exists()
+    runs = {r["run_id"]: r for r in quarantine.list_runs()}
+    (qrun,) = [r for r, info in runs.items() if info["removed_count"]]
+    (brun,) = [r for r in runs if r != qrun]
+    assert f"cleanix restore {qrun}" in out
+    assert f"cleanix restore {brun}" not in out
+    assert "Copies of the removed job/service files are kept in" in out and brun in out
+    assert "Notes on 1 item(s)" in out and "exit 5" in out and "warning" in out
+
+    # No-arg restore takes the path run, never the copy-only run.
+    code, out = _cli(env, capsys, "restore")
+    assert f.exists() and not p.exists()
+    code, out = _cli(env, capsys, "restore")
+    assert code == 1 and "Nothing in quarantine to restore" in out and not p.exists()
+
+
+def test_cli_act_on_jobs_only_prints_no_restore_hint(cli_env, capsys):
+    env = cli_env
+    p, item = _job_item(env)
+    env.scan_gives([item])
+    code, out = _cli(env, capsys, "clean", "--act-on", "orphan_launch_jobs",
+                     "--execute", "--yes")
+    assert code == 0 and not p.exists()
+    assert "cleanix restore" in out  # only inside "does not bring them back"
+    assert "undo with" not in out and "Quarantine run" not in out
+    assert "does not bring them back" in out and "Notes on 1 item(s)" in out
+
+
+def test_review_wording_and_notes_for_jobs(env):
+    from rich.console import Console
+
+    from cleanix.core import findings, review
+    from cleanix.core.models import CleanerReport, ScanResult
+
+    p, item = _job_item(env)
+    scan = ScanResult(reports=[CleanerReport(cleaner_id=item.cleaner_id, name="j",
+                                             description="t", items=[item])])
+    env.rec.result = (5, "", "boom")
+    c = Console(record=True, width=400, force_terminal=False)
+    res = review.run(findings.group_findings(scan), lambda prompt: "d",
+                     lambda its: actions.act(its, Config(), dry_run=False), c)
+    out = " ".join(c.export_text().split())
+    assert res.removed == 1 and not p.exists()
+    assert " ".join(remedy_exec.planned_text(env.q).split()) in out  # the prompt
+    assert "kept in quarantine" not in out and "undo with" not in out
+    assert res.backups and "does not bring them back" in out
+    assert "Notes on 1 item(s)" in out and "exit 5" in out

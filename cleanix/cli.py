@@ -552,7 +552,7 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
 
     Preview by default; --execute acts (one confirmation unless --yes).
     Quarantine unless --permanent. Scans only the named scenarios."""
-    from cleanix.core import findings, service
+    from cleanix.core import findings, review, service
 
     for attr, flag in _ACT_ON_CONFLICTS:
         val = getattr(args, attr, None)
@@ -637,6 +637,9 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
                     label = why if k in kept_paths else f"skipped: {why}"
                     _act_line(console, i, safe(label))
                     continue
+                if review.is_job(i):
+                    _act_line(console, i, safe(review.undo_line(i, permanent)))
+                    continue
                 action = f"{verb}: {undo}"
                 kept = findings.survivor_of(stamped[k]) if k in stamped else None
                 if kept is not None:
@@ -651,11 +654,15 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
     if not eligible:
         console.print("\nNothing can be acted on right now.")
         return 0
+    n_jobs = sum(1 for i in eligible if review.is_job(i))
+    jobs_text = (f" {n_jobs} of them are background jobs/services: stopped and "
+                 "removed permanently (a copy of each file is kept)."
+                 if n_jobs else "")
     if not args.execute:
         console.print(
             f"\n[yellow]Preview: {len(eligible)} item(s), up to "
             f"{human_size(total)}, would be "
-            f"{'deleted' if permanent else 'quarantined'}.[/yellow]")
+            f"{'deleted' if permanent else 'quarantined'}.{jobs_text}[/yellow]")
         console.print("[dim]This was a dry run. Add [bold]--execute[/bold] to "
                       "act on these items.[/dim]")
         return 0
@@ -670,7 +677,8 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
         try:
             confirmed = Confirm.ask(
                 f"{'Permanently delete' if permanent else 'Quarantine'} "
-                f"{len(eligible)} item(s), up to {human_size(total)}?",
+                f"{len(eligible)} item(s), up to {human_size(total)}?"
+                f"{jobs_text}",
                 default=False)
         except (EOFError, OSError):
             console.print(
@@ -695,6 +703,13 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
             f"[bold]cleanix quarantine empty[/bold].")
     elif permanent and summary.removed:
         console.print("[dim]Deleted permanently; there is no undo.[/dim]")
+    if summary.backup_run:
+        console.print(f"[cyan]{safe(review.backup_line(summary.backup_run))}[/cyan]")
+    noted = [o for o in summary.result.outcomes if o.note]
+    if noted:
+        console.print(f"\n[yellow]Notes on {len(noted)} item(s):[/yellow]")
+        for o in noted:
+            console.print(f"  {safe(o.item.description)}: {safe(o.note)}")
     skipped = [(i, w) for i, w in plan_skipped if id(i) not in kept_ids]
     skipped += list(summary.skipped)
     skipped += [(i, "needs an elevated run (not done here)") for i in root_items]

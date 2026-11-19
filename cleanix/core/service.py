@@ -12,7 +12,7 @@ from typing import Any, Callable, List, Mapping, Optional, Sequence
 
 from cleanix.config import Config
 from cleanix.core import history, safety
-from cleanix.core.engine import Engine, PrecheckCB
+from cleanix.core.engine import DeleteCB, Engine, PrecheckCB
 from cleanix.core.models import (
     CleanableItem,
     CleanOutcome,
@@ -108,6 +108,7 @@ def clean(
     registry_backup_root: Optional[Path] = None,
     registry_verified_backups: Optional[Mapping[str, Any]] = None,
     precheck: PrecheckCB = None,
+    delete_instead: DeleteCB = None,
 ) -> CleanSummary:
     """Clean ``items``. ``cancel`` must be thread-safe: it may be called from
     worker threads.
@@ -141,7 +142,8 @@ def clean(
     where the backup files are.
 
     ``precheck`` is passed to :meth:`Engine.clean` (re-verify each path right
-    before it is removed; default None changes nothing).
+    before it is removed; default None changes nothing). ``delete_instead``
+    is passed on too (PATH items deleted, not moved, in a quarantine run).
     """
     from cleanix.core import regclean
 
@@ -191,7 +193,7 @@ def clean(
     result = Engine([]).clean(
         items, dry_run=dry_run, quarantine=quarantine,
         progress=on_progress, cancel=cancel, registry_backup=registry_backup,
-        precheck=precheck,
+        precheck=precheck, delete_instead=delete_instead,
     )
 
     manifest: Optional[str] = None

@@ -21,6 +21,32 @@ from cleanix.core.utils import human_size
 
 # The one place the undo command is spelled (cli.py imports it from here).
 RESTORE_CMD = "cleanix restore"
+
+
+def is_job(item: CleanableItem) -> bool:
+    """A launch job / systemd unit finding: always removed permanently."""
+    from cleanix.core import remedy_exec
+
+    return item.remedy is not None and item.remedy.kind in remedy_exec.KINDS
+
+
+def undo_line(item: CleanableItem, permanent: bool) -> str:
+    """What acting on ``item`` does, by remedy kind (unescaped text)."""
+    if is_job(item):
+        from cleanix.core import quarantine, remedy_exec
+
+        return remedy_exec.planned_text(quarantine.quarantine_root())
+    return ("permanent, no undo" if permanent else
+            f"kept in quarantine; undo with `{RESTORE_CMD}`")
+
+
+def backup_line(run_id: str) -> str:
+    """Where the copies of removed job files are (unescaped text)."""
+    from cleanix.core import quarantine
+
+    return (f"Copies of the removed job/service files are kept in "
+            f"{quarantine.quarantine_root() / run_id / 'files'} for manual "
+            f"recovery; `{RESTORE_CMD}` does not bring them back.")
 PROMPT = "  [d]elete  [s]kip  [g] delete rest of group  [n] skip rest of group  [q]uit  [?] "
 HELP = (
     "  d  delete this item\n"
@@ -39,6 +65,8 @@ class ReviewResult:
     skipped: List[Tuple[CleanableItem, str]] = field(default_factory=list)
     errors: List[CleanOutcome] = field(default_factory=list)
     runs: List[str] = field(default_factory=list)
+    backups: List[str] = field(default_factory=list)  # copy-only runs (jobs)
+    notes: List[Tuple[CleanableItem, str]] = field(default_factory=list)
     undo_errors: List[str] = field(default_factory=list)
     quit: bool = False  # the user answered q
     aborted: bool = False  # Ctrl-C or end of input
@@ -59,12 +87,19 @@ def _record(res: ReviewResult, summary, console) -> None:
     res.errors.extend(summary.errors)
     if summary.quarantine_run:
         res.runs.append(summary.quarantine_run)
+    backup = getattr(summary, "backup_run", None)
+    if backup and backup not in res.backups:
+        res.backups.append(backup)
     if summary.undo_record_error:
         res.undo_errors.append(summary.undo_record_error)
     for item, why in getattr(summary, "skipped", []):
         console.print(f"    [yellow]skipped:[/yellow] {safe(why)}")
     for o in summary.errors:
         console.print(f"    [red]error:[/red] {safe(o.error)}")
+    for o in getattr(getattr(summary, "result", None), "outcomes", None) or []:
+        if getattr(o, "note", None):
+            res.notes.append((o.item, o.note))
+            console.print(f"    [yellow]note:[/yellow] {safe(o.note)}")
     if summary.undo_record_error:
         console.print(f"    [red]{safe(summary.undo_record_error)}[/red]")
     if summary.removed:
@@ -98,8 +133,6 @@ def run(groups: List[findings.FindingGroup],
     ``notes`` are shown before the first prompt and again in the summary."""
     banner = list(notes or [])
     res = ReviewResult()
-    undo = ("permanent, no undo" if permanent else
-            f"kept in quarantine; undo with `{RESTORE_CMD}`")
     # Plan every group up front: nothing is asked before the data is sound.
     plans: Dict[int, Tuple[List[CleanableItem], List[Tuple[CleanableItem, str]],
                            List[CleanableItem]]] = {}
@@ -157,7 +190,7 @@ def run(groups: List[findings.FindingGroup],
             while idx < len(todo):
                 item = todo[idx]
                 kept_copy = findings.survivor_of(item)
-                _describe(console, item, g.category, undo,
+                _describe(console, item, g.category, undo_line(item, permanent),
                           kept_copy.path if kept_copy else None)
                 ans = decide(PROMPT)
                 if ans == "q":
@@ -202,6 +235,12 @@ def _print_summary(res: ReviewResult, console, permanent: bool,
                       "[bold]cleanix quarantine empty[/bold].")
     elif permanent and res.removed:
         console.print("[dim]Deleted permanently; there is no undo.[/dim]")
+    for run_id in res.backups:
+        console.print(f"[cyan]{safe(backup_line(run_id))}[/cyan]")
+    if res.notes:
+        console.print(f"\n[yellow]Notes on {len(res.notes)} item(s):[/yellow]")
+        for i, note in res.notes:
+            console.print(f"  {safe(getattr(i, 'description', ''))}: {safe(note)}")
     if res.skipped:
         console.print(f"\n[yellow]Skipped {len(res.skipped)} item(s):[/yellow]")
         for i, why in res.skipped:

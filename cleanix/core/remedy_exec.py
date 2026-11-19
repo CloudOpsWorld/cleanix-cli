@@ -2,25 +2,28 @@
 
 A ``LAUNCH_JOB`` finding (a plist directly in ``~/Library/LaunchAgents``) or a
 ``SYSTEMD_UNIT`` finding (a ``.service`` file directly in
-``~/.config/systemd/user``) is acted on by :func:`cleanix.core.actions.act`:
+``~/.config/systemd/user``) is acted on by :func:`cleanix.core.actions.act`,
+always permanently (never as an Undo-able quarantine move):
 
 1. :func:`check` re-verifies it (fail closed; see there), up front and again
    right before the file is removed;
-2. :func:`unload` stops it best effort: ``launchctl bootout gui/<uid>/<label>``
-   or ``systemctl --user disable --now <unit>``;
-3. the Engine moves the file into the batch's quarantine run (or, for a
-   permanent run, deletes it after ``actions`` kept a copy), and once per
-   batch :func:`reload_units` runs ``systemctl --user daemon-reload``.
-
-These removals are presented as permanent: a copy of the file is kept for
-manual recovery, but nothing re-loads the job.
+2. ``actions`` keeps a copy of the file in a copy-only backup run
+   (``Quarantine.store_copy``; restore never acts on it);
+3. :func:`unload` stops it best effort: ``launchctl bootout gui/<uid>/<label>``
+   or ``systemctl --user disable [--now] <unit>`` -- unless another job file
+   declares the same label / another unit file has the same name, which a
+   stop by name would hit instead;
+4. the Engine deletes the file, and once per batch :func:`reload_units` runs
+   ``systemctl --user daemon-reload``.
 
 Commands are built only from validated components, as argv lists (never a
 shell string), checked against :data:`MUTATING_COMMANDS` -- a separate
 allowlist from ``orphan_common.READ_ONLY_COMMANDS``, which stays read-only and
 refuses every shape here -- and run through the single injectable
-:data:`runner` (tests replace it; nothing else here starts a process). A
-failing, missing or timed-out command never raises: it becomes a warning.
+:data:`runner` (tests replace it; nothing else here starts a process). The
+default runner uses fixed absolute tool paths where they exist, the C locale
+and no stdin. A failing, missing or timed-out command never raises: it
+becomes a warning.
 """
 
 from __future__ import annotations
@@ -28,12 +31,13 @@ from __future__ import annotations
 import os
 import re
 import stat
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
 
 from cleanix.core import safety
 from cleanix.core.remedy import CHANGED, RemedyKind, verify_path
-from cleanix.core.utils import run_command
+from cleanix.core.utils import which
 
 if TYPE_CHECKING:  # pragma: no cover
     from cleanix.config import Config
@@ -41,6 +45,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 KINDS = frozenset({RemedyKind.LAUNCH_JOB, RemedyKind.SYSTEMD_UNIT})
 COMMAND_TIMEOUT = 30  # seconds per command
+MAX_LABEL_SCAN = 10000  # plists read when looking for another job's label
 
 # The mutating command shapes (verb prefixes). The operands are checked by
 # :func:`argv_allowed`; nothing outside these shapes is ever run from here.
@@ -48,22 +53,38 @@ MUTATING_COMMANDS: frozenset = frozenset(
     {
         ("launchctl", "bootout"),
         ("systemctl", "--user", "disable", "--now"),
+        ("systemctl", "--user", "disable"),  # template units only (no --now)
         ("systemctl", "--user", "daemon-reload"),
     }
 )
+
+# Where the tools live; ``which`` is asked only when none of these exists.
+_TOOL_PATHS = {
+    "env": ("/usr/bin/env", "/bin/env"),
+    "launchctl": ("/bin/launchctl",),
+    "systemctl": ("/usr/bin/systemctl", "/bin/systemctl"),
+}
 
 Runner = Callable[[Sequence[str], int], Tuple[int, str, str]]
 
 _NO_FINGERPRINT = (0, 0, 0, 0)
 _REPARSE = 0x400
 _SERVICE_TARGET = re.compile(r"gui/(0|[1-9][0-9]{0,9})/(.+)")
+# launchctl bootout exit codes taken to mean "no such process" / "could not
+# find service": the job simply was not loaded (a note, not a warning).
+# UNVERIFIED on a real Mac.
+_NOT_LOADED_RC = (3, 113)
 
 NOT_IN_PLACE = "not directly inside {where}; refused"
+LINK_ON_THE_WAY = ("a folder on the way is a link; move/replace it with a real "
+                   "folder or act manually")
 BAD_NAME = "the job's name is not a plain label/unit name; refused"
+APPLE_JOB = "an Apple job (com.apple.*); never touched"
 BAD_DATA = "unexpected remedy data; refused"
 EVIDENCE_GONE = ("the detector no longer reports it as stale (program present, "
                  "file changed or cannot be judged); nothing removed")
 NOT_OWNED = "not owned by your account; refused"
+AS_ROOT = "run without sudo; this acts only on your own account's jobs"
 IS_LINK = "a link, not a job file; not handled here (remove the link by hand)"
 BLOCKED = "blocked by safety guard (protected path)"
 
@@ -85,6 +106,11 @@ def valid_unit(unit: object) -> bool:
     return _ident(unit) and str(unit).endswith(".service") and len(str(unit)) > len(".service")
 
 
+def is_template(unit: str) -> bool:
+    """``foo@.service``: a template, which cannot be started/stopped itself."""
+    return unit.endswith("@.service")
+
+
 # --------------------------------------------------------------- commands
 def bootout_argv(uid: int, label: str) -> List[str]:
     """``launchctl bootout gui/<uid>/<label>`` (the service-target form: a
@@ -97,9 +123,12 @@ def bootout_argv(uid: int, label: str) -> List[str]:
 
 
 def disable_argv(unit: str) -> List[str]:
-    """``systemctl --user disable --now <unit>``."""
+    """``systemctl --user disable --now <unit>`` (no ``--now`` for a
+    template unit, which has nothing to stop)."""
     if not valid_unit(unit):
         raise ValueError("invalid systemd unit name")
+    if is_template(unit):
+        return ["systemctl", "--user", "disable", unit]
     return ["systemctl", "--user", "disable", "--now", unit]
 
 
@@ -120,16 +149,47 @@ def argv_allowed(argv: object) -> bool:
     if a == ("systemctl", "--user", "daemon-reload"):
         return True
     if len(a) == 5 and a[:4] == ("systemctl", "--user", "disable", "--now"):
-        return valid_unit(a[4])
+        return valid_unit(a[4]) and not is_template(a[4])
+    if len(a) == 4 and a[:3] == ("systemctl", "--user", "disable"):
+        return valid_unit(a[3]) and is_template(a[3])
     if len(a) == 3 and a[:2] == ("launchctl", "bootout"):
         m = _SERVICE_TARGET.fullmatch(a[2])
         return bool(m) and valid_label(m.group(2))
     return False
 
 
+def _resolve(name: str) -> Optional[str]:
+    """The tool's fixed absolute path, else ``which`` (None: not installed)."""
+    for p in _TOOL_PATHS.get(name, ()):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return which(name)
+
+
+def _spawn(argv: List[str], timeout: int) -> Tuple[int, str, str]:
+    """Start one process: argv list, no shell, no stdin, a timeout."""
+    try:
+        proc = subprocess.run(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=timeout, check=False,
+        )
+    except FileNotFoundError:
+        return 127, "", f"command not found: {argv[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "", "command timed out"
+    out = (proc.stdout or b"").decode("utf-8", "replace")
+    err = (proc.stderr or b"").decode("utf-8", "replace")
+    return proc.returncode, out, err
+
+
 def default_runner(argv: Sequence[str], timeout: int) -> Tuple[int, str, str]:
-    """Run under the C locale (as ``orphan_common.run``), argv list, timeout."""
-    return run_command(["env", "LC_ALL=C", *argv], timeout)
+    """Run under the C locale (as ``orphan_common.run``) with the tools at
+    fixed absolute paths where they exist."""
+    env = _resolve("env")
+    tool = _resolve(argv[0]) if argv else None
+    if env is None or tool is None:
+        return 127, "", f"command not found: {argv[0] if argv else ''}"
+    return _spawn([env, "LC_ALL=C", tool, *argv[1:]], timeout)
 
 
 # The one injection point for running a command (tests replace it).
@@ -154,18 +214,31 @@ def _clip(text: str) -> str:
     return safe_label(line)[:160]
 
 
-def _step(argv: List[str]) -> List[str]:
-    """Run one best-effort step; [] on success, else one warning line."""
+class Stop:
+    """What a stop attempt did: ``stopped`` (the command succeeded),
+    ``warnings`` (something to look at) and ``info`` (harmless facts)."""
+
+    def __init__(self, stopped: bool = False, warnings: Sequence[str] = (),
+                 info: Sequence[str] = ()):
+        self.stopped = stopped
+        self.warnings = list(warnings)
+        self.info = list(info)
+
+
+def _step(argv: List[str], soft: Sequence[int] = ()) -> Stop:
+    """Run one best-effort step."""
     rc, out, err = run_mutating(argv)
     if rc == 0:
-        return []
+        return Stop(stopped=True)
+    if rc in soft:
+        return Stop(info=["the job was not loaded"])
     detail = {
         124: "timed out",
         126: "refused",
         127: "command not found",
     }.get(rc, f"exit {rc}")
     why = _clip(err) or _clip(out)
-    return [f"{' '.join(argv)} failed ({detail}{': ' + why if why else ''})"]
+    return Stop(warnings=[f"{' '.join(argv)} failed ({detail}{': ' + why if why else ''})"])
 
 
 def _uid() -> Optional[int]:
@@ -174,31 +247,113 @@ def _uid() -> Optional[int]:
     return getuid() if getuid is not None else None
 
 
-def unload(kind: RemedyKind, name: str) -> List[str]:
-    """Stop/disable the job best effort; returns warnings, never raises."""
+def _same(a: object, b: object) -> bool:
+    return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
+
+
+def _label_elsewhere(path: str, label: str) -> Optional[str]:
+    """Why ``bootout`` by ``label`` could hit another job: another plist in
+    the user's, the local or the system LaunchAgents declares the same
+    Label (or a folder/plist there cannot be read). None when clear."""
+    from cleanix.cleaners import orphan_common as oc
+    from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
+
+    load = OrphanLaunchJobReporter._load  # size-capped; uses no instance state
+    root = OrphanLaunchJobReporter.sysroot
+    dirs = [expected_dir(RemedyKind.LAUNCH_JOB),
+            oc.in_root(root, "/Library/LaunchAgents"),
+            oc.in_root(root, "/System/Library/LaunchAgents")]
+    seen = 0
+    for d in dirs:
+        children = oc.list_dir(d)
+        if children is None:
+            return f"could not read {d} to rule out another job with this label; not stopped"
+        for child in children:
+            if child.suffix != ".plist" or _same(child, path):
+                continue
+            seen += 1
+            if seen > MAX_LABEL_SCAN:
+                return "too many job files to rule out another job with this label; not stopped"
+            if os.path.islink(child) and not os.path.exists(child):
+                continue  # a broken link holds no label
+            data = load(None, child)  # type: ignore[arg-type]
+            if data is None or data == "not a valid property list":
+                continue  # launchd cannot load it either
+            if isinstance(data, str):
+                return (f"could not read {child} to rule out another job with this "
+                        "label; not stopped")
+            if data.get("Label") == label:
+                return f"another job uses this label ({child}); not stopped"
+    return None
+
+
+def _unit_elsewhere(name: str) -> Optional[str]:
+    """Why ``disable`` by name could hit another unit file: one with the
+    same name exists in another user-unit directory. None when clear."""
+    from cleanix.cleaners import stale_services
+
+    mine = expected_dir(RemedyKind.SYSTEMD_UNIT)
+    root = stale_services.StaleSystemdUnitReporter.sysroot
+    for d in stale_services.user_lookup_dirs(_home(), root):
+        if _same(d, mine):
+            continue
+        other = Path(d) / name
+        try:
+            os.lstat(other)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return f"could not check {d} for another unit named {name}; not disabled"
+        return f"another unit file with this name exists ({other}); not disabled"
+    return None
+
+
+def unload(kind: RemedyKind, name: str, path: str) -> Stop:
+    """Stop/disable the job best effort; never raises."""
     try:
+        soft: Sequence[int] = ()
         if kind is RemedyKind.LAUNCH_JOB:
             uid = _uid()
             if uid is None:
-                return ["launchctl bootout was not run (user id unknown)"]
+                return Stop(warnings=["launchctl bootout was not run (user id unknown)"])
             argv = bootout_argv(uid, name)
+            clash = _label_elsewhere(path, name)
+            soft = _NOT_LOADED_RC
         elif kind is RemedyKind.SYSTEMD_UNIT:
             argv = disable_argv(name)
+            clash = _unit_elsewhere(name)
         else:
-            return [f"no stop command for {kind}"]
+            return Stop(warnings=[f"no stop command for {kind}"])
     except Exception as exc:  # noqa: BLE001
-        return [f"the job was not stopped ({str(exc) or type(exc).__name__})"]
-    return _step(argv)
+        return Stop(warnings=[f"the job was not stopped ({str(exc) or type(exc).__name__})"])
+    if clash is not None:
+        return Stop(warnings=[clash])
+    return _step(argv, soft)
 
 
 def reload_units() -> List[str]:
     """``systemctl --user daemon-reload`` once; warnings, never raises."""
-    return _step(daemon_reload_argv())
+    return _step(daemon_reload_argv()).warnings
 
 
-def permanent_note(where: object, warnings: Sequence[str] = ()) -> str:
+def planned_text(where: object) -> str:
+    """What acting on a launch job / unit does (preview, prompts, results)."""
+    return (f"permanent: the job is stopped and its file removed (a copy of the "
+            f"file is kept in {where} for manual recovery)")
+
+
+def permanent_note(where: object, stop: Optional[Stop] = None,
+                   extra_warnings: Sequence[str] = ()) -> str:
     """The result text for a removed launch job / unit file."""
-    text = f"permanent (a copy of the file is kept in {where})"
+    stop = stop if stop is not None else Stop(stopped=True)
+    if stop.stopped:
+        text = planned_text(where)
+    else:
+        text = (f"permanent: its file was removed (a copy of the file is kept "
+                f"in {where} for manual recovery)")
+    if stop.info:
+        text += "; " + "; ".join(stop.info)
+    warnings = list(stop.warnings) + list(extra_warnings)
     if warnings:
         text += "; warning: " + "; ".join(warnings)
     return text
@@ -239,7 +394,7 @@ def _placement(path: str, kind: RemedyKind) -> Optional[str]:
     home = os.path.abspath(str(_home()))
     real_expected = os.path.realpath(expected)
     if _norm(real_expected) != _norm(os.path.join(os.path.realpath(home), *_REL[kind])):
-        return where + " (a folder on the way is a link)"
+        return f"{expected}: {LINK_ON_THE_WAY}"
     if _norm(os.path.realpath(parent)) != _norm(real_expected):
         return where
     return None
@@ -269,10 +424,13 @@ def _identity(path: str, fingerprint: object) -> Optional[str]:
 
 
 def _owner(path: str) -> Optional[str]:
-    """POSIX: the file must belong to the account the command acts for."""
+    """POSIX: the file must belong to the account the command acts for, and
+    that account is never root (a sudo run would stop root's jobs)."""
     if os.name == "nt":
         return None
     uid = _uid()
+    if uid == 0:
+        return AS_ROOT
     try:
         st = os.lstat(path)
     except OSError:
@@ -303,13 +461,14 @@ def check(item: "CleanableItem", config: "Config") -> Tuple[Optional[str], Optio
     Fail closed, in order: kind matches the item; remedy data is exactly
     the one name, and that name is valid (no leading ``-``, separators,
     whitespace or control characters; units end in ``.service`` and equal
-    the file name); the file is directly in its kind's user folder (no link
-    on the way); it is a regular file unchanged since the scan (with the
-    ``(0, 0, 0, 0)`` placeholder: a regular file, vouched for by the
-    re-parse below); on POSIX it is owned by this account; the detector's
-    own check, re-run on this file, still reports it with the same name
-    (program still missing; the plist's own Label key, not the caller's
-    claim); and the deletion guard allows it.
+    the file name); never an Apple job (``com.apple.*`` file or label, as
+    the scan refuses); the file is directly in its kind's user folder (no
+    link on the way); it is a regular file unchanged since the scan (with
+    the ``(0, 0, 0, 0)`` placeholder: a regular file, vouched for by the
+    re-parse below); on POSIX it is owned by this (non-root) account; the
+    detector's own check, re-run on this file, still reports it with the
+    same name (program still missing; the plist's own Label key, not the
+    caller's claim); and the deletion guard allows it.
     """
     from cleanix.core.models import ItemKind
 
@@ -330,6 +489,8 @@ def check(item: "CleanableItem", config: "Config") -> Tuple[Optional[str], Optio
         if (not valid_label(name) or not base.endswith(".plist")
                 or any(c in base for c in ("\n", "\r", "\0"))):
             return BAD_NAME, None
+        if base.startswith("com.apple.") or name.startswith("com.apple."):
+            return APPLE_JOB, None
     elif not valid_unit(name) or base != name:
         return BAD_NAME, None
     why = _placement(path, kind)
