@@ -510,7 +510,7 @@ def test_winreg_imported_only_in_backend_module():
         for p in (REPO / "cleanix").rglob("*.py")
         if pat.search(p.read_text(encoding="utf-8"))
     ]
-    assert set(hits) <= {"cleanix/core/winregistry_win.py"}
+    assert set(hits) == {"cleanix/core/winregistry_win.py"}
 
 
 # -- fix round 1 -------------------------------------------------------------
