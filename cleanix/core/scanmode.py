@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import threading
 from typing import Iterator
 
 _helper: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -18,8 +19,33 @@ _helper: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 
+_process_lock = threading.Lock()
+_process_flag = False
+
+
+def enable_process_helper_mode() -> None:
+    """Mark this whole process as a single-purpose helper (set once at startup).
+
+    Visible from every thread, including ones started outside any copied
+    context (GUI workers, foreign pools). Never reset in production."""
+    global _process_flag
+    with _process_lock:
+        _process_flag = True
+
+
+def process_helper_mode_enabled() -> bool:
+    with _process_lock:
+        return _process_flag
+
+
+def _reset_for_tests() -> None:
+    global _process_flag
+    with _process_lock:
+        _process_flag = False
+
+
 def is_helper_mode() -> bool:
-    return _helper.get()
+    return _helper.get() or process_helper_mode_enabled()
 
 
 def set_helper_mode(value: bool) -> None:

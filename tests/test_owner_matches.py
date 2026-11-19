@@ -108,7 +108,145 @@ def test_scanmode_restored_on_exception():
     assert scanmode.is_helper_mode() is False
 
 
-def test_set_helper_mode_is_context_local():
+@pytest.fixture(autouse=True)
+def _no_process_flag_leak():
+    scanmode._reset_for_tests()
+    yield
+    scanmode._reset_for_tests()
+
+
+def test_process_flag_visible_in_plain_threads_and_pools():
+    from concurrent.futures import ThreadPoolExecutor
+
+    assert scanmode.process_helper_mode_enabled() is False
+    scanmode.enable_process_helper_mode()
+    assert scanmode.process_helper_mode_enabled() is True
+    seen = []
+    t = threading.Thread(target=lambda: seen.append(scanmode.is_helper_mode()))
+    t.start()
+    t.join()
+    with ThreadPoolExecutor(2) as pool:  # no context copy
+        seen.append(pool.submit(scanmode.is_helper_mode).result())
+    assert seen == [True, True]
+    scanmode._reset_for_tests()
+    assert scanmode.is_helper_mode() is False
+
+
+def test_contextvar_alone_is_not_visible_in_plain_threads():
+    from concurrent.futures import ThreadPoolExecutor
+
+    with scanmode.helper_mode():
+        with ThreadPoolExecutor(1) as pool:
+            assert pool.submit(scanmode.is_helper_mode).result() is False
+        assert scanmode.is_helper_mode() is True
+
+
+class _Probe:
+    """Engine-compatible cleaner recording what its worker thread sees."""
+
+    def __init__(self, i, sink):
+        self.name = f"probe{i}"
+        self.id = self.name
+        self.sink = sink
+
+    def scan(self):
+        from cleanix.core.models import CleanerReport
+
+        self.sink.append((scanmode.is_helper_mode(), regtargets.scan_owner_matches()))
+        return CleanerReport(self.id, self.name, "")
+
+
+@pytest.mark.parametrize("parallel", [True, False])
+def test_engine_workers_see_helper_mode(env, parallel):
+    from cleanix.core.engine import Engine
+
+    sink = []
+    eng = Engine([_Probe(i, sink) for i in range(6)])
+    with scanmode.helper_mode():
+        eng.scan(parallel=parallel)
+    assert sink == [(True, False)] * 6
+    sink.clear()
+    eng.scan(parallel=parallel)
+    assert sink == [(False, True)] * 6
+
+
+def test_engine_detector_context_in_workers(env, captured):
+    from cleanix.core.engine import Engine
+
+    flags = []
+
+    class Det(WinRegAppPaths):
+        def find_items(self):
+            flags.append(self.context().owner_matches)
+            return iter(())
+
+    eng = Engine([Det(Config()) for _ in range(4)])
+    with scanmode.helper_mode():
+        eng.scan(parallel=True)
+    assert flags == [False] * 4
+
+
+def test_engine_scans_from_different_threads_are_isolated(env):
+    from cleanix.core.engine import Engine
+
+    results = {}
+    barrier = threading.Barrier(2)
+
+    def run(name, helper):
+        sink = []
+        eng = Engine([_Probe(i, sink) for i in range(4)])
+        barrier.wait(5)
+        with scanmode.helper_mode(helper):
+            eng.scan(parallel=True)
+        results[name] = set(sink)
+
+    ts = [
+        threading.Thread(target=run, args=("h", True)),
+        threading.Thread(target=run, args=("n", False)),
+    ]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert results == {"h": {(True, False)}, "n": {(False, True)}}
+
+
+def test_engine_propagates_use_user(monkeypatch):
+    from cleanix.core.engine import Engine
+
+    seen = []
+
+    class P(_Probe):
+        def scan(self):
+            seen.append(context.current_user())
+            return super().scan()
+
+    sink = []
+    with context.use_user(OTHER):
+        Engine([P(i, sink) for i in range(3)]).scan(parallel=True)
+    assert seen == [OTHER] * 3
+
+
+def test_default_context_passes_owner_matches_through():
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("default_context needs Windows")
+    assert regtargets.default_context(owner_matches=False).owner_matches is False
+    assert regtargets.default_context(owner_matches=True).owner_matches is True
+    assert regtargets.default_context().owner_matches is True
+
+
+def test_invoker_flag_alone_is_not_enough(env):
+    impostor = TargetUser("me2", Path("C:/Users/me2"), 1002, 1002, True)
+    env.setattr(context, "current_user", lambda: impostor)
+    assert regtargets.scan_owner_matches() is False
+
+
+def test_contextvar_is_per_context_not_per_process_engine_copies_it():
+    # A plain thread starts with an empty context, so set_helper_mode there
+    # does not leak; engine workers see the caller's value only because the
+    # engine runs them through contextvars.copy_context().
     seen = {}
 
     def worker():

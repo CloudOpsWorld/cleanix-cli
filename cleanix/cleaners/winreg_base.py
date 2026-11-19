@@ -15,11 +15,10 @@ from dataclasses import dataclass
 from typing import Iterable, Iterator, List, Optional
 
 from cleanix.cleaners.base import SCOPE_SYSTEM, Cleaner
-from cleanix.core import regsnap, winregistry
+from cleanix.core import regsnap, regtargets, winregistry
 from cleanix.core.models import CleanableItem, CleanerReport, ItemKind, RegTarget
 from cleanix.core.platform import WINDOWS
 from cleanix.core.regsafety import Container, check_target, containers_for
-from cleanix.core import regtargets
 from cleanix.core.regtargets import DetectorContext, default_context
 from cleanix.core.winregistry import RegistryBackend, RegistryError, RegValue
 
