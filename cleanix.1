@@ -121,7 +121,7 @@ with \-\-act\-on: delete instead of quarantining (no undo)
 .B \-\-profile
 preset bundle of opt\-in settings: 'safe' disables aggressive cleaners, 'aggressive' enables offline\-repo/backup/locale/all\-image pruning (never volumes)
 .SS review
-walk findings one item at a time and choose what to delete (interactive)
+walk findings one item at a time and choose what to delete (interactive; exit 0 done or q, 1 interrupted/EOF, 2 errors or no terminal)
 .TP
 .B \-h, \-\-help
 show this help message and exit
@@ -130,7 +130,7 @@ show this help message and exit
 finding ids or category names to review (default: every findings scenario that applies to this system)
 .TP
 .B \-\-keep
-which copy of each duplicate group stays (required to review duplicates)
+which copy of each duplicate group stays (required when you name duplicates; without it a plain `review` skips duplicates)
 .TP
 .B \-\-permanent
 delete instead of quarantining (no undo)

@@ -14,10 +14,12 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from cleanix.core import findings
+from cleanix.core.curation import safety_of
 from cleanix.core.models import CleanableItem, CleanOutcome
 from cleanix.core.report import safe
 from cleanix.core.utils import human_size
 
+# The one place the undo command is spelled (cli.py imports it from here).
 RESTORE_CMD = "cleanix restore"
 PROMPT = "  [d]elete  [s]kip  [g] delete rest of group  [n] skip rest of group  [q]uit  [?] "
 HELP = (
@@ -75,8 +77,8 @@ def _describe(console, item: CleanableItem, category: str, undo: str,
     console.print(f"\n[bold]{safe(item.description)}[/bold]")
     console.print(f"  path:    {safe(item.path or '')}")
     console.print(f"  size:    {human_size(item.size)}")
-    console.print(f"  kind:    {safe(category)}; safety: review it first, "
-                  "nothing is removed unless you say so")
+    console.print(f"  kind:    {safe(category)}; "
+                  f"safety: {safe(safety_of(item, None).value)}")
     if item.hint:
         console.print(f"  hint:    {safe(item.hint)}")
     if survivor is not None:
@@ -89,9 +91,12 @@ def run(groups: List[findings.FindingGroup],
         act: Callable[[List[CleanableItem]], object],
         console,
         *, keep: Optional[str] = None,
-        permanent: bool = False) -> ReviewResult:
+        permanent: bool = False,
+        notes: Optional[List[str]] = None) -> ReviewResult:
     """Walk ``groups`` asking about every item; apply each decision with
-    ``act`` at once. Returns what was done (also printed as a summary)."""
+    ``act`` at once. Returns what was done (also printed as a summary).
+    ``notes`` are shown before the first prompt and again in the summary."""
+    banner = list(notes or [])
     res = ReviewResult()
     undo = ("permanent, no undo" if permanent else
             f"kept in quarantine; undo with `{RESTORE_CMD}`")
@@ -132,6 +137,8 @@ def run(groups: List[findings.FindingGroup],
                 console.print(f"  [yellow]Not understood: {safe(raw)!s}. "
                               "Press ? for help.[/yellow]")
 
+    for n in banner:
+        console.print(f"[yellow]{safe(n)}[/yellow]")
     try:
         last_cat = None
         for gi, g in enumerate(groups):
@@ -170,11 +177,12 @@ def run(groups: List[findings.FindingGroup],
                     break
     except _Stop:
         pass
-    _print_summary(res, console, permanent)
+    _print_summary(res, console, permanent, banner)
     return res
 
 
-def _print_summary(res: ReviewResult, console, permanent: bool) -> None:
+def _print_summary(res: ReviewResult, console, permanent: bool,
+                   notes: List[str]) -> None:
     console.print()
     if res.aborted:
         console.print("[yellow]Review interrupted; summary of what was "
@@ -203,5 +211,7 @@ def _print_summary(res: ReviewResult, console, permanent: bool) -> None:
         for o in res.errors:
             console.print(f"  [red]![/red] {safe(o.item.description)}: "
                           f"{safe(o.error)}")
+    for n in notes:
+        console.print(f"[yellow]{safe(n)}[/yellow]")
     for e in res.undo_errors:
         console.print(f"[red]{safe(e)}[/red]")

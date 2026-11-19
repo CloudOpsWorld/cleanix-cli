@@ -305,8 +305,7 @@ def test_review_duplicates_require_keep(tmp_path, monkeypatch, capsys):
     code, out, ask = _cli(monkeypatch, capsys, ["d"], "duplicates")
     assert code == 2 and "--keep" in out and ask.asked == []
     assert all(p.exists() for p in paths)
-    # also when found via a no-argument review
-    code, out, ask = _cli(monkeypatch, capsys, ["d"])
+    code, out, ask = _cli(monkeypatch, capsys, ["d"], "Your files")
     assert code == 2 and "--keep" in out and ask.asked == []
     code, out, ask = _cli(monkeypatch, capsys, ["d"], "duplicates", "--keep", "oldest")
     assert code == 0 and paths[0].exists() and not paths[1].exists()
@@ -332,3 +331,68 @@ def test_review_permanent_wording(tmp_path, monkeypatch, capsys):
 def test_completion_mentions_review():
     for shell in ("bash", "zsh", "fish"):
         assert "review" in completion.generate(shell)
+
+
+def test_review_no_args_skips_duplicates_without_keep(tmp_path, monkeypatch, capsys):
+    paths, dups = _dups(tmp_path)
+    other = _file(tmp_path, "other.bin", b"other")
+    _patch_scan(monkeypatch, dups + [_finding(other)])
+    code, out, ask = _cli(monkeypatch, capsys, ["d", "d"])
+    assert code == 0 and len(ask.asked) == 1 and not other.exists()
+    assert all(p.exists() for p in paths)
+    assert out.count("duplicates skipped: pass --keep") == 2  # start + summary
+    # only duplicates found: note, nothing prompted, not an error
+    _patch_scan(monkeypatch, dups)
+    code, out, ask = _cli(monkeypatch, capsys, [])
+    assert code == 0 and ask.asked == [] and "duplicates skipped" in out
+
+
+def test_review_named_duplicates_without_keep_exits_before_scan(
+        tmp_path, monkeypatch, capsys):
+    _, dups = _dups(tmp_path)
+    calls = _patch_scan(monkeypatch, dups)
+    code, out, _ = _cli(monkeypatch, capsys, [], "duplicates")
+    assert code == 2 and calls == []
+
+
+def test_review_no_args_with_keep_reviews_duplicates(tmp_path, monkeypatch, capsys):
+    paths, dups = _dups(tmp_path)
+    _patch_scan(monkeypatch, dups)
+    code, out, ask = _cli(monkeypatch, capsys, ["d"], "--keep", "oldest")
+    assert code == 0 and len(ask.asked) == 1
+    assert paths[0].exists() and not paths[1].exists()
+    assert "duplicates skipped" not in out
+
+
+def test_review_uppercase_and_padded_keys(tmp_path):
+    a, b = _file(tmp_path, "a.bin", b"a"), _file(tmp_path, "b.bin", b"b")
+    res = review.run(_groups([_finding(a), _finding(b)]),
+                     _script(["  D ", " G"]), _act(), _console())
+    assert res.removed == 2 and not a.exists() and not b.exists()
+
+
+def test_review_g_after_s_on_duplicates_spares_skipped_and_survivor(tmp_path):
+    paths, items = _dups(tmp_path, n=4, data=b"q" * 7000)
+    ask = _script(["s", "g"])  # survivor = paths[0]; copy1 skipped, 2+3 deleted
+    res = review.run(_groups(items), ask, _act(), _console(), keep="oldest")
+    assert paths[0].exists() and paths[1].exists()
+    assert not paths[2].exists() and not paths[3].exists()
+    assert res.removed == 2 and res.declined == 1
+
+
+def test_review_individual_deletes_of_all_copies_keep_survivor(tmp_path):
+    paths, items = _dups(tmp_path, n=3, data=b"r" * 7000)
+    ask = _script(["d", "d"])
+    res = review.run(_groups(items), ask, _act(), _console(), keep="oldest")
+    assert len(ask.asked) == 2 and res.removed == 2 and len(res.runs) == 2
+    assert paths[0].exists() and not paths[1].exists() and not paths[2].exists()
+
+
+def test_review_shows_real_safety_level(tmp_path):
+    c = _console()
+    review.run(_groups([_finding(_file(tmp_path))]), _script(["s"]), _act(), c)
+    assert "safety: Review" in _text(c)
+
+
+def test_restore_cmd_single_definition():
+    assert cli.RESTORE_CMD is review.RESTORE_CMD

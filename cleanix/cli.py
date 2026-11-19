@@ -25,6 +25,7 @@ from cleanix.config import Config
 from cleanix.core.engine import Engine
 from cleanix.core.models import ItemKind, ScanResult, _visible, item_target
 from cleanix.core.registry import build_cleaners, describe_all, unknown_ids
+from cleanix.core.review import RESTORE_CMD
 from cleanix.core.report import (
     registry_items,
     registry_notice,
@@ -486,7 +487,6 @@ _ACT_ON_CONFLICTS = (
     ("min_size", "--min-size"),
 )
 _BLANKET_WORDS = ("all", "*", "everything")
-RESTORE_CMD = "cleanix restore"
 
 
 def _resolve_act_scenarios(raw: str, config: Config, flag: str = "--act-on"):
@@ -755,12 +755,23 @@ def cmd_review(args: argparse.Namespace, console: Console) -> int:
     if not groups:
         console.print("[green]Nothing found to review.[/green]")
         return 0
-    has_dups = any(i.remedy is not None and i.remedy.group
-                   for g in groups for i in g.items if not i.requires_root)
-    if has_dups and not keep:
-        return _act_error(
-            console, f"duplicate findings need --keep ({keep_help}) to choose "
-            "which copy stays")
+    notes: List[str] = []
+    if not keep:
+        # Only reachable without named scenarios (naming duplicates without
+        # --keep was refused above): skip duplicate groups, say so.
+        def _is_dup(i) -> bool:
+            return i.remedy is not None and bool(i.remedy.group)
+
+        if any(_is_dup(i) for g in groups for i in g.items):
+            notes.append("duplicates skipped: pass --keep "
+                         f"{keep_help} to review them")
+            for g in groups:
+                g.items = [i for i in g.items if not _is_dup(i)]
+            groups = [g for g in groups if g.items]
+            if not groups:
+                console.print(f"[yellow]{safe(notes[0])}[/yellow]")
+                console.print("[green]Nothing else found to review.[/green]")
+                return 0
 
     def ask(prompt: str) -> str:
         return input(prompt)
@@ -768,7 +779,8 @@ def cmd_review(args: argparse.Namespace, console: Console) -> int:
     def act(items):
         return service.act(items, config, dry_run=False, permanent=permanent)
 
-    res = review.run(groups, ask, act, console, keep=keep, permanent=permanent)
+    res = review.run(groups, ask, act, console, keep=keep, permanent=permanent,
+                     notes=notes)
     if res.failed:
         return 2
     return 1 if res.aborted else 0
@@ -1671,7 +1683,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_review = sub.add_parser(
         "review",
         help="walk findings one item at a time and choose what to delete "
-        "(interactive)",
+        "(interactive; exit 0 done or q, 1 interrupted/EOF, 2 errors or "
+        "no terminal)",
     )
     p_review.add_argument(
         "targets",
@@ -1684,8 +1697,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep",
         choices=["oldest", "newest", "shortest-path"],
         default=None,
-        help="which copy of each duplicate group stays (required to review "
-        "duplicates)",
+        help="which copy of each duplicate group stays (required when you "
+        "name duplicates; without it a plain `review` skips duplicates)",
     )
     p_review.add_argument(
         "--permanent",
