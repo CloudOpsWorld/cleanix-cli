@@ -489,7 +489,7 @@ _BLANKET_WORDS = ("all", "*", "everything")
 RESTORE_CMD = "cleanix restore"
 
 
-def _resolve_act_scenarios(raw: str, config: Config):
+def _resolve_act_scenarios(raw: str, config: Config, flag: str = "--act-on"):
     """Turn the --act-on value into cleaner ids: (ids, None) or (None, error).
 
     Accepts finding cleaner ids and finding category names (case-insensitive;
@@ -499,7 +499,7 @@ def _resolve_act_scenarios(raw: str, config: Config):
 
     tokens = [t.strip() for t in raw.split(",")]
     if not raw.strip() or any(not t for t in tokens):
-        return None, ("--act-on needs scenario ids or category names "
+        return None, (f"{flag} needs scenario ids or category names "
                       "(empty entries are not allowed)")
     categories = {c.lower(): c for c in findings.CATEGORY_ORDER}
     finding_ids = {k.lower(): k for k in findings.FINDING_CATEGORIES}
@@ -508,7 +508,7 @@ def _resolve_act_scenarios(raw: str, config: Config):
     for tok in tokens:
         low = tok.lower()
         if low in _BLANKET_WORDS:
-            return None, (f"--act-on does not accept {tok!r}: name the scenarios "
+            return None, (f"{flag} does not accept {tok!r}: name the scenarios "
                           "or categories explicitly (see `cleanix list`)")
         cat = categories.get(low)
         if cat is not None:
@@ -528,7 +528,7 @@ def _resolve_act_scenarios(raw: str, config: Config):
                           + ", ".join(findings.CATEGORY_ORDER[:-1]))
         else:
             return None, (f"{tok!r} is not a findings scenario: it is an "
-                          "ordinary cleaner (use --only without --act-on)")
+                          f"ordinary cleaner (use --only without {flag})")
         for cid in new:
             if cid not in ids:
                 ids.append(cid)
@@ -710,6 +710,68 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
     # Same convention as plain `clean`: 2 on real errors, 1 only for a user
     # abort (above), 0 for success (skips are not failures).
     return 2 if summary.errors or summary.undo_record_error else 0
+
+
+def cmd_review(args: argparse.Namespace, console: Console) -> int:
+    """`review`: walk findings one item at a time; delete only on an explicit
+    `d` (or `g`) per item. Needs a terminal."""
+    from cleanix.core import findings, review, service
+
+    config = _load_config()
+    targets = list(getattr(args, "targets", None) or [])
+    keep = getattr(args, "keep", None)
+    keep_help = "|".join(findings.KEEP_POLICIES)
+    if targets:
+        ids, err = _resolve_act_scenarios(",".join(targets), config, "review")
+        if err:
+            return _act_error(console, err)
+        if keep and "duplicates" not in ids:
+            return _act_error(
+                console, "--keep only applies to the duplicates scenario; "
+                "add duplicates to the review or drop --keep")
+        if "duplicates" in ids and not keep:
+            return _act_error(
+                console, f"the duplicates scenario needs --keep ({keep_help}) "
+                "to choose which copy stays")
+    else:
+        applicable = {cid for cid, c in describe_all(config).items()
+                      if c.supported()}
+        ids = [cid for cid in findings.FINDING_CATEGORIES if cid in applicable]
+        if not ids:
+            console.print("No findings scenario applies to this system.")
+            return 0
+    permanent = bool(getattr(args, "permanent", False))
+    if not _stdin_is_tty():
+        return _act_error(
+            console, "review is interactive and needs a terminal; run it in "
+            "one (or use `clean --act-on` with --execute). Nothing was changed.")
+
+    _configure_scope(args)
+    engine = _make_engine(config, ids, None)
+    _scope_note(console)
+    scan = _scan(engine, console)
+    groups = findings.group_findings(scan)
+    groups = [g for g in groups if any(not i.requires_root for i in g.items)]
+    if not groups:
+        console.print("[green]Nothing found to review.[/green]")
+        return 0
+    has_dups = any(i.remedy is not None and i.remedy.group
+                   for g in groups for i in g.items if not i.requires_root)
+    if has_dups and not keep:
+        return _act_error(
+            console, f"duplicate findings need --keep ({keep_help}) to choose "
+            "which copy stays")
+
+    def ask(prompt: str) -> str:
+        return input(prompt)
+
+    def act(items):
+        return service.act(items, config, dry_run=False, permanent=permanent)
+
+    res = review.run(groups, ask, act, console, keep=keep, permanent=permanent)
+    if res.failed:
+        return 2
+    return 1 if res.aborted else 0
 
 
 def cmd_clean(args: argparse.Namespace, console: Console) -> int:
@@ -1605,6 +1667,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_profile(p_clean)
     p_clean.set_defaults(func=cmd_clean)
+
+    p_review = sub.add_parser(
+        "review",
+        help="walk findings one item at a time and choose what to delete "
+        "(interactive)",
+    )
+    p_review.add_argument(
+        "targets",
+        nargs="*",
+        metavar="IDS_OR_CATEGORIES",
+        help="finding ids or category names to review (default: every "
+        "findings scenario that applies to this system)",
+    )
+    p_review.add_argument(
+        "--keep",
+        choices=["oldest", "newest", "shortest-path"],
+        default=None,
+        help="which copy of each duplicate group stays (required to review "
+        "duplicates)",
+    )
+    p_review.add_argument(
+        "--permanent",
+        action="store_true",
+        help="delete instead of quarantining (no undo)",
+    )
+    p_review.set_defaults(func=cmd_review)
 
     p_explain = sub.add_parser(
         "explain", help="show exactly what one cleaner would consider (read-only)"

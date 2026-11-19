@@ -7,10 +7,11 @@ baked in, so completion always matches this build.
 from __future__ import annotations
 
 from cleanix.config import field_names
+from cleanix.core.findings import FINDING_CATEGORIES
 from cleanix.core.registry import known_ids
 
 SUBCOMMANDS = [
-    "list", "scan", "clean", "info", "stats", "restore", "quarantine",
+    "list", "scan", "clean", "review", "info", "stats", "restore", "quarantine",
     "config", "schedule", "factory-reset", "completion", "gui",
 ]
 SCAN_CLEAN_OPTS = [
@@ -23,6 +24,10 @@ SCAN_CLEAN_OPTS = [
 
 def _ids() -> str:
     return " ".join(known_ids())
+
+
+def _finding_ids() -> str:
+    return " ".join(FINDING_CATEGORIES)
 
 
 def _keys() -> str:
@@ -39,6 +44,7 @@ _cleanix() {{
     local sub="{' '.join(SUBCOMMANDS)}"
     local cleaners="{_ids()}"
     local cfgkeys="{_keys()}"
+    local findingids="{_finding_ids()}"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$sub" -- "$cur") ); return
@@ -58,6 +64,8 @@ _cleanix() {{
             else
                 COMPREPLY=( $(compgen -W "$cfgkeys" -- "$cur") )
             fi;;
+        review)
+            COMPREPLY=( $(compgen -W "$findingids --keep --permanent" -- "$cur") );;
         quarantine)
             COMPREPLY=( $(compgen -W "list empty" -- "$cur") );;
         restore)
@@ -97,6 +105,7 @@ _cleanix() {{
         config)
             if (( CURRENT == 3 )); then _values 'action' list get set unset path
             else _values 'key' $cfgkeys; fi;;
+        review) _values 'option' {_finding_ids()} --keep --permanent;;
         quarantine) _values 'action' list empty;;
         restore) _values 'option' --yes;;
         schedule) _values 'action' install uninstall status;;
@@ -123,8 +132,16 @@ def fish_script() -> str:
             f'-l {opt.lstrip("-")} -a "{_ids()}"'
         )
     lines.append(
-        'complete -c cleanix -n "__fish_seen_subcommand_from clean" '
+        'complete -c cleanix -n "__fish_seen_subcommand_from clean review" '
         '-l keep -a "oldest newest shortest-path"'
+    )
+    lines.append(
+        'complete -c cleanix -n "__fish_seen_subcommand_from review" '
+        f'-a "{_finding_ids()}"'
+    )
+    lines.append(
+        'complete -c cleanix -n "__fish_seen_subcommand_from review" '
+        '-l permanent'
     )
     lines.append(
         'complete -c cleanix -n "__fish_seen_subcommand_from config" '
