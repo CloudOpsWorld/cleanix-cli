@@ -28,10 +28,11 @@ def make(env, rel, *, is_dir=True, size=0):
 
 
 def setup(env, monkeypatch, *, owned=(), installed=("bash",),
-          passwd="root:x:0:0\n", installed_ok=True, query_rc=None):
+          passwd="root:x:0:0\n", installed_ok=True, query_rc=None,
+          backend="dpkg"):
     """Fake dpkg: paths in ``owned`` are owned, every other queried one is not."""
-    monkeypatch.setattr(oc.OrphanReporter, "pkg_backend", lambda self: "dpkg")
-    env.cmds.tools = {"dpkg-query"}
+    monkeypatch.setattr(oc.OrphanReporter, "pkg_backend", lambda self: backend)
+    env.cmds.tools = {"dpkg-query", "rpm", "pacman"}
     if passwd is not None:
         make(env, "/etc")
         (env.root / "etc" / "passwd").write_text(passwd)
@@ -59,6 +60,26 @@ def setup(env, monkeypatch, *, owned=(), installed=("bash",),
                 else:
                     err.append(f"dpkg-query: no path found matching pattern {p}")
             return (1 if err else 0), "\n".join(out), "\n".join(err)
+        if argv[:2] in (["rpm", "-qa"], ["pacman", "-Qq"]):
+            if not installed_ok:
+                return 1, "", "failed"
+            return 0, "".join(f"{n}\n" for n in installed), ""
+        if argv[:2] == ["rpm", "-qf"]:
+            ps = argv[2:]
+            queried.extend(ps)
+            batches.append(ps)
+            bad = [p for p in ps if p not in owned]
+            out = [f"file {p} is not owned by any package" if p in bad
+                   else "somepkg-1.0-1" for p in ps]
+            return len(bad), "\n".join(out), ""
+        if argv[:2] == ["pacman", "-Qo"]:
+            ps = argv[2:]
+            queried.extend(ps)
+            batches.append(ps)
+            bad = [p for p in ps if p not in owned]
+            err = [f"error: No package owns {p}" for p in bad]
+            out = [f"{p} is owned by somepkg 1.0-1" for p in ps if p in owned]
+            return (1 if bad else 0), "\n".join(out), "\n".join(err)
         return 127, "", "not found"
 
     monkeypatch.setattr(oc, "run_command", fake)
@@ -192,7 +213,7 @@ def test_usr_local_depth_two(orphan_env, monkeypatch):
     ]
     for i in r.items:
         assert i.description.startswith("Installed outside the package manager: ")
-        assert "make install" in i.hint and "pip" in i.hint
+        assert "make install" in i.hint and "pip" not in i.hint
 
 
 def test_unknown_ownership_reports_nothing(orphan_env, monkeypatch):
@@ -278,3 +299,125 @@ def test_budget_caps_items(orphan_env, monkeypatch):
     assert len(real) == 2
     assert len(r.items) == 3
     assert "Scan stopped early" in r.items[-1].description
+
+
+def test_usr_local_python_dirs_skipped(orphan_env, monkeypatch):
+    setup(orphan_env, monkeypatch)
+    for d in ("python3.12/dist-packages", "python3/site-packages", "python2.7",
+              "site_python", "dist-packages", "site-packages"):
+        make(orphan_env, f"/usr/local/lib/{d}")
+    make(orphan_env, "/usr/local/lib64/python3.12")
+    make(orphan_env, "/usr/local/share/zoneinfo")
+    make(orphan_env, "/usr/local/lib/node_modules")
+    make(orphan_env, "/usr/local/lib/mylib.so", is_dir=False, size=5)
+    assert paths(scan(orphan_env), orphan_env) == [
+        "/usr/local/lib/mylib.so", "/usr/local/lib/node_modules",
+    ]
+
+
+def test_vendor_parent_with_owned_child_not_reported(orphan_env, monkeypatch):
+    # rpm-style: only /opt/vendor/app is owned, /opt/vendor is not
+    setup(orphan_env, monkeypatch, backend="rpm", owned={"/opt/vendor/app"})
+    make(orphan_env, "/opt/vendor/app")
+    make(orphan_env, "/opt/vendor/other")
+    make(orphan_env, "/opt/stale/leftover")
+    make(orphan_env, "/opt/empty")
+    r = scan(orphan_env)
+    assert paths(r, orphan_env) == ["/opt/empty", "/opt/stale"]
+    assert "rpm -qf /opt/stale" in [i for i in r.items if i.path.endswith("stale")][0].hint
+    assert len(orphan_env.batches) == 1  # probes ride in the same batch
+
+
+def test_vendor_probe_checks_at_most_five_children(orphan_env, monkeypatch):
+    setup(orphan_env, monkeypatch)
+    for n in range(9):
+        make(orphan_env, f"/opt/big/c{n}")
+    scan(orphan_env)
+    probed = [q for q in orphan_env.queried if q.startswith("/opt/big/")]
+    assert len(probed) == 5
+
+
+def test_pacman_path(orphan_env, monkeypatch):
+    setup(orphan_env, monkeypatch, backend="pacman", owned={"/opt/google"})
+    make(orphan_env, "/opt/google")
+    make(orphan_env, "/opt/oldapp")
+    (it,) = scan(orphan_env).items
+    assert it.path.endswith("oldapp") and "pacman -Qo /opt/oldapp" in it.hint
+
+
+def test_symmetric_name_matching():
+    ev = oc_ev(["bolt", "bluez", "power-profiles-daemon", "ab", "NetworkManager"])
+    assert ev.matches("boltd") and ev.matches("bolt")
+    assert ev.matches("power-profiles") and ev.matches("networkmanager")
+    assert not ev.matches("abc") and not ev.matches("bol")
+    assert not ev.matches("zzzgenuine")
+
+
+def oc_ev(names):
+    from cleanix.cleaners.orphan_files import NameEvidence
+
+    return NameEvidence(names)
+
+
+def test_name_matching_is_fast():
+    import time
+
+    ev = oc_ev([f"package-{i}-lib" for i in range(4000)])
+    t = time.perf_counter()
+    for i in range(500):
+        ev.matches(f"leftover-name-{i}")
+    assert time.perf_counter() - t < 0.5
+
+
+def test_new_var_lib_skip_entries(orphan_env, monkeypatch):
+    setup(orphan_env, monkeypatch)
+    for d in ("bluetooth", "boltd", "rpm-state", "shells.state", "swcatalog",
+              "cups", "sddm", "gdm", "lightdm", "AccountsService", "fwupd",
+              "PackageKit", "NetworkManager", "polkit-1", "ModemManager",
+              "upower", "geoclue", "power-profiles-daemon", "plymouth", "ucf",
+              "cloud"):
+        make(orphan_env, f"/var/lib/{d}")
+    make(orphan_env, "/var/lib/zzzgenuine")
+    assert paths(scan(orphan_env), orphan_env) == ["/var/lib/zzzgenuine"]
+
+
+@posix_only
+def test_symlink_findings_take_budget_not_notes(orphan_env, monkeypatch, tmp_path):
+    setup(orphan_env, monkeypatch, installed_ok=False)
+    make(orphan_env, "/opt")
+    make(orphan_env, "/var/lib/x")
+    for n in range(40):
+        (orphan_env.root / "opt" / f"l{n}").symlink_to(tmp_path)
+    r = scan(orphan_env, orphan_max_items=10)
+    links = [i for i in r.items if i.description.startswith("Not from any")]
+    assert len(links) == 10 and all(i.size == 0 for i in links)
+    assert any("Not checked: /var/lib" in i.description for i in r.items)
+    assert any("Scan stopped early" in i.description for i in r.items)
+
+
+@posix_only
+def test_symlinked_standard_dir_and_root_not_followed(orphan_env, monkeypatch, tmp_path):
+    setup(orphan_env, monkeypatch)
+    real = tmp_path / "realbin"
+    (real / "tool").mkdir(parents=True)
+    make(orphan_env, "/usr/local")
+    (orphan_env.root / "usr" / "local" / "bin").symlink_to(real)
+    assert scan(orphan_env).items == []
+    # Silverblue-style: /usr/local itself is a symlink
+    import shutil
+
+    shutil.rmtree(orphan_env.root / "usr" / "local")
+    (orphan_env.root / "usr" / "local").symlink_to(real)
+    assert scan(orphan_env).items == []
+
+
+def test_each_root_listed_once(orphan_env, monkeypatch):
+    setup(orphan_env, monkeypatch)
+    make(orphan_env, "/var/lib/zzz")
+    make(orphan_env, "/var/cache/yyy")
+    listed = []
+    real_list = oc.list_dir
+    monkeypatch.setattr(oc, "list_dir", lambda p: listed.append(str(p).replace("\\", "/")) or real_list(p))
+    scan(orphan_env)
+    for root in ("/var/lib", "/var/cache"):
+        assert sum(1 for x in listed if x.endswith(root)) == 1
