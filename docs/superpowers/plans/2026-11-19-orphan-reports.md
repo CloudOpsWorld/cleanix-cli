@@ -151,15 +151,17 @@ Each detector family is its own module and test file, built in parallel in separ
     - `name_matches(name: str, names: set[str]) -> bool`. Both sides are normalised: lowercase, keep only `[a-z0-9]`, and remove a trailing version (digits). The result is True if the normalised values are equal, or if the normalised name has at least 4 characters and is a prefix of a normalised candidate.
   - `class OrphanReporter(Cleaner)`:
     - `requires_root = False`, `sysroot: str = "/"`
-    - `budget: ScanBudget` (set in `scan()`)
-    - `scan()` builds a fresh budget from config, resets the once-flags, then calls `super().scan()`.
+    - `budget: ScanBudget` is created in `__init__` from config, so a direct `find_items()` call (tests, `cleanix explain`) works.
+    - `scan()` replaces it with a fresh budget, resets the once-flags, then calls `super().scan()`.
+    - `pkg_backend(self) -> Optional[str]` returns `detect_pkg_backend()`. It is the only way detectors pick a backend, so tests can patch it on the class.
+    - Detector modules must call commands only as `orphan_common.run(...)` / `orphan_common.tool(...)` (module attribute access, never `from ... import run`).
     - `system_findings(self) -> Iterable[Finding]` and `user_findings(self) -> Iterable[Finding]` both default to `()`.
     - `find_items()` yields system findings once per scan and user findings on every call (so once per target user). Each finding becomes a `CleanableItem(report_only=True, hint=..., size=bounded_size or 0 for notes)`. A partial size appends `" (size is a lower bound)"` to the description. When `budget.take()` fails it yields one note, `"Scan stopped early (<stop_reason>); results are incomplete"`, and stops.
     - `note(path: Path, label: str, hint: str, requires_root: bool = True) -> Finding`
   - conftest `orphan_env(tmp_path, monkeypatch)` returns a `SimpleNamespace` with these fields:
     - `root = tmp_path/"root"` is patched as `OrphanReporter.sysroot`.
     - `home = tmp_path/"home"/"u"` is installed as the single target user, the same way `fake_win` does it.
-    - `cmds` is a `FakeCommands` patched over `orphan_common.run` and `orphan_common.tool`. It supports:
+    - `cmds` is a `FakeCommands` patched over `orphan_common.run_command` and `orphan_common.which`, the module globals that `run()` and `tool()` call. This keeps the allowlist and the `env LC_ALL=C` prefix under test in every detector test and holds whatever the import style. It supports:
       - `on(prefix: tuple, rc=0, out="", err="")`. The prefix is matched against argv without the `env LC_ALL=C` prefix. An unmatched argv returns `(127, "", "not found")`.
       - `tools: set[str]`
       - `calls: list[list[str]]`
@@ -214,14 +216,14 @@ Each detector family is its own module and test file, built in parallel in separ
 **Files:** Create `cleanix/cleaners/linux_orphan_files.py` and `tests/test_orphans_linux_files.py`.
 
 **Interfaces:**
-- Consumes: Task 1 (`OrphanReporter`, `Finding`, `list_dir`, `device_of`, `query_unowned`, `installed_package_names`, `system_account_names`, `name_matches`, `owner_check_command`, `detect_pkg_backend`, `bad_name`), `linux_extras._LEFTOVER_SUFFIXES`.
+- Consumes: Task 1 (`OrphanReporter`, `Finding`, `list_dir`, `device_of`, `query_unowned`, `installed_package_names`, `system_account_names`, `name_matches`, `owner_check_command`, `OrphanReporter.pkg_backend`, `bad_name`), `linux_extras._LEFTOVER_SUFFIXES`.
 - Produces: `class UnownedSystemFilesReporter(OrphanReporter)` with these attributes:
   - `id="orphan_files"`
   - `name="Files not from any package"`
   - `description="Items under /opt, /usr/local, /var/lib, /var/cache, /etc and /srv that no installed package owns (report only)"`
   - `platforms=(LINUX,)`, `scope=SCOPE_SYSTEM`, `default_enabled=False`
 
-  `available()` returns `"package ownership lookup is not supported on this distribution"` when `detect_pkg_backend()` is None.
+  `available()` returns `"package ownership lookup is not supported on this distribution"` when `self.pkg_backend()` is None.
 - Rules (pinned):
   - **Candidates and depth:**
     - **Depth 1:** children of `/opt`, `/srv`, `/var/lib`, `/var/cache` and `/etc`.
@@ -248,7 +250,7 @@ Each detector family is its own module and test file, built in parallel in separ
     - for `/usr/local`: `"Installed outside the package manager: <logical>"`
   - **Hint:** `"Nothing installed this through <backend>. Check first: <owner_check_command>. If you no longer need it, remove <quoted path> by hand (administrator rights needed)."` For `/usr/local`, the hint also says it was probably installed manually (make install, a script or pip).
 
-- [ ] **Step 1: Write failing tests** in `tests/test_orphans_linux_files.py` (all use `orphan_env`; `cmds.tools={"dpkg-query"}`; `detect_pkg_backend` patched to `"dpkg"`):
+- [ ] **Step 1: Write failing tests** in `tests/test_orphans_linux_files.py` (all use `orphan_env`; `cmds.tools={"dpkg-query"}`; `OrphanReporter.pkg_backend` patched on the class to return `"dpkg"`):
   - `test_reports_unowned_opt_dir`: `/opt/oldapp` is unowned and `/opt/google` is owned → exactly one item, `report_only`, `requires_root`, hint contains `dpkg -S /opt/oldapp`.
   - `test_false_positives_not_reported`. None of these may be reported:
     - every skip-list sample: `/var/lib/dpkg`, `/var/lib/docker`, `/var/lib/flatpak`, `/var/lib/snapd`, `/var/lib/systemd`, `/etc/hostname`, `/etc/machine-id`, `/etc/.pwd.lock`
@@ -282,7 +284,7 @@ Each detector family is its own module and test file, built in parallel in separ
 **Files:** Create `cleanix/cleaners/systemd_stale.py` and `tests/test_orphans_systemd.py`.
 
 **Interfaces:**
-- Consumes: Task 1 (`OrphanReporter`, `Finding`, `in_root`, `logical_path`, `list_dir`, `link_target_exists`, `is_removable_location`, `owner_check_command`, `detect_pkg_backend`), `utils.home`.
+- Consumes: Task 1 (`OrphanReporter`, `Finding`, `in_root`, `logical_path`, `list_dir`, `link_target_exists`, `is_removable_location`, `owner_check_command`, `OrphanReporter.pkg_backend`), `utils.home`.
 - Produces: `class StaleSystemdUnitReporter(OrphanReporter)` with these attributes:
   - `id="stale_services"`
   - `name="Services for removed programs"`
@@ -498,7 +500,7 @@ Each detector family is its own module and test file, built in parallel in separ
       - Paths from `mdfind kMDItemContentType == 'com.apple.application-bundle'`. If mdfind fails, its contribution is simply empty.
     - **Ids collected:**
       - `CFBundleIdentifier` from each found bundle's `Contents/Info.plist`
-      - launch job filename stems from the three launchd directories in Task 5
+      - launch job filename stems from `~/Library/LaunchAgents`, `/Library/LaunchAgents` and `/Library/LaunchDaemons`. This module lists those directories itself and imports nothing from Task 5.
       - ids from `pkgutil --pkgs` (ignored on failure)
     - If `/Applications` is unreadable, `installed_ids` returns None. Then nothing is reported and a note is yielded.
   - **Candidates:**
@@ -634,7 +636,7 @@ Each detector family is its own module and test file, built in parallel in separ
     - `"windows"` not in `platforms`
     - the COPY blurb ends with `_REVIEW_TAIL`
   - `test_orphan_files_is_opt_in`. With `current_os` patched to `linux`, `build_cleaners(Config())` excludes it and `build_cleaners(Config(), only=["orphan_files"])` includes it.
-  - `test_list_marks_opt_in`: `cli.main(["list","--all"])` output has the `orphan_files` row containing `opt-in`.
+  - `test_list_marks_opt_in`: `cli.main(["list","--all"])` output contains `opt-in` (do not assert on a single row; Rich may wrap columns).
   - `test_scan_yields_only_report_only_items`. Each registered orphan class runs on an empty `orphan_env` sysroot without raising, and every item is `report_only` with a hint.
 - [ ] **Step 2: Run** `pytest tests/test_orphans_wiring.py tests/test_curation.py tests/test_catalog.py` and expect FAIL.
 - [ ] **Step 3: Implement** the registry, catalog, COPY, test edits, CLI marker and README changes listed above.
