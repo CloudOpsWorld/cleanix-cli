@@ -11,12 +11,13 @@ from __future__ import annotations
 import bisect
 import os
 import shlex
+import time
 from pathlib import Path
 from typing import Iterable, Optional
 
 from cleanix.cleaners import orphan_common as oc
 from cleanix.cleaners.base import SCOPE_SYSTEM
-from cleanix.cleaners.linux_extras import _LEFTOVER_SUFFIXES
+from cleanix.cleaners.linux_extras import LEFTOVER_SUFFIXES
 from cleanix.cleaners.orphan_common import Finding, OrphanReporter
 from cleanix.core.platform import LINUX
 
@@ -29,10 +30,21 @@ _SHARE_SKELETON = frozenset(
 )
 # Debian/Ubuntu maintainer scripts create these under /usr/local/lib; dpkg
 # does not own them, but they hold pip-installed system packages.
-_PYTHON_DIR_NAMES = frozenset({"site_python", "dist-packages", "site-packages"})
+_PYTHON_DIR_NAMES = frozenset({
+    "site_python", "dist-packages", "site-packages",
+    # language-runtime trees that installer scripts / package managers create
+    "R", "site_ruby", "lua", "octave", "perl", "php",
+})
 _PYTHON_DIR_PREFIXES = ("python2", "python3")
+# Long-running services keep live state here (k3s, kubelet, CNI, container
+# runtimes, cloud agents); it is never "left over" from a removed package.
+_RUNTIME_DIRS = frozenset(
+    "rancher kubelet cni containerd waagent amazon lxd lxcfs microk8s k0s k3s "
+    "snap docker containers podman libvirt flatpak".split()
+)
 _SKIP = {
-    "/var/lib": frozenset(
+    "/opt": _RUNTIME_DIRS,
+    "/var/lib": _RUNTIME_DIRS | frozenset(
         "dpkg apt rpm dnf yum pacman apk systemd private flatpak snapd docker "
         "containerd containers lxd lxc libvirt machines portables ucf polkit-1 "
         "sudo dbus misc pam initramfs-tools os-prober update-rc.d alternatives "
@@ -52,6 +64,12 @@ _NEEDS_NAMES = ("/var/lib", "/var/cache")
 _ROOTS = ("/opt", "/usr/local", "/var/lib", "/var/cache")
 _UNIT_DIRS = ("/etc/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system")
 _PROBE_CHILDREN = 5
+_FRESH_CHILDREN = 20
+_EXEC_ROOTS = ("/opt/", "/var/lib/", "/var/cache/", "/usr/local/")
+_CAVEAT = (
+    "It may be created at runtime by a program or installer script; "
+    "removing it can break that program. Check what uses it first. "
+)
 _GLOB = set("*?[]\\")
 _CHECK_EVERY = 64
 
@@ -114,9 +132,72 @@ class UnownedSystemFilesReporter(OrphanReporter):
                 names.add(p.name.rsplit(".", 1)[0])
         return names
 
+    def _unit_evidence(self) -> set:
+        """Names a systemd unit stands for: unit stems, plus the program and
+        data folder each ExecStart uses (``/opt/foo/bin/x`` -> foo, x)."""
+        names = self._unit_names()
+        seen = 0
+        for d in _UNIT_DIRS:
+            for p in oc.list_dir(oc.in_root(self.sysroot, d)) or []:
+                if not p.name.endswith(".service") or oc.bad_name(p.name):
+                    continue
+                seen += 1
+                if seen > 2000 or self.budget.expired():
+                    return names
+                try:
+                    if os.path.islink(p):
+                        continue
+                    with open(p, "rb") as fh:
+                        text = fh.read(65536).decode("utf-8", "replace")
+                except OSError:
+                    continue
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line.startswith("ExecStart"):
+                        continue
+                    _k, _, val = line.partition("=")
+                    prog = val.lstrip("-@+!: " + chr(9)).split(None, 1)
+                    if not prog or not prog[0].startswith("/"):
+                        continue
+                    path = prog[0]
+                    names.add(path.rsplit("/", 1)[-1])
+                    for r in _EXEC_ROOTS:
+                        if path.startswith(r):
+                            first = path[len(r):].split("/", 1)[0]
+                            if first:
+                                names.add(first)
+        return names
+
+    def _is_fresh(self, real: Path, cutoff: Optional[float]) -> bool:
+        """True when the entry or its newest immediate child changed since
+        ``cutoff`` (live data is always fresh). lstat only; budget-aware."""
+        if cutoff is None:
+            return False
+        try:
+            st = real.lstat()
+        except OSError:
+            return True  # cannot tell: treat as in use
+        newest = st.st_mtime
+        if os.path.isdir(real) and not os.path.islink(real):
+            try:
+                with os.scandir(real) as it:
+                    for n, entry in enumerate(it):
+                        if n >= _FRESH_CHILDREN or self.budget.expired():
+                            break
+                        try:
+                            newest = max(
+                                newest, entry.stat(follow_symlinks=False).st_mtime
+                            )
+                        except OSError:
+                            continue
+            except OSError:
+                return True
+        return newest > cutoff
+
     def _hint(self, backend: str, logical: str, sampled: bool = False) -> str:
         check = oc.owner_check_command(backend, logical)
         text = f"Nothing installed this through {backend}. Check first: {check}. "
+        text += _CAVEAT
         if logical.startswith("/usr/local"):
             text += (
                 "It was probably installed manually (for example make install "
@@ -138,7 +219,7 @@ class UnownedSystemFilesReporter(OrphanReporter):
 
     def _keep(self, child: Path, skip):
         name = child.name
-        if name in skip or oc.bad_name(name) or name.endswith(_LEFTOVER_SUFFIXES):
+        if name in skip or oc.bad_name(name) or name.endswith(LEFTOVER_SUFFIXES):
             return
         yield (oc.logical_path(self.sysroot, child), child)
 
@@ -206,7 +287,12 @@ class UnownedSystemFilesReporter(OrphanReporter):
             return
         loaded = False
         evidence: Optional[NameEvidence] = None
+        unit_evidence: Optional[NameEvidence] = None
+        days = float(self.config.orphan_min_age_days)
+        cutoff = time.time() - days * 86400 if days > 0 else None
         cands = []
+        units = self._unit_evidence()
+        unit_evidence = NameEvidence(units)
         for root in _ROOTS:
             root_real = oc.in_root(self.sysroot, root)
             if os.path.islink(root_real):
@@ -225,7 +311,7 @@ class UnownedSystemFilesReporter(OrphanReporter):
                         evidence = NameEvidence(
                             names
                             | oc.system_account_names(self.sysroot)
-                            | self._unit_names()
+                            | units
                         )
                 if evidence is None:
                     yield self.note(
@@ -247,6 +333,10 @@ class UnownedSystemFilesReporter(OrphanReporter):
                 if dev is None or (root_dev is not None and dev != root_dev):
                     continue
                 if root in _NEEDS_NAMES and evidence.matches(real.name):
+                    continue
+                if root == "/opt" and oc._norm(real.name) in unit_evidence._set:
+                    continue  # a service runs from / is named after it
+                if self._is_fresh(real, cutoff):
                     continue
                 cands.append((logical, real))
         if not cands:

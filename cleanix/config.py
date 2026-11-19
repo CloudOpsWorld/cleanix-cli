@@ -203,7 +203,7 @@ FIELD_HELP = {
     "dup_top_n": "Report at most the N largest duplicate groups",
     "orphan_max_items": "Report at most N orphan findings per cleaner",
     "orphan_max_seconds": "Stop an orphan scan after N seconds",
-    "orphan_min_age_days": "Mac app data must be untouched N days to be reported",
+    "orphan_min_age_days": "Orphan data (Mac app data, unowned files) must be untouched N days to be reported",
 }
 
 

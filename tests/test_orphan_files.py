@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sys
+import time
 
 import pytest
 
@@ -89,6 +91,7 @@ def setup(env, monkeypatch, *, owned=(), installed=("bash",),
 
 def scan(env, **cfg):
     config = Config()
+    config.orphan_min_age_days = 0  # freshness gate off unless a test sets it
     for k, v in cfg.items():
         setattr(config, k, v)
     return UnownedSystemFilesReporter(config).scan()
@@ -492,3 +495,106 @@ def test_unknown_probe_result_suppresses_parent(orphan_env, monkeypatch):
         oc, "query_unowned", lambda backend, ps, budget, **k: {"/opt/vendor"}
     )
     assert scan(orphan_env).items == []
+
+
+# ------------------------------------------------- live data / false positives
+CAVEAT = (
+    "It may be created at runtime by a program or installer script; "
+    "removing it can break that program. Check what uses it first."
+)
+
+
+def age(path, days=90):
+    t = time.time() - days * 86400
+    for p in [path, *path.rglob("*")]:
+        os.utime(p, (t, t))
+    return path
+
+
+def test_fresh_live_service_data_not_reported(orphan_env, monkeypatch):
+    """Reviewer scenario: Docker CE + k3s host."""
+    env = orphan_env
+    make(env, "/etc/systemd/system")
+    (env.root / "etc/systemd/system/k3s.service").write_text("[Service]\n")
+    make(env, "/opt/containerd/bin")
+    make(env, "/opt/containerd/lib")
+    make(env, "/var/lib/rancher/k3s/server", size=10)
+    make(env, "/var/lib/cni/networks", size=10)
+    make(env, "/var/lib/kubelet/pods", size=10)
+    make(env, "/var/lib/docker/overlay2", size=10)
+    make(env, "/var/lib/someapp/state", size=10)  # fresh, unknown program
+    setup(env, monkeypatch, installed=("bash", "docker-ce", "containerd.io"))
+    rep = scan(env, orphan_min_age_days=30.0)
+    assert paths(rep, env) == []
+
+
+def test_old_unowned_dir_reported_with_caveat(orphan_env, monkeypatch):
+    env = orphan_env
+    age(make(env, "/opt/oldtool/bin", size=10).parent)
+    age(make(env, "/var/lib/oldstuff/x", size=10).parent)
+    setup(env, monkeypatch)
+    rep = scan(env, orphan_min_age_days=30.0)
+    assert paths(rep, env) == ["/opt/oldtool", "/var/lib/oldstuff"]
+    assert all(CAVEAT in i.hint for i in rep.items)
+
+
+def test_fresh_child_keeps_old_parent_out(orphan_env, monkeypatch):
+    env = orphan_env
+    d = age(make(env, "/opt/livetool/bin", size=10).parent)
+    (d / "fresh.log").write_text("now")  # child modified just now
+    setup(env, monkeypatch)
+    assert paths(scan(env, orphan_min_age_days=30.0), env) == []
+    assert paths(scan(env, orphan_min_age_days=0), env) == ["/opt/livetool"]
+
+
+def test_caveat_on_every_root(orphan_env, monkeypatch):
+    env = orphan_env
+    make(env, "/usr/local/mytool")
+    make(env, "/var/cache/zzcache", size=10)
+    make(env, "/var/lib/zzdata", size=10)
+    make(env, "/opt/zzvendor", size=10)
+    setup(env, monkeypatch)
+    rep = scan(env)
+    assert len(rep.items) == 4 and all(CAVEAT in i.hint for i in rep.items)
+
+
+@pytest.mark.parametrize("name", [
+    "rancher", "kubelet", "cni", "containerd", "waagent", "amazon", "lxd",
+    "lxcfs", "microk8s", "k0s", "k3s", "snap", "docker", "containers",
+    "podman", "libvirt", "flatpak",
+])
+@pytest.mark.parametrize("root", ["/var/lib", "/opt"])
+def test_runtime_service_dirs_skipped(orphan_env, monkeypatch, root, name):
+    make(orphan_env, f"{root}/{name}", size=10)
+    make(orphan_env, f"{root}/zzother", size=10)
+    setup(orphan_env, monkeypatch)
+    assert paths(scan(orphan_env), orphan_env) == [f"{root}/zzother"]
+
+
+def test_unit_stem_and_execstart_protect_opt_and_var_lib(orphan_env, monkeypatch):
+    env = orphan_env
+    units = make(env, "/etc/systemd/system")
+    (units / "myagent.service").write_text(
+        "[Service]\nExecStart=/opt/agentdir/bin/run -x\n")
+    (units / "other.service").write_text(
+        "[Service]\nExecStart=-/var/lib/statefulthing/serve\n")
+    make(env, "/opt/myagent", size=10)
+    make(env, "/opt/agentdir", size=10)
+    make(env, "/var/lib/statefulthing", size=10)
+    make(env, "/opt/zzother", size=10)
+    setup(env, monkeypatch)
+    assert paths(scan(env), env) == ["/opt/zzother"]
+
+
+@pytest.mark.parametrize("name", ["R", "site_ruby", "lua", "octave", "perl", "php"])
+def test_usr_local_lib_language_dirs_skipped(orphan_env, monkeypatch, name):
+    make(orphan_env, f"/usr/local/lib/{name}", size=10)
+    make(orphan_env, "/usr/local/lib/zzreal", size=10)
+    setup(orphan_env, monkeypatch)
+    assert paths(scan(orphan_env), orphan_env) == ["/usr/local/lib/zzreal"]
+
+
+def test_node_modules_still_reported(orphan_env, monkeypatch):
+    make(orphan_env, "/usr/local/lib/node_modules", size=10)
+    setup(orphan_env, monkeypatch)
+    assert paths(scan(orphan_env), orphan_env) == ["/usr/local/lib/node_modules"]
