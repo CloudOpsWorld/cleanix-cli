@@ -87,6 +87,14 @@ def _walk(backend: RegistryBackend, hive: str, key: str, name: str, b: _Budget) 
     return KeySnap(name=name, values=tuple(values), subkeys=children)
 
 
+def value_snapshot(value: RegValue) -> RegValue:
+    """The snapshot of a value a detector already read (via ``read_values``),
+    so capturing it does not re-read its whole container."""
+    if _data_size(value.data) > MAX_BYTES:
+        raise SnapshotError("too much data")
+    return _norm(value)
+
+
 def snapshot(backend: RegistryBackend, target: RegTarget) -> Snapshot:
     """Capture ``target`` or raise :class:`SnapshotError`."""
     try:
