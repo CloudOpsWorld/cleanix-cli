@@ -31,7 +31,9 @@ def detector(states=None, default=M, owner=True):
 
 
 def items(det):
-    return det.scan().items
+    report = det.scan()
+    assert report.skipped_reason is None, report.skipped_reason
+    return report.items
 
 
 @pytest.mark.parametrize(

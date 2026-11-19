@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
 from cleanix.cleaners.base import Cleaner
-from cleanix.core import regclean, regsafety, safety, winenv, winregistry
+from cleanix.core import regclean, regpromises, regsafety, safety, winenv, winregistry
 from cleanix.core.models import (
     CleanableItem,
     CleanerReport,
@@ -289,12 +289,12 @@ class Engine:
             if not text.startswith("partially deleted"):
                 text = f"partially deleted or state unknown: {text}; scan again"
             run = getattr(sink, "run_id", None)
-            where = getattr(sink, "backup_dir", None)
+            where = getattr(sink, "dir", None) or getattr(sink, "backup_dir", None)
             if run:
-                text += (
-                    f"; the backup is in quarantine run {run}"
-                    f" (restore with cleanix restore {run})"
-                )
+                text += f"; the backup is in quarantine run {run}"
+                hint = regpromises.restore_hint(run, reg.hive, where)
+                if hint:
+                    text += f" ({hint})"
             elif where is not None:
                 text += f"; the backup is in {where}"
             error = text
@@ -308,16 +308,21 @@ class Engine:
                 # The manifest on disk is not this run's: Undo cannot be
                 # promised; point at the backup files themselves.
                 where = getattr(sink, "dir", None) or getattr(sink, "backup_dir", None)
+                word = "undo" if regpromises.registry_undo_shipped() else "backup"
                 note = (
-                    f"the undo record could not be saved ({why}); "
-                    f"the backup files are in {where}"
+                    f"the {word} record could not be saved ({why}); "
+                    + regpromises.backup_files_note(where)
                 )
             else:
                 # The manifest still holds the entry with "deleted": None,
                 # which restore treats as restorable, so undo stays safe.
+                where = getattr(sink, "dir", None) or getattr(sink, "backup_dir", None)
+                run = getattr(sink, "run_id", None)
+                hint = regpromises.restore_hint(run, reg.hive, where)
+                word = "undo" if regpromises.registry_undo_shipped() else "backup"
                 note = (
-                    f"the undo record could not be updated ({why}); "
-                    "cleanix restore is still safe"
+                    f"the {word} record could not be updated ({why}); "
+                    + (hint or regpromises.backup_files_note(where))
                 )
             if error is None:
                 return CleanOutcome(item=item, removed=True, freed=0,

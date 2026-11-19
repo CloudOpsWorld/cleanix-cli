@@ -506,7 +506,8 @@ def run_flow(inner, report: Report, tmp: Path, base: Path, *, elevated: bool) ->
     """Steps 2-7. ``inner`` is the real backend (or a FakeRegistry in the unit
     test). Raises nothing for failed assertions; they are recorded."""
     from cleanix.config import Config
-    from cleanix.core import catalog, engine, history, quarantine, regbackup, regsnap, service, winenv, winregistry
+    from cleanix.core import (catalog, engine, history, quarantine, regbackup, regpromises,
+                              regsnap, service, winenv, winregistry)
     from cleanix.core.registry import build_cleaners
 
     guard = Confined(inner)
@@ -533,7 +534,9 @@ def run_flow(inner, report: Report, tmp: Path, base: Path, *, elevated: bool) ->
     state = tmp / "state"
     qroot.mkdir()
     state.mkdir()
-    with _patched(quarantine, "quarantine_root", lambda: qroot), \
+    # The restore path is what is being verified: switch it on in this process only.
+    with _patched(regpromises, "UNDO_SHIPPED", True), \
+            _patched(quarantine, "quarantine_root", lambda: qroot), \
             _patched(history, "state_dir", lambda: state), \
             winregistry.using_backend(rerooted):
         # -- 3/4: scan ---------------------------------------------------------------

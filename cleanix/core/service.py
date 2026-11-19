@@ -183,9 +183,12 @@ def clean(
             run.save()
         except OSError as exc:  # incl. ManifestConflict
             # Items are already removed: never lose the summary over this.
+            from cleanix.core import regpromises
+
+            word = "undo" if regpromises.registry_undo_shipped() else "backup"
             undo_error = (
-                f"the undo record could not be saved ({str(exc) or type(exc).__name__}); "
-                f"the backup files are in {run.dir}"
+                f"the {word} record could not be saved ({str(exc) or type(exc).__name__}); "
+                + regpromises.backup_files_note(run.dir)
             )
     elif run is not None:
         run.discard_if_empty()

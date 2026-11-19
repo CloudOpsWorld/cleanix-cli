@@ -748,6 +748,8 @@ class SimpleView(QWidget):
         text = f"Restored {restored} item{'s' if restored != 1 else ''}."
         if failed:
             text += f" {failed} could not be restored."
+        if res.get("not_restored"):
+            text += " Registry restore is not enabled in this version."
         self.undo_label.setText(text)
         self.undo_button.setEnabled(False)
         self.undone.emit()

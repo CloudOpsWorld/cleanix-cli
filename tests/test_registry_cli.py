@@ -28,7 +28,7 @@ UNINST = CV + r"\Uninstall"
 FOO = UNINST + r"\Foo"
 RUN = CV + r"\Run"
 
-UNDO_FALSE_TEXT = "no backup or restore is available in this version"
+UNDO_FALSE_TEXT = "restoring registry entries is not supported in this version yet"
 UNDO_TRUE_TEXT = "can be restored with cleanix restore"
 
 
@@ -392,7 +392,7 @@ def _hklm_run(env, monkeypatch):
     return reg, run_id
 
 
-def test_restore_hklm_describes_confirms_then_allows_machine(env, monkeypatch, capsys):
+def test_restore_hklm_describes_confirms_then_allows_machine(env, monkeypatch, capsys, shipped):
     reg, run_id = _hklm_run(env, monkeypatch)
     capsys.readouterr()
     calls = []
@@ -412,7 +412,7 @@ def test_restore_hklm_describes_confirms_then_allows_machine(env, monkeypatch, c
     assert "WRITTEN machine-wide" in capsys.readouterr().out.replace("\n", " ")
 
 
-def test_restore_hklm_decline_restores_nothing(env, monkeypatch, capsys):
+def test_restore_hklm_decline_restores_nothing(env, monkeypatch, capsys, shipped):
     reg, run_id = _hklm_run(env, monkeypatch)
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
     monkeypatch.setattr(cli.Prompt, "ask", lambda *a, **k: "y")
@@ -421,7 +421,7 @@ def test_restore_hklm_decline_restores_nothing(env, monkeypatch, capsys):
     assert not reg.key_exists("HKLM", FOO)
 
 
-def test_restore_hklm_noninteractive_refuses_without_yes(env, monkeypatch, capsys):
+def test_restore_hklm_noninteractive_refuses_without_yes(env, monkeypatch, capsys, shipped):
     reg, run_id = _hklm_run(env, monkeypatch)
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
     monkeypatch.setattr(cli.Prompt, "ask", lambda *a, **k: pytest.fail("prompted"))
@@ -430,7 +430,7 @@ def test_restore_hklm_noninteractive_refuses_without_yes(env, monkeypatch, capsy
     assert not reg.key_exists("HKLM", FOO)
 
 
-def test_restore_hklm_yes_with_explicit_run_id(env, monkeypatch, capsys):
+def test_restore_hklm_yes_with_explicit_run_id(env, monkeypatch, capsys, shipped):
     reg, run_id = _hklm_run(env, monkeypatch)
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
     monkeypatch.setattr(cli.Prompt, "ask", lambda *a, **k: pytest.fail("prompted"))
@@ -447,7 +447,7 @@ def test_restore_yes_never_for_latest(env, monkeypatch, capsys):
     assert "run id" in _out(capsys)
 
 
-def test_restore_hklm_nonelevated_prints_admin_advice(env, monkeypatch, capsys):
+def test_restore_hklm_nonelevated_prints_admin_advice(env, monkeypatch, capsys, shipped):
     reg, run_id = _hklm_run(env, monkeypatch)
     monkeypatch.setattr(winenv, "is_admin", lambda: False)
     monkeypatch.setattr(cli.Prompt, "ask", lambda *a, **k: pytest.fail("prompted"))
@@ -459,7 +459,7 @@ def test_restore_hklm_nonelevated_prints_admin_advice(env, monkeypatch, capsys):
     assert not reg.key_exists("HKLM", FOO)
 
 
-def test_restore_hkcu_only_run_needs_no_confirmation(env, monkeypatch, capsys):
+def test_restore_hkcu_only_run_needs_no_confirmation(env, monkeypatch, capsys, shipped):
     reg = env
     _foo(reg)
     _patch_scan(monkeypatch, [_item(reg)])
@@ -753,7 +753,7 @@ def test_clean_no_terminal_without_yes_refuses_cleanly(env, monkeypatch, capsys)
     assert reg.key_exists("HKCU", FOO)
 
 
-def test_restore_no_terminal_refuses_cleanly(env, monkeypatch, capsys):
+def test_restore_no_terminal_refuses_cleanly(env, monkeypatch, capsys, shipped):
     reg, run_id = _hklm_run(env, monkeypatch)
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
 
@@ -788,3 +788,18 @@ def test_confirmation_keeps_permanently_for_files(env, monkeypatch, capsys):
     out = capsys.readouterr().out.replace("\n", "")
     assert asked and asked[0].startswith("Permanently remove")
     assert "permanently removed" in out
+
+
+def test_cli_restore_reports_registry_entries_not_restored_while_gated(env, capsys, monkeypatch):
+    reg = env
+    reg.add_key("HKCU", FOO, {"DisplayName": (REG_SZ, "Foo")})
+    item = _item(reg)
+    from cleanix.config import Config
+    from cleanix.core import service
+    s = service.clean([item], Config(), dry_run=False)
+    assert not reg.key_exists("HKCU", FOO)
+    rc = cli.main(["restore", s.quarantine_run])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "registry restore is not enabled in this version" in out
+    assert not reg.key_exists("HKCU", FOO)

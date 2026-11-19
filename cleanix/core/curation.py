@@ -155,12 +155,12 @@ _RAW = {
     "device_backups": ("Phone and tablet backups", "iOS and Android device backups, often irreplaceable. " + _REVIEW_TAIL),
     "libvirt_saves": ("Saved virtual machine states", "Suspended VM memory images with real state. " + _REVIEW_TAIL),
     "macos_sleepimage": ("Mac sleep image", "Hibernation file recreated by macOS. " + _REVIEW_TAIL),
-    # --- Windows registry leftovers (opt-in; always backed up first)
-    "win_reg_uninstall": ("Dead uninstall entries", "Apps & Features entries whose program folder and uninstaller are gone. Removing them only tidies the list; a backup is kept."),
-    "win_reg_app_paths": ("Dead program shortcuts (App Paths)", "Run-dialog shortcuts to programs that no longer exist. Removing them has no effect on working software; a backup is kept."),
-    "win_reg_file_assoc": ("Dead file-type handlers", "Open-with handlers pointing at deleted programs. Affected files fall back to 'choose an app'; a backup is kept."),
-    "win_reg_startup": ("Dead startup entries", "Startup entries for programs that no longer exist. Nothing starts from them today; a backup is kept."),
-    "win_reg_shared_dlls": ("Stale shared-file counters", "Install counters for shared files that no longer exist. Uninstallers no longer need them; a backup is kept."),
+    # --- Windows registry leftovers (opt-in)
+    "win_reg_uninstall": ("Dead uninstall entries", "Apps & Features entries whose program folder and uninstaller are gone. Removing them only tidies the list."),
+    "win_reg_app_paths": ("Dead program shortcuts (App Paths)", "Run-dialog shortcuts to programs that no longer exist. Removing them has no effect on working software."),
+    "win_reg_file_assoc": ("Dead file-type handlers", "Open-with handlers pointing at deleted programs. Affected files fall back to 'choose an app'."),
+    "win_reg_startup": ("Dead startup entries", "Startup entries for programs that no longer exist. Nothing starts from them today."),
+    "win_reg_shared_dlls": ("Stale shared-file counters", "Install counters for shared files that no longer exist. Uninstallers no longer need them."),
 }
 
 COPY: Dict[str, Copy] = {k: Copy(*v) for k, v in _RAW.items()}
