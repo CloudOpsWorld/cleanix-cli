@@ -6,9 +6,11 @@ import json
 from typing import Any, Dict
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
-from cleanix.core.models import CleanResult, ScanResult
+from cleanix.core import regpromises
+from cleanix.core.models import CleanResult, ItemKind, ScanResult, item_target
 from cleanix.core.utils import human_size
 
 
@@ -63,6 +65,42 @@ def render_scan_table(
             "[dim]not deleted by cleanix[/dim]",
         )
     console.print(table)
+
+
+def registry_notice() -> str:
+    """What may truthfully be promised about registry removal right now; read
+    from ``regpromises`` so every UI changes in one place."""
+    if not regpromises.registry_undo_shipped():
+        return regpromises.PERMANENT_LINE
+    return (
+        "Registry entries are backed up before removal. HKCU entries can be "
+        "restored with `cleanix restore <run>`; HKLM entries are backed up "
+        "too, but restoring them needs an Administrator terminal."
+    )
+
+
+def registry_items(items) -> list:
+    return [i for i in items if i.kind is ItemKind.REGISTRY]
+
+
+def render_registry_items(items: list, console: Console) -> None:
+    """List registry findings with their exact (escaped) targets and evidence."""
+    if not items:
+        return
+    table = Table(title="Registry entries", title_style="cyan")
+    table.add_column("Hive", style="magenta")
+    table.add_column("Target", style="cyan", overflow="fold")
+    table.add_column("Evidence", overflow="fold")
+    table.add_column("Hint", style="dim", overflow="fold")
+    for i in items:
+        table.add_row(
+            i.reg.hive if i.reg else "",
+            escape(item_target(i)),
+            escape(i.description),
+            escape(i.hint or ""),
+        )
+    console.print(table)
+    console.print(f"[yellow]{escape(registry_notice())}[/yellow]")
 
 
 def render_report_only(result: ScanResult, console: Console) -> None:
@@ -131,6 +169,7 @@ def scan_to_dict(result: ScanResult) -> Dict[str, Any]:
                 "ran": r.ran,
                 "skipped_reason": r.skipped_reason,
                 "incomplete": r.incomplete,
+                "registry": any(i.kind is ItemKind.REGISTRY for i in r.items),
                 "count": r.count,
                 "bytes": r.total_size,
                 "human": human_size(r.total_size),
@@ -143,6 +182,14 @@ def scan_to_dict(result: ScanResult) -> Dict[str, Any]:
                         "requires_root": i.requires_root,
                         "report_only": i.report_only,
                         "hint": i.hint,
+                        # Additive: registry findings carry their target here.
+                        "kind": i.kind.value,
+                        "target": item_target(i),
+                        "registry": (
+                            {"hive": i.reg.hive, "key": i.reg.key,
+                             "value": i.reg.value}
+                            if i.reg is not None else None
+                        ),
                     }
                     for i in r.items
                 ],

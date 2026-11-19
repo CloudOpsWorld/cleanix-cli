@@ -46,6 +46,10 @@ def write_manifest(result) -> str:
                     "cleaner_id": o.item.cleaner_id,
                     "description": o.item.description,
                     "path": o.item.path,
+                    # Registry runs: the target's display only, never values.
+                    "registry": (o.item.reg.display
+                                 if getattr(o.item, "reg", None) is not None
+                                 else None),
                     "command": list(o.item.command) if o.item.command else None,
                     "bytes": o.freed,
                 }) + "\n")
@@ -54,17 +58,37 @@ def write_manifest(result) -> str:
         return ""
 
 
-def record(freed: int, items: int, *, mode: str) -> None:
+def record(freed: int, items: int, *, mode: str, registry: int = 0) -> None:
     """Append a completed clean run to the history log. ``mode`` is one of
-    'delete', 'quarantine'."""
+    'delete', 'quarantine'. ``registry`` counts removed registry entries."""
     path = _history_file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         entry = {"time": time.time(), "freed": freed, "items": items, "mode": mode}
+        if registry:
+            entry["registry"] = int(registry)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
     except OSError:
         pass  # history is best-effort; never fail a clean over it
+
+
+def annotate_last_registry(count: int) -> None:
+    """Add a ``registry`` count to the newest history entry (best effort; the
+    service layer records the run, the CLI knows the registry count)."""
+    path = _history_file()
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines or count <= 0:
+            return
+        entry = json.loads(lines[-1])
+        entry["registry"] = int(count)
+        lines[-1] = json.dumps(entry)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except (OSError, ValueError):
+        pass
 
 
 def load() -> List[Dict]:
