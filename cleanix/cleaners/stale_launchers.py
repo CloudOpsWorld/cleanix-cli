@@ -8,6 +8,8 @@ Nothing is ever deleted. Every finding carries a hint naming the exact path and
 how to confirm it; unknown or unverifiable situations (unreadable files,
 removable locations, unparsable Exec lines, entries a package owns) are skipped.
 Commands are only called through ``orphan_common`` (``run``/``tool``).
+The scanned top-level directories may themselves be symlinks (stow setups);
+only entries inside them are checked for being links.
 AppImage launchers (``appimagekit_*.desktop``) belong to the ``appimage``
 cleaner and are skipped here.
 """
@@ -15,6 +17,7 @@ cleaner and are skipped here.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 from pathlib import Path
 from typing import Iterable, Optional
@@ -38,9 +41,19 @@ _WRAPPERS = frozenset(
 _PATH_DIRS = (
     "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin",
     "/bin", "/usr/games", "/usr/local/games", "/snap/bin",
-    "/var/lib/flatpak/exports/bin",
+    "/var/lib/flatpak/exports/bin", "/nix/var/nix/profiles/default/bin",
+    "/run/current-system/sw/bin", "/run/wrappers/bin",
+    "/home/linuxbrew/.linuxbrew/bin", "/opt/homebrew/bin",
 )
-_HOME_PATH_DIRS = (".local/bin", "bin", ".local/share/flatpak/exports/bin")
+_HOME_PATH_DIRS = (
+    ".local/bin", "bin", ".local/share/flatpak/exports/bin", ".nix-profile/bin",
+    ".cargo/bin", "go/bin", ".npm-global/bin",
+    ".local/share/JetBrains/Toolbox/scripts",
+)
+# A sysroot containing one of these is Nix-style: programs live in profiles we
+# cannot enumerate, so a bare program name that is not found is only "unknown".
+_NIX_MARKERS = ("/run/current-system", "/nix/store")
+_SLAVE_TARGETS = ("/usr/share/man", "/usr/share/doc", "/usr/share/info")
 
 # Package-owned system directories: reported only when query_unowned agrees.
 _OWNED_DIRS = ("/usr/share/applications", "/etc/xdg/autostart")
@@ -55,6 +68,8 @@ def _read_entry(path: Path) -> Optional[dict]:
             raw = fh.read(_MAX_DESKTOP_BYTES)
     except OSError:
         return None
+    if len(raw) >= _MAX_DESKTOP_BYTES and not raw.endswith(b"\n"):
+        raw = raw[: raw.rfind(b"\n") + 1]  # drop a possibly cut-off last line
     keys: dict = {}
     in_group = found = False
     for line in raw.decode("utf-8", errors="replace").splitlines():
@@ -132,9 +147,15 @@ class StaleDesktopEntryReporter(oc.OrphanReporter):
             if oc.is_removable_location(token):
                 return False
             reals = [str(oc.in_root(self.sysroot, token))]
+            if self._on_other_device(reals[0]):
+                return False
         else:
             if "/" in token:
                 return False
+            if any(
+                oc.in_root(self.sysroot, m).exists() for m in _NIX_MARKERS
+            ):
+                return False  # Nix-style system: cannot enumerate profiles
             reals = [
                 str(oc.in_root(self.sysroot, f"{d}/{token}")) for d in _PATH_DIRS
             ]
@@ -152,6 +173,20 @@ class StaleDesktopEntryReporter(oc.OrphanReporter):
                 if oc.is_removable_location(tgt):
                     return False
         return True
+
+    def _on_other_device(self, real: str) -> bool:
+        """True if the first existing ancestor of ``real`` lives on a device
+        other than the sysroot or home (unmounted/autofs disks: unknown)."""
+        refs = {oc.device_of(Path(self.sysroot)), oc.device_of(home())}
+        refs.discard(None)
+        p = Path(real)
+        while True:
+            dev = oc.device_of(p)
+            if dev is not None:
+                return bool(refs) and dev not in refs
+            if p.parent == p:
+                return False
+            p = p.parent
 
     @staticmethod
     def _binary_of(keys: dict) -> Optional[str]:
@@ -282,14 +317,31 @@ class BrokenAlternativesReporter(oc.OrphanReporter):
                 return
             if oc.bad_name(link.name) or not link.is_symlink():
                 continue
-            if oc.link_target_exists(link, self.sysroot) is not False:
-                continue
             try:
                 target = os.readlink(link)
             except OSError:
                 continue
             if oc.is_removable_location(target) or oc.bad_name(target):
                 continue
+            # man/doc slave links are dangling by design on minimal images
+            if re.search(r"\.(\d\w*|gz)$", link.name) or any(
+                target == t or target.startswith(t + "/") for t in _SLAVE_TARGETS
+            ):
+                continue
+            if target == "/dev/null":
+                continue
+            dest = (
+                oc.in_root(self.sysroot, target)
+                if target.startswith("/")
+                else link.parent / target
+            )
+            try:
+                os.stat(dest)
+                continue  # exists
+            except (FileNotFoundError, NotADirectoryError):
+                pass  # positively missing
+            except OSError:
+                continue  # unknown
             q = shlex.quote(link.name)
             yield oc.Finding(
                 link,

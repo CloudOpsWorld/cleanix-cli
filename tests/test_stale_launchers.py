@@ -71,9 +71,8 @@ def test_desktop_missing_exec_reported(orphan_env):
     sysi = next(i for i in rep.items if "Loc" in i.description)
     assert sysi.requires_root is True
     assert "Administrator" in sysi.hint
-    assert sysi.description.endswith("(/usr/local/share/applications/loc.desktop)") or (
-        "usr/local/share/applications/loc.desktop" in sysi.description
-    )
+    assert sysi.description.startswith("Menu entry for a missing program: Loc (")
+    assert sysi.description.endswith("/usr/local/share/applications/loc.desktop)")
 
 
 def test_autostart_reported(orphan_env):
@@ -205,6 +204,8 @@ def test_usr_share_entry_needs_unowned(orphan_env, monkeypatch):
     assert "Check first: dpkg -S /usr/share/applications/b.desktop" in b.hint
     assert "Administrator" in b.hint
     assert b.requires_root
+    c = next(i for i in rep.items if "(/etc/xdg/autostart/c" in i.description)
+    assert "Check first: dpkg -S /etc/xdg/autostart/c.desktop" in c.hint
 
 
 def test_unknown_ownership_not_reported(orphan_env, monkeypatch):
@@ -220,6 +221,7 @@ def test_only_dpkg_query_s_is_called(orphan_env, monkeypatch):
     put(env.root, "usr/share/applications/a.desktop", entry("gone-a"))
     _dpkg(env, monkeypatch)
     scan(env)
+    assert env.cmds.calls
     assert all(c[:2] == ["dpkg-query", "-S"] for c in env.cmds.calls)
 
 
@@ -310,3 +312,79 @@ def test_class_metadata():
     assert BrokenAlternativesReporter.id == "stale_alternatives"
     assert BrokenAlternativesReporter.scope == SCOPE_SYSTEM
     assert StaleDesktopEntryReporter.platforms == ("linux",)
+
+
+# ------------------------------------------------------- fix round 1
+@pytest.mark.parametrize(
+    "where",
+    [
+        ("home", ".nix-profile/bin"),
+        ("root", "nix/var/nix/profiles/default/bin"),
+        ("root", "home/linuxbrew/.linuxbrew/bin"),
+        ("home", ".cargo/bin"),
+        ("home", "go/bin"),
+        ("home", ".npm-global/bin"),
+    ],
+)
+def test_relative_exec_wider_lookup_dirs(orphan_env, where):
+    base = orphan_env.home if where[0] == "home" else orphan_env.root
+    prog(base, "/" + where[1] + "/tool")
+    put(orphan_env.home, ".local/share/applications/t.desktop", entry("tool"))
+    assert scan(orphan_env).items == []
+
+
+@pytest.mark.parametrize("marker", ["run/current-system", "nix/store"])
+def test_nix_style_system_relative_missing_is_unknown(orphan_env, marker):
+    (orphan_env.root / marker).mkdir(parents=True)
+    put(orphan_env.home, ".local/share/applications/t.desktop", entry("firefox"))
+    assert scan(orphan_env).items == []
+    # an absolute path that is positively missing is still reported
+    put(orphan_env.home, ".local/share/applications/u.desktop",
+        entry("/opt/gone/bin/x", name="Abs"))
+    assert len(scan(orphan_env).items) == 1
+
+
+def test_absolute_exec_on_other_device_is_unknown(orphan_env, monkeypatch):
+    env = orphan_env
+    (env.root / "data").mkdir()
+    real = oc.device_of
+    monkeypatch.setattr(
+        oc, "device_of", lambda p: 999 if p.name == "data" else real(p)
+    )
+    put(env.home, ".local/share/applications/t.desktop", entry("/data/x/prog"))
+    assert scan(env).items == []
+
+
+def test_desktop_read_cap_ignores_cut_off_last_line(orphan_env):
+    from cleanix.cleaners import stale_launchers as sl
+
+    pad = "# " + "x" * 60 + "\n"
+    head = "[Desktop Entry]\nType=Application\nName=Big\n"
+    n = (sl._MAX_DESKTOP_BYTES - len(head) - 40) // len(pad)
+    text = head + pad * n
+    rest = sl._MAX_DESKTOP_BYTES - len(text)
+    text += "Exec=/opt/gone/bin/" + "p" * rest + "\n"  # crosses the cap
+    assert len(text.encode()) > sl._MAX_DESKTOP_BYTES
+    path = put(orphan_env.home, ".local/share/applications/big.desktop", text)
+    keys = sl._read_entry(path)
+    assert keys is not None and "Exec" not in keys
+    assert scan(orphan_env).items == []
+
+
+def test_unreadable_alternatives_dir_gives_note(orphan_env, monkeypatch):
+    _alt(orphan_env)
+    monkeypatch.setattr(oc, "list_dir", lambda p: None)
+    (item,) = scan(orphan_env, BrokenAlternativesReporter).items
+    assert item.report_only and "administrator" in item.hint.lower()
+
+
+@posix_only
+def test_alternative_slave_links_skipped(orphan_env):
+    d = _alt(orphan_env)
+    os.symlink("/usr/share/man/man1/vim.1.gz", d / "editor.1.gz")
+    os.symlink("/usr/share/man/man1/nano.1.gz", d / "pager.1")
+    os.symlink("/usr/share/doc/x/readme", d / "docs")
+    os.symlink("/usr/share/info/x.info.gz", d / "infox")
+    os.symlink("/usr/bin/gone", d / "real-one")
+    (item,) = scan(orphan_env, BrokenAlternativesReporter).items
+    assert "real-one" in item.description
