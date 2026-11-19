@@ -617,19 +617,70 @@ def load_verified(json_path: Path) -> Tuple[str, RegTarget, Snapshot]:
     return entry.cleaner_id, entry.target, entry.snap
 
 
+DESCRIBE_MAX_CHARS = 300
+DESCRIBE_MAX_BYTES = 32
+_TYPE_NAMES = {
+    0: "REG_NONE", REG_SZ: "REG_SZ", REG_EXPAND_SZ: "REG_EXPAND_SZ",
+    REG_BINARY: "REG_BINARY", REG_DWORD: "REG_DWORD", 5: "REG_DWORD_BIG_ENDIAN",
+    REG_LINK: "REG_LINK", REG_MULTI_SZ: "REG_MULTI_SZ", REG_QWORD: "REG_QWORD",
+}
+
+
+def _show_text(text: str) -> str:
+    """A quoted, escaped (control/format/bidi characters as ``\\uXXXX``)
+    string, truncated to DESCRIBE_MAX_CHARS with its full length noted."""
+    from cleanix.core.models import _visible
+
+    if len(text) > DESCRIBE_MAX_CHARS:
+        return f'"{_visible(text[:DESCRIBE_MAX_CHARS])}…" ({len(text)} characters)'
+    return f'"{_visible(text)}"'
+
+
+def _show_bytes(data: bytes) -> str:
+    head = data[:DESCRIBE_MAX_BYTES].hex(" ")
+    more = " …" if len(data) > DESCRIBE_MAX_BYTES else ""
+    return f"{head}{more} ({len(data)} bytes)".lstrip()
+
+
+def _value_lines(prefix: str, v: RegValue) -> List[str]:
+    from cleanix.core.models import _visible
+
+    name = _visible(v.name) if v.name else "(Default)"
+    kind = _TYPE_NAMES.get(v.type, f"type 0x{v.type:x}")
+    head = f"{prefix} [{name}] = {kind}"
+    data = v.data
+    if isinstance(data, tuple):
+        return [f"{head} ({len(data)} strings)"] + [f"    {_show_text(s)}" for s in data]
+    if isinstance(data, bool):
+        data = int(data)
+    if isinstance(data, int):
+        width = 16 if v.type == REG_QWORD else 8
+        return [f"{head} {data} (0x{data:0{width}x})"]
+    if isinstance(data, str):
+        return [f"{head} {_show_text(data)}"]
+    if isinstance(data, (bytes, bytearray)):
+        return [f"{head} {_show_bytes(bytes(data))}"]
+    return [f"{head} {_visible(repr(data))}"]
+
+
 def describe_backup(json_path: Path) -> List[str]:
-    """Human-readable lines for every key and value a restore of this
-    (validated) backup would write. Raises :class:`RestoreError`."""
+    """Human-readable lines for every key and every value (with its type
+    and data) a restore of this validated backup would write. Every name
+    and string is escaped; long data is truncated with its length noted.
+    Raises :class:`RestoreError`."""
+    from cleanix.core.models import _visible
+
     _cid, target, snap = load_verified(json_path)
     hive = target.hive
     if isinstance(snap, RegValue):
-        return [f"{hive}\\{target.key} [{snap.name}]"]
+        return _value_lines(f"{hive}\\{_visible(target.key)}", snap)
     lines: List[str] = []
 
     def walk(path: str, ks: KeySnap) -> None:
-        lines.append(f"{hive}\\{path}")
+        shown = f"{hive}\\{_visible(path)}"
+        lines.append(shown)
         for v in ks.values:
-            lines.append(f"{hive}\\{path} [{v.name or '(Default)'}]")
+            lines.extend(_value_lines(shown, v))
         for sub in ks.subkeys:
             walk(path + "\\" + sub.name, sub)
 
@@ -698,12 +749,14 @@ class _WinSecurity:
         rc = self.advapi.GetNamedSecurityInfoW(
             str(path), 1, 1, c.byref(owner), None, None, None, c.byref(sd)
         )
-        if rc != 0 or not owner.value:
+        if rc != 0:
             return None
         try:
-            return self._sid_str(owner)
+            # The descriptor is freed even when it carries no owner.
+            return self._sid_str(owner) if owner.value else None
         finally:
-            self.kernel.LocalFree(sd)
+            if sd.value:
+                self.kernel.LocalFree(sd)
 
     def user_sid(self) -> Optional[str]:
         c, wt = self.ctypes, self.wt
