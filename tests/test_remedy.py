@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 
 import pytest
@@ -21,7 +22,9 @@ def _item(path, remedy=None, report_only=True):
 
 
 def _remedy_for(path):
-    return Remedy(RemedyKind.PATH, fingerprint_of(str(path)))
+    fp = fingerprint_of(str(path))
+    assert fp is not None
+    return Remedy(RemedyKind.PATH, fp)
 
 
 def test_remedy_requires_report_only(tmp_path):
@@ -96,5 +99,18 @@ def test_remedy_defaults_and_frozen():
     assert r.group is None and r.extra == ()
     assert {k.value for k in RemedyKind} == {
         "path", "launch_job", "systemd_unit", "pkg_receipt"}
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         r.group = "g"  # type: ignore[misc]
+
+
+def test_fingerprint_of_embedded_nul_fails_closed():
+    assert fingerprint_of("bad\x00path") is None
+
+
+def test_unchanged_false_for_non_path_kind(tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("x")
+    fp = fingerprint_of(str(f))
+    assert fp is not None
+    item = _item(f, Remedy(RemedyKind.SYSTEMD_UNIT, fp))
+    assert unchanged(item) is False

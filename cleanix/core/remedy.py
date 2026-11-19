@@ -45,15 +45,19 @@ def fingerprint_of(path: str) -> Optional[Fingerprint]:
     """lstat identity of ``path`` (no symlink following); None when missing."""
     try:
         st = os.lstat(path)
-    except OSError:
+    except (OSError, ValueError):  # ValueError: embedded NUL; fail closed
         return None
     return (st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev)
 
 
 def unchanged(item: "CleanableItem") -> bool:
-    """True when the item's path still has the fingerprint stored in its remedy."""
+    """True when the item's path still has the fingerprint stored in its remedy.
+
+    Only RemedyKind.PATH remedies are path-fingerprinted; any other kind
+    returns False (it must be verified by its own kind-specific check).
+    """
     remedy = item.remedy
-    if remedy is None or not item.path:
+    if remedy is None or remedy.kind is not RemedyKind.PATH or not item.path:
         return False
     current = fingerprint_of(item.path)
     return current is not None and current == tuple(remedy.fingerprint)
