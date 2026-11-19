@@ -169,7 +169,7 @@ class Engine:
                 return CleanOutcome(
                     item=item, removed=False, dry_run=dry_run,
                     error=f"registry entry not removed, nothing was deleted: "
-                          f"{exc or type(exc).__name__}",
+                          f"{str(exc) or type(exc).__name__}",
                 )
         return CleanOutcome(
             item=item, removed=False, dry_run=dry_run, error="unknown item kind"
@@ -270,7 +270,7 @@ class Engine:
         except regclean.RegistryChanged:
             return fail(regclean.CHANGED)
         except Exception as exc:  # noqa: BLE001 - any failure vetoes the delete
-            return fail(f"backup failed, nothing deleted: {exc or type(exc).__name__}")
+            return fail(f"backup failed, nothing deleted: {str(exc) or type(exc).__name__}")
 
         deleted = True
         error: Optional[str] = None
@@ -297,12 +297,24 @@ class Engine:
         try:
             sink.after_delete(item, deleted)
         except Exception as exc:  # noqa: BLE001
-            # The manifest still holds the entry with "deleted": None, which
-            # restore treats as restorable, so undo stays safe; say so.
-            note = (
-                f"the undo record could not be updated ({exc or type(exc).__name__}); "
-                "cleanix restore is still safe"
-            )
+            from cleanix.core.quarantine import ManifestConflict
+
+            why = str(exc) or type(exc).__name__
+            if isinstance(exc, ManifestConflict):
+                # The manifest on disk is not this run's: Undo cannot be
+                # promised; point at the backup files themselves.
+                where = getattr(sink, "dir", None) or getattr(sink, "backup_dir", None)
+                note = (
+                    f"the undo record could not be saved ({why}); "
+                    f"the backup files are in {where}"
+                )
+            else:
+                # The manifest still holds the entry with "deleted": None,
+                # which restore treats as restorable, so undo stays safe.
+                note = (
+                    f"the undo record could not be updated ({why}); "
+                    "cleanix restore is still safe"
+                )
             if error is None:
                 return CleanOutcome(item=item, removed=True, freed=0,
                                     error=f"deleted, but {note}")

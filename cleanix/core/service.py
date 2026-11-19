@@ -38,6 +38,10 @@ class CleanSummary:
     removed: int = 0
     errors: List[CleanOutcome] = field(default_factory=list)
     cancelled: bool = False
+    # Set when the quarantine run's final manifest save failed after items
+    # were removed; ``quarantine_run`` is still set and the text says where
+    # the backup files are.
+    undo_record_error: Optional[str] = None
 
 
 def scan(
@@ -76,6 +80,7 @@ def clean(
     cancel: CancelCB = None,
     record_history: bool = True,
     registry_backup_elsewhere: bool = False,
+    registry_backup_run: Optional[str] = None,
     registry_backup_dir: Optional[Path] = None,
 ) -> CleanSummary:
     """Clean ``items``. ``cancel`` must be thread-safe: it may be called from
@@ -91,12 +96,17 @@ def clean(
     ``use_quarantine`` is False (files are then still deleted, not moved).
     ``registry_backup_elsewhere=True`` (the elevated helper only) means the
     backup was already written by the GUI as the user into the quarantine run
-    at ``registry_backup_dir``; no run is created and
-    :class:`regclean.VerifyOnlySink` deletes only HKLM entries for which a
-    validated backup with the same fingerprint exists there (every other
-    registry item fails with "backup is required for this entry"). Without
-    it, a real registry clean needs ``record_history=True`` because the run
-    must be saved.
+    ``registry_backup_run`` (a run id of the invoking account's quarantine;
+    ``registry_backup_dir`` is a deprecated alias accepted only when it is
+    exactly such a run directory). No run is created and
+    :class:`regclean.VerifyOnlySink` deletes only HKLM entries that run would
+    restore (every other registry item fails with "backup is required for
+    this entry"). Without it, a real registry clean needs
+    ``record_history=True`` because the run must be saved.
+
+    Once items were removed, a failing final manifest save is not raised:
+    ``quarantine_run`` is still returned and ``undo_record_error`` says
+    where the backup files are.
     """
     from cleanix.core import regclean
 
@@ -127,10 +137,16 @@ def clean(
     quarantine = run if use_quarantine else None
     registry_backup = None
     if not dry_run:
-        registry_backup = (
-            regclean.VerifyOnlySink(registry_backup_dir)
-            if registry_backup_elsewhere else run
-        )
+        if registry_backup_elsewhere:
+            if registry_backup_run is not None:
+                bound = registry_backup_run
+            elif registry_backup_dir is not None:  # deprecated alias
+                bound = Path(registry_backup_dir)
+            else:
+                bound = None
+            registry_backup = regclean.VerifyOnlySink(bound)
+        else:
+            registry_backup = run
 
     result = Engine([]).clean(
         items, dry_run=dry_run, quarantine=quarantine,
@@ -143,9 +159,17 @@ def clean(
         history.record(result.freed, result.removed_count,
                        mode="quarantine" if quarantine else "delete")
         manifest = history.write_manifest(result) or None
+    undo_error: Optional[str] = None
     if run is not None and run.items:
-        run.save()
         run_id = run.run_id
+        try:
+            run.save()
+        except OSError as exc:  # incl. ManifestConflict
+            # Items are already removed: never lose the summary over this.
+            undo_error = (
+                f"the undo record could not be saved ({str(exc) or type(exc).__name__}); "
+                f"the backup files are in {run.dir}"
+            )
     elif run is not None:
         run.discard_if_empty()
 
@@ -157,4 +181,5 @@ def clean(
         removed=result.removed_count,
         errors=result.errors,
         cancelled=bool(cancel is not None and cancel()),
+        undo_record_error=undo_error,
     )

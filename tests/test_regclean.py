@@ -8,6 +8,7 @@ touched (the autouse ForbiddenBackend fixture enforces that).
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -596,7 +597,7 @@ def test_service_helper_mode_writes_nothing(state, fake_registry, monkeypatch):
     reg.calls.clear()
     summary = service.clean([item], Config(), dry_run=False, use_quarantine=False,
                             record_history=False, registry_backup_elsewhere=True,
-                            registry_backup_dir=gui_run.dir)
+                            registry_backup_run=gui_run.run_id)
     assert summary.removed == 1, summary.errors
     assert summary.quarantine_run is None
     assert sorted(p.name for p in (state / "q").iterdir()) == before
@@ -676,6 +677,9 @@ def test_restore_skips_not_deleted_entries(state, fake_registry):
     res = quarantine.restore(run.run_id)
     assert res == {"restored": [], "failed": []}
     assert _writes(reg) == []
+    # Nothing was consumed: the run and its backup are kept.
+    assert (run.dir / "manifest.json").is_file()
+    assert list((run.dir / "registry").glob("*__registry.json"))
 
 
 def test_restore_ignores_paths_outside_the_run(state, fake_registry, tmp_path):
@@ -749,10 +753,10 @@ def test_verify_only_sink_writes_nothing(state, fake_registry):
     item = _item(fake_registry, hive="HKLM")
     run = quarantine.new_run()
     run.store_registry(item, fake_registry)
-    sink = regclean.VerifyOnlySink(run.dir)
     fake_registry.calls.clear()
-    sink.before_delete(item, fake_registry)
-    sink.after_delete(item, True)
+    for sink in (regclean.VerifyOnlySink(run.run_id), regclean.VerifyOnlySink(run.dir)):
+        sink.before_delete(item, fake_registry)
+        sink.after_delete(item, True)
     assert fake_registry.calls == []
 
 
@@ -860,7 +864,7 @@ def test_elsewhere_refuses_hkcu(state, fake_registry):
     reg.calls.clear()
     s = service.clean([item], Config(), dry_run=False, use_quarantine=False,
                       record_history=False, registry_backup_elsewhere=True,
-                      registry_backup_dir=run.dir)
+                      registry_backup_run=run.run_id)
     assert s.removed == 0
     assert "backup is required for this entry" in s.errors[0].error
     assert _writes(reg) == [] and reg.key_exists("HKCU", FOO)
@@ -877,11 +881,11 @@ def test_elsewhere_hklm_without_valid_backup_refused(state, fake_registry, monke
     run.store_registry(other, reg)  # a backup, but of another entry
     empty = tmp_path / "empty"
     empty.mkdir()
-    for d in (None, empty, run.dir):
+    for kw in ({}, {"registry_backup_dir": empty}, {"registry_backup_run": run.run_id},
+               {"registry_backup_dir": run.dir}):
         s = service.clean([item], Config(), dry_run=False, use_quarantine=False,
-                          record_history=False, registry_backup_elsewhere=True,
-                          registry_backup_dir=d)
-        assert s.removed == 0, d
+                          record_history=False, registry_backup_elsewhere=True, **kw)
+        assert s.removed == 0, kw
         assert "backup is required for this entry" in s.errors[0].error
     # A tampered backup of the right entry does not count either.
     run.store_registry(item, reg)
@@ -891,7 +895,7 @@ def test_elsewhere_hklm_without_valid_backup_refused(state, fake_registry, monke
     jp.write_text(json.dumps(doc), encoding="ascii")
     s = service.clean([item], Config(), dry_run=False, use_quarantine=False,
                       record_history=False, registry_backup_elsewhere=True,
-                      registry_backup_dir=run.dir)
+                      registry_backup_run=run.run_id)
     assert s.removed == 0
     assert _writes(reg) == [] and reg.key_exists("HKLM", FOO + r"\Sub\Deeper")
 
@@ -914,9 +918,272 @@ def test_elsewhere_partial_names_backup_location(state, fake_registry, monkeypat
     reg.delete_key = flaky
     s = service.clean([item], Config(), dry_run=False, use_quarantine=False,
                       record_history=False, registry_backup_elsewhere=True,
-                      registry_backup_dir=run.dir)
+                      registry_backup_run=run.run_id)
     err = s.errors[0].error
-    assert err.startswith("partially deleted") and str(run.dir) in err
+    assert err.startswith("partially deleted") and f"cleanix restore {run.run_id}" in err
+
+
+# == fix round 2 ====================================================================
+# -- N1: the helper's sink is bound to a run of this account ------------------------------
+def _gui_backup(reg, monkeypatch):
+    monkeypatch.setattr(winenv, "is_admin", lambda: True)
+    _foo_tree(reg, hive="HKLM")
+    item = _item(reg, hive="HKLM")
+    run = quarantine.new_run()
+    run.store_registry(item, reg)
+    return item, run
+
+
+def _helper_clean(item, **kw):
+    return service.clean([item], Config(), dry_run=False, use_quarantine=False,
+                         record_history=False, registry_backup_elsewhere=True, **kw)
+
+
+def test_sink_refuses_backup_marked_not_deleted(state, fake_registry, monkeypatch):
+    reg = fake_registry
+    item, run = _gui_backup(reg, monkeypatch)
+    run.mark_registry(item, False)  # Undo would skip this entry
+    s = _helper_clean(item, registry_backup_run=run.run_id)
+    assert s.removed == 0 and "backup is required for this entry" in s.errors[0].error
+    assert reg.key_exists("HKLM", FOO + r"\Sub\Deeper")
+    # ...and Undo of that run keeps its only backup.
+    from cleanix.core import regbackup
+
+    monkeypatch.setattr(regbackup, "owner_is_current_user", lambda p: True)
+    assert quarantine.restore(run.run_id, allow_machine_restore=True) == {
+        "restored": [], "failed": []}
+    assert list((run.dir / "registry").glob("*__registry.json"))
+
+
+def test_sink_refuses_orphan_backup_outside_a_run(state, fake_registry, monkeypatch, tmp_path):
+    reg = fake_registry
+    item, run = _gui_backup(reg, monkeypatch)
+    for name in ("outside", ):
+        loose = tmp_path / name
+        loose.mkdir()
+        for f in (run.dir / "registry").iterdir():
+            shutil.copy(f, loose / f.name)
+    # A copy under the root but without a manifest entry.
+    inside = state / "q" / "loose-run"
+    (inside / "registry").mkdir(parents=True)
+    for f in (run.dir / "registry").iterdir():
+        shutil.copy(f, inside / "registry" / f.name)
+    shutil.rmtree(run.dir)
+    for kw in ({"registry_backup_dir": tmp_path / "outside"},
+               {"registry_backup_run": "loose-run"},
+               {"registry_backup_run": run.run_id}):
+        s = _helper_clean(item, **kw)
+        assert s.removed == 0, kw
+    assert _writes(reg) == [] and reg.key_exists("HKLM", FOO)
+
+
+@pytest.mark.parametrize("bad", ["..", ".", "", "a/b", "a\\b", "..\\q", "/abs", "C:x", "x\x00"])
+def test_sink_refuses_unsafe_run_ids(state, fake_registry, monkeypatch, bad):
+    reg = fake_registry
+    item, run = _gui_backup(reg, monkeypatch)
+    sink = regclean.VerifyOnlySink(bad)
+    with pytest.raises(Exception) as ei:
+        sink.before_delete(item, reg)
+    assert "backup is required for this entry" in str(ei.value)
+
+
+def test_sink_path_must_be_under_root(state, fake_registry, monkeypatch, tmp_path):
+    reg = fake_registry
+    item, run = _gui_backup(reg, monkeypatch)
+    regclean.VerifyOnlySink(run.dir).before_delete(item, reg)  # inside: fine
+    with pytest.raises(Exception):
+        regclean.VerifyOnlySink(run.dir / "registry").before_delete(item, reg)
+    with pytest.raises(Exception):
+        regclean.VerifyOnlySink(state / "q" / "x" / ".." / run.run_id / "..").before_delete(item, reg)
+
+
+def test_sink_matches_cleaner_target_and_fingerprint_exactly(state, fake_registry, monkeypatch):
+    reg = fake_registry
+    item, run = _gui_backup(reg, monkeypatch)
+    sink = regclean.VerifyOnlySink(run.run_id)
+    sink.before_delete(item, reg)
+    variants = [
+        CleanableItem(cleaner_id="win_reg_app_paths", description="x",
+                      kind=ItemKind.REGISTRY, reg=item.reg, requires_root=True),
+        CleanableItem(cleaner_id=item.cleaner_id, description="x", kind=ItemKind.REGISTRY,
+                      reg=RegTarget("HKLM", FOO, None, "0" * 64), requires_root=True),
+        CleanableItem(cleaner_id=item.cleaner_id, description="x", kind=ItemKind.REGISTRY,
+                      reg=RegTarget("HKLM", UNINST + r"\Other", None, item.reg.fingerprint),
+                      requires_root=True),
+        CleanableItem(cleaner_id=item.cleaner_id, description="x", kind=ItemKind.REGISTRY,
+                      reg=RegTarget("HKLM", FOO, "DisplayName", item.reg.fingerprint),
+                      requires_root=True),
+    ]
+    for v in variants:
+        with pytest.raises(Exception) as ei:
+            sink.before_delete(v, reg)
+        assert "backup is required for this entry" in str(ei.value), v
+
+
+def test_sink_manifest_and_json_must_agree(state, fake_registry, monkeypatch):
+    """A manifest entry whose json file is another entry's backup is refused."""
+    reg = fake_registry
+    item, run = _gui_backup(reg, monkeypatch)
+    reg.add_key("HKLM", UNINST + r"\Bar", {"DisplayName": (REG_SZ, "Bar")})
+    other = _item(reg, hive="HKLM", key=UNINST + r"\Bar")
+    run.store_registry(other, reg)
+    data = _manifest(run.dir)
+    data["items"][0]["json"], data["items"][1]["json"] = (
+        data["items"][1]["json"], data["items"][0]["json"])
+    (run.dir / "manifest.json").write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(Exception):
+        regclean.VerifyOnlySink(run.run_id).before_delete(item, reg)
+
+
+def test_restore_keeps_run_unless_fully_consumed(state, fake_registry):
+    reg = fake_registry
+    _foo_tree(reg)
+    reg.add_key("HKCU", UNINST + r"\Bar", {"DisplayName": (REG_SZ, "Bar")})
+    a, b = _item(reg), _item(reg, key=UNINST + r"\Bar")
+    run = quarantine.new_run()
+    Engine([]).clean([a], dry_run=False, registry_backup=run)
+    run.store_registry(b, reg)
+    run.mark_registry(b, False)
+    res = quarantine.restore(run.run_id)
+    assert res == {"restored": [a.reg.display], "failed": []}
+    assert run.dir.is_dir()  # b's backup is still there
+    # A run whose every entry was restored is removed as before.
+    run2 = quarantine.new_run()
+    reg.add_key("HKCU", UNINST + r"\Baz", {"DisplayName": (REG_SZ, "Baz")})
+    c = _item(reg, key=UNINST + r"\Baz")
+    Engine([]).clean([c], dry_run=False, registry_backup=run2)
+    assert quarantine.restore(run2.run_id)["restored"] == [c.reg.display]
+    assert not run2.dir.exists()
+
+
+def test_external_manifest_change_vetoes_next_delete(state, fake_registry):
+    reg = fake_registry
+    _foo_tree(reg)
+    reg.add_key("HKCU", UNINST + r"\Bar", {"DisplayName": (REG_SZ, "Bar")})
+    a, b = _item(reg), _item(reg, key=UNINST + r"\Bar")
+    run = quarantine.new_run()
+    real_after = run.after_delete
+
+    def after(item, deleted):
+        real_after(item, deleted)
+        mf = run.dir / "manifest.json"
+        mf.write_bytes(mf.read_bytes() + b" ")  # someone else touched it
+
+    run.after_delete = after
+    res = Engine([]).clean([a, b], dry_run=False, registry_backup=run)
+    assert res.outcomes[0].removed is True
+    assert res.outcomes[1].removed is False
+    assert res.outcomes[1].error.startswith("backup failed, nothing deleted")
+    assert reg.key_exists("HKCU", UNINST + r"\Bar")
+
+
+def test_backup_failure_after_claim_leaves_no_empty_run(state, fake_registry, monkeypatch):
+    from cleanix.core import regbackup
+
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+
+    def fail(directory, *a, **k):
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        raise regbackup.BackupError("disk full")
+
+    monkeypatch.setattr(regbackup, "write_backup", fail)
+    s = service.clean([item], Config(), dry_run=False, use_quarantine=False)
+    assert s.removed == 0 and s.quarantine_run is None
+    assert list((state / "q").iterdir()) == []
+
+
+def test_latest_run_sorts_by_creation_time(state):
+    root = state / "q"
+    for rid, created in (("20261119-120000-99999-aaaa", 2.0),
+                         ("20261119-120000-100000-bbbb", 1.0)):
+        (root / rid).mkdir(parents=True)
+        (root / rid / "manifest.json").write_text(json.dumps(
+            {"run_id": rid, "created": created, "items": []}), encoding="utf-8")
+    assert quarantine.latest_run() == "20261119-120000-99999-aaaa"
+
+
+# -- N2: an informative machine-restore confirmation ----------------------------------------
+def test_describe_shows_types_data_and_escapes(state, fake_registry, monkeypatch):
+    from cleanix.core.winregistry import REG_BINARY, REG_MULTI_SZ, REG_QWORD
+
+    monkeypatch.setattr(winenv, "is_admin", lambda: True)
+    reg = fake_registry
+    long = "C:\\x\\" + "a" * 400
+    reg.add_key("HKLM", FOO, {
+        "Upd\u202eexe.dab": (REG_SZ, "evil.exe\r\n--flag"),
+        "Long": (REG_SZ, long),
+        "Bin": (REG_BINARY, bytes(range(40))),
+        "Multi": (REG_MULTI_SZ, ("one", "tw\u200eo", "")),
+        "Q": (REG_QWORD, 2 ** 40),
+    })
+    reg.add_key("HKLM", FOO + "\\Sub\u202e", {"": (REG_SZ, "default")})
+    item = _item(reg, hive="HKLM")
+    s = service.clean([item], Config(), dry_run=False, use_quarantine=False)
+    assert s.removed == 1, s.errors
+    lines = quarantine.describe_registry_entries(s.quarantine_run)
+    text = "\n".join(lines)
+    assert lines[0] == quarantine.MACHINE_WARNING
+    assert "\u202e" not in text and "\u200e" not in text and "\r" not in text
+    assert '[Upd\\u202eexe.dab] = REG_SZ "evil.exe\\u000d\\u000a--flag"' in text
+    assert "Sub\\u202e [(Default)] = REG_SZ \"default\"" in text
+    assert "REG_SZ \"" + long[:300] + "\u2026\" (" + str(len(long)) + " characters)" in text
+    assert "REG_BINARY " + bytes(range(32)).hex(" ") + " \u2026 (40 bytes)" in text
+    assert "REG_QWORD 1099511627776 (0x0000010000000000)" in text
+    assert '    "one"' in lines and '    "tw\\u200eo"' in lines and '    ""' in lines
+
+
+def test_describe_lists_only_entries_restore_would_touch(state, fake_registry, monkeypatch):
+    reg = fake_registry
+    monkeypatch.setattr(winenv, "is_admin", lambda: True)
+    _foo_tree(reg, hive="HKLM")
+    reg.add_key("HKLM", UNINST + r"\Bar", {"DisplayName": (REG_SZ, "Bar")})
+    a, b = _item(reg, hive="HKLM"), _item(reg, hive="HKLM", key=UNINST + r"\Bar")
+    run = quarantine.new_run()
+    Engine([]).clean([a], dry_run=False, registry_backup=run, allow_root_items=True)
+    run.store_registry(b, reg)
+    run.mark_registry(b, False)
+    text = "\n".join(quarantine.describe_registry_entries(run.run_id))
+    assert FOO in text and "Bar" not in text
+
+
+# -- N3: the final save after deletes is non-fatal --------------------------------------------
+@pytest.mark.parametrize("mode", ["oserror", "conflict"])
+def test_final_save_failure_is_reported_not_raised(state, fake_registry, monkeypatch, mode):
+    reg = fake_registry
+    _foo_tree(reg)
+    item = _item(reg)
+    real_new = quarantine.new_run
+
+    def new_run():
+        r = real_new()
+        real_save, n = r.save, [0]
+
+        def save():
+            n[0] += 1
+            if n[0] >= 2:
+                if mode == "conflict":
+                    raise quarantine.ManifestConflict("not this run's manifest")
+                raise OSError("disk full")
+            return real_save()
+
+        r.save = save
+        return r
+
+    monkeypatch.setattr(quarantine, "new_run", new_run)
+    monkeypatch.setattr(quarantine.time, "sleep", lambda s: None)
+    s = service.clean([item], Config(), dry_run=False, use_quarantine=False)
+    assert s.removed == 1 and not reg.key_exists("HKCU", FOO)
+    assert s.quarantine_run
+    assert s.undo_record_error and "the backup files are in" in s.undo_record_error
+    assert history.stats()["runs"] == 1
+    note = s.result.outcomes[0].error
+    assert note.startswith("deleted, but")
+    if mode == "conflict":
+        assert "still safe" not in note and "the backup files are in" in note
+    else:
+        assert "cleanix restore is still safe" in note
 
 
 # -- I2: machine restore needs confirmation, ownership ---------------------------------------
@@ -937,13 +1204,21 @@ def test_hklm_restore_needs_explicit_confirmation(state, fake_registry, monkeypa
     monkeypatch.setattr(regbackup, "owner_is_current_user", lambda p: True)
     res = quarantine.restore(run_id)  # admin, but not confirmed
     (_orig, reason), = res["failed"]
-    assert f"cleanix restore {run_id}" in reason and "reg import" in reason
+    assert "explicit confirmation" in reason and run_id in reason
+    assert "Administrator terminal" not in reason
     assert not reg.key_exists("HKLM", FOO)
     lines = quarantine.describe_registry_entries(run_id)
     assert lines == quarantine.Quarantine.describe_registry_entries(run_id)
+    assert lines[0] == quarantine.MACHINE_WARNING
     assert "HKLM\\" + FOO in lines
-    assert "HKLM\\" + FOO + " [DisplayName]" in lines
-    assert "HKLM\\" + FOO + r"\Sub\Deeper [B]" in lines
+    assert "HKLM\\" + FOO + ' [DisplayName] = REG_SZ "Foo App"' in lines
+    assert "HKLM\\" + FOO + " [EstimatedSize] = REG_DWORD 42 (0x0000002a)" in lines
+    assert "HKLM\\" + FOO + r"\Sub\Deeper [B] = REG_DWORD 1 (0x00000001)" in lines
+    # Not confirmed, not admin: the Administrator-terminal advice as before.
+    monkeypatch.setattr(winenv, "is_admin", lambda: False)
+    (_orig, reason), = quarantine.restore(run_id)["failed"]
+    assert f"cleanix restore {run_id}" in reason and "reg import" in reason
+    monkeypatch.setattr(winenv, "is_admin", lambda: True)
     res = quarantine.restore(run_id, allow_machine_restore=True)
     assert res == {"restored": [item.reg.display], "failed": []}
     assert reg.key_exists("HKLM", FOO + r"\Sub\Deeper")
