@@ -48,7 +48,10 @@ def run(argv: Sequence[str], timeout: int = 60) -> tuple[int, str, str]:
     """Run an allowlisted read-only command under the C locale."""
     if tuple(argv[:2]) not in READ_ONLY_COMMANDS:
         return 126, "", "refused"
-    return run_command(["env", "LC_ALL=C", *argv], timeout)
+    try:
+        return run_command(["env", "LC_ALL=C", *argv], timeout)
+    except Exception:  # noqa: BLE001 - e.g. UnicodeDecodeError on odd filenames
+        return 125, "", ""  # unknown, never "unowned"
 
 
 def tool(name: str) -> Optional[str]:
@@ -75,11 +78,18 @@ class ScanBudget:
         self.max_items = max_items
         self.max_seconds = max_seconds
         self._clock = clock
-        self._start = clock()
+        # The clock starts lazily (start()/first use) so a budget built in
+        # __init__ is not already spent when a scan begins much later.
+        self._start: Optional[float] = None
         self._taken = 0
         self.stop_reason: Optional[str] = None
 
+    def start(self) -> None:
+        self._start = self._clock()
+
     def expired(self) -> bool:
+        if self._start is None:
+            self.start()
         if self._clock() - self._start >= self.max_seconds:
             if self.stop_reason is None:
                 self.stop_reason = "time limit"
@@ -137,6 +147,8 @@ def bounded_size(path: Path, budget: ScanBudget) -> tuple[int, bool]:
     if not _stat.S_ISDIR(st.st_mode):
         return total, True
     root_dev = device_of(path)
+    if root_dev is None:
+        return total, False
     complete = True
     stack = [path]
     while stack:
@@ -170,7 +182,11 @@ def bounded_size(path: Path, budget: ScanBudget) -> tuple[int, bool]:
                     # device_of (path lstat), not entry.stat(): scandir stats
                     # carry no st_dev on Windows. Mount points are dirs.
                     child = Path(entry.path)
-                    if device_of(child) != root_dev:
+                    cdev = device_of(child)
+                    if cdev is None:
+                        complete = False
+                        continue
+                    if cdev != root_dev:
                         continue
                     total += _allocated_bytes(est)
                     stack.append(child)
@@ -231,6 +247,8 @@ def safe_label(text: str) -> str:
 
 
 def bad_name(name: str) -> bool:
+    """True for names with newline, CR or NUL. Detectors MUST skip such
+    directory entries (they could forge output lines or break hints)."""
     return any(c in name for c in ("\n", "\r", "\0"))
 
 
@@ -269,8 +287,10 @@ def owner_check_command(backend: Optional[str], logical: str) -> Optional[str]:
     return f"{prefix} {shlex.quote(logical)}"
 
 
-def _parse(paths, rc, text, patterns) -> Optional[set]:
-    if rc not in (0, 1):
+def _parse(paths, rc, text, patterns, max_rc: int = 1) -> Optional[set]:
+    # Only rc 0..max_rc is a real answer; 124 (timeout), 125/126/127 (unknown,
+    # refused, missing) and anything larger mean "unknown", never "unowned".
+    if not (0 <= rc <= max_rc):
         return None
     lines = {ln.strip() for ln in text.splitlines()}
     return {p for p in paths if any(pat.format(p=p) in lines for pat in patterns)}
@@ -286,7 +306,8 @@ def parse_dpkg(paths, rc, out, err) -> Optional[set]:
 
 def parse_rpm(paths, rc, out, err) -> Optional[set]:
     return _parse(
-        paths, rc, f"{out}\n{err}", ("file {p} is not owned by any package",)
+        paths, rc, f"{out}\n{err}", ("file {p} is not owned by any package",),
+        max_rc=len(paths),  # rpm -qf exits with the number of failed queries
     )
 
 
@@ -304,6 +325,17 @@ _QUERY_ARGV = {
     "pacman": ["pacman", "-Qo"],
 }
 _GLOB_CHARS = set("*?[]\\")
+_MERGED = ("bin", "sbin", "lib", "lib32", "lib64", "libx32")
+
+
+def _usr_alias(p: str) -> Optional[str]:
+    """The usr-merge twin of ``p`` (/bin/x <-> /usr/bin/x), else None."""
+    for d in _MERGED:
+        if p == f"/{d}" or p.startswith(f"/{d}/"):
+            return "/usr" + p
+        if p == f"/usr/{d}" or p.startswith(f"/usr/{d}/"):
+            return p[len("/usr"):]
+    return None
 
 
 def query_unowned(
@@ -314,10 +346,21 @@ def query_unowned(
     batch: int = 100,
     timeout: int = 60,
 ) -> set:
-    """Subset of ``logical_paths`` that no package owns (positive evidence only)."""
+    """Subset of ``logical_paths`` that no package owns (positive evidence only).
+
+    Skipped (counted as owned): paths with glob characters or with newline /
+    CR / NUL (a crafted name could forge an "unowned" output line). A path in a
+    usr-merge alias pair is unowned only if both forms are unowned.
+    """
     if backend not in _PARSERS:
         return set()
-    queryable = [p for p in logical_paths if not (_GLOB_CHARS & set(p))]
+    wanted = [
+        p for p in logical_paths
+        if not (_GLOB_CHARS & set(p)) and not bad_name(p)
+    ]
+    queryable = list(dict.fromkeys(
+        q for p in wanted for q in (p, _usr_alias(p)) if q
+    ))
     unowned: set = set()
     for i in range(0, len(queryable), batch):
         if budget.expired():
@@ -327,7 +370,12 @@ def query_unowned(
         res = _PARSERS[backend](chunk, rc, out, err)
         if res:
             unowned |= res
-    return unowned
+    result = set()
+    for p in wanted:
+        alias = _usr_alias(p)
+        if p in unowned and (alias is None or alias in unowned):
+            result.add(p)
+    return result
 
 
 def installed_package_names(backend: str) -> Optional[set]:
@@ -372,6 +420,9 @@ def name_matches(name: str, names: set) -> bool:
 
 
 # ---------------------------------------------------------------- reporter
+MAX_NOTES = 25  # per scan; a detector yielding more gets one "suppressed" note
+
+
 class OrphanReporter(Cleaner):
     """Base for report-only orphan detectors."""
 
@@ -388,9 +439,11 @@ class OrphanReporter(Cleaner):
         )
         self._system_done = False
         self._stop_noted = False
+        self._notes = 0
 
     def scan(self):
         self._reset()
+        self.budget.start()  # the clock runs from scan start, not construction
         return super().scan()
 
     def pkg_backend(self) -> Optional[str]:
@@ -408,6 +461,8 @@ class OrphanReporter(Cleaner):
         return Finding(path, label, hint, requires_root, note=True)
 
     def find_items(self):
+        if self.budget.stop_reason:
+            return  # an earlier pass (e.g. another user) already ran out
         if not self._system_done:
             self._system_done = True
             yield from self._emit(self.system_findings())
@@ -416,7 +471,18 @@ class OrphanReporter(Cleaner):
     def _emit(self, findings: Iterable[Finding]):
         for f in findings:
             if f.note:
-                yield self._item(f, 0, True)
+                self._notes += 1
+                if self._notes <= MAX_NOTES:
+                    yield self._item(f, 0, True)
+                elif self._notes == MAX_NOTES + 1:
+                    yield self._item(
+                        Finding(
+                            f.path, "More notes suppressed",
+                            "Further unreadable or skipped locations are not listed.",
+                            requires_root=False, note=True,
+                        ),
+                        0, True,
+                    )
                 continue
             if not self.budget.take():
                 if not self._stop_noted:

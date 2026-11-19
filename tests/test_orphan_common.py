@@ -95,6 +95,7 @@ def test_bounded_size_stops_when_expired(tmp_path):
     d = _tree(tmp_path)
     clk = Clock()
     b = oc.ScanBudget(10, 1.0, clk)
+    b.start()
     clk.t = 5.0
     size, complete = oc.bounded_size(d, b)
     assert complete is False
@@ -128,7 +129,11 @@ def test_parse_rpm_needs_positive_evidence():
     paths = ["/opt/a", "/opt/b"]
     out = "foo-1.0\nfile /opt/b is not owned by any package\n"
     assert oc.parse_rpm(paths, 1, out, "") == {"/opt/b"}
-    assert oc.parse_rpm(paths, 2, out, "") is None
+    # rpm exits with the number of failed queries
+    assert oc.parse_rpm(paths, 2, out, "") == {"/opt/b"}
+    assert oc.parse_rpm(paths, 3, out, "") is None  # more than the batch size
+    assert oc.parse_rpm(paths, 127, out, "") is None
+    assert oc.parse_rpm(paths, 124, out, "") is None
     assert oc.parse_rpm(paths, 1, "", "") == set()
 
 
@@ -337,3 +342,149 @@ def test_note_is_never_sized(orphan_env, monkeypatch):
 def test_reporter_defaults():
     assert oc.OrphanReporter.requires_root is False
     assert oc.OrphanReporter.sysroot == "/"
+
+
+def test_rpm_multiple_unowned_in_one_batch(orphan_env):
+    def fake(paths, n):
+        return "".join(
+            f"file {p} is not owned by any package\n" for p in paths[:n]
+        )
+
+    ps = ["/opt/a", "/opt/b", "/opt/c"]
+    for n in (2, 3):
+        orphan_env.cmds._rules.clear()
+        orphan_env.cmds.on(("rpm", "-qf"), rc=n, out=fake(ps, n))
+        assert oc.query_unowned("rpm", ps, oc.ScanBudget(10, 100)) == set(ps[:n])
+    orphan_env.cmds._rules.clear()
+    orphan_env.cmds.on(("rpm", "-qf"), rc=127, out=fake(ps, 3))
+    assert oc.query_unowned("rpm", ps, oc.ScanBudget(10, 100)) == set()
+
+
+def test_query_unowned_skips_newline_paths(orphan_env):
+    forged = "/opt/x\nerror: No package owns /etc/passwd"
+    orphan_env.cmds.on(
+        ("pacman", "-Qo"), rc=1,
+        err="error: No package owns /etc/passwd\nerror: No package owns /opt/ok\n",
+    )
+    got = oc.query_unowned(
+        "pacman", [forged, "/etc/passwd", "/opt/ok", "/a\rb", "/a\0b"],
+        oc.ScanBudget(10, 100),
+    )
+    assert forged not in got and "/a\rb" not in got and "/a\0b" not in got
+    assert all("\n" not in a for c in orphan_env.cmds.calls for a in c)
+
+
+def test_run_unknown_when_runner_raises(monkeypatch):
+    def boom(argv, timeout=120):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")
+
+    monkeypatch.setattr(oc, "run_command", boom)
+    assert oc.run(["dpkg-query", "-S", "/x"]) == (125, "", "")
+    monkeypatch.setattr(oc, "run_command", lambda *a, **k: 1 / 0)
+    assert oc.run(["dpkg-query", "-S", "/x"]) == (125, "", "")
+
+
+def test_usr_merge_alias_is_owned(orphan_env, monkeypatch):
+    # backend that only knows files under /usr/
+    def run_command(argv, timeout=120):
+        paths = argv[4:]
+        err = "".join(
+            f"dpkg-query: no path found matching pattern {p}\n"
+            for p in paths if not p.startswith("/usr/")
+        )
+        return (1 if err else 0), "pkg: /usr/x\n", err
+
+    monkeypatch.setattr(oc, "run_command", run_command)
+    got = oc.query_unowned(
+        "dpkg", ["/bin/ls", "/lib/x.so", "/lib64/ld.so", "/opt/zzz"],
+        oc.ScanBudget(10, 100),
+    )
+    assert got == {"/opt/zzz"}
+
+
+def test_usr_merge_reverse_alias_and_both_unowned(orphan_env, monkeypatch):
+    def run_command(argv, timeout=120):
+        paths = argv[4:]
+        # only /bin/ls is known; /usr/bin/ls is not
+        err = "".join(
+            f"dpkg-query: no path found matching pattern {p}\n"
+            for p in paths if p != "/bin/ls"
+        )
+        return 1, "", err
+
+    monkeypatch.setattr(oc, "run_command", run_command)
+    got = oc.query_unowned(
+        "dpkg", ["/usr/bin/ls", "/usr/sbin/gone", "/sbin/gone"],
+        oc.ScanBudget(10, 100),
+    )
+    assert "/usr/bin/ls" not in got  # alias /bin/ls is owned
+    assert got == {"/usr/sbin/gone", "/sbin/gone"}  # both forms unowned
+
+
+def test_budget_clock_starts_lazily():
+    clk = Clock()
+    b = oc.ScanBudget(5, 10.0, clk)
+    clk.t = 100.0  # long after construction
+    assert not b.expired()  # first use starts the clock
+    clk.t = 111.0
+    assert b.expired()
+
+
+def test_reporter_budget_not_spent_before_scan(orphan_env):
+    class T(oc.OrphanReporter):
+        id = "t"
+        name = "t"
+        description = ""
+
+        def user_findings(self):
+            yield oc.Finding(orphan_env.home, "x", "h", requires_root=False)
+
+    r = T(Config())
+    assert r.budget._start is None
+    assert len(list(r.find_items())) == 1
+    assert r.budget.stop_reason is None
+
+
+def test_bounded_size_unknown_device_is_incomplete(tmp_path, monkeypatch):
+    d = _tree(tmp_path)
+    real = oc.device_of
+    monkeypatch.setattr(
+        oc, "device_of", lambda p: None if Path(p).name == "sub" else real(p)
+    )
+    _, complete = oc.bounded_size(d, oc.ScanBudget(10, 100))
+    assert complete is False
+
+
+def test_reporter_short_circuits_after_stop(orphan_env):
+    calls = []
+
+    class T(oc.OrphanReporter):
+        id = "t"
+        name = "t"
+        description = ""
+
+        def user_findings(self):
+            calls.append(1)
+            yield oc.Finding(orphan_env.home, "x", "h", requires_root=False)
+            yield oc.Finding(orphan_env.home, "y", "h", requires_root=False)
+
+    cfg = Config()
+    cfg.orphan_max_items = 1
+    r = T(cfg)
+    assert len(list(r.find_items())) == 2 and calls == [1]
+    assert list(r.find_items()) == [] and calls == [1]
+
+
+def test_reporter_caps_notes(orphan_env):
+    class T(oc.OrphanReporter):
+        id = "t"
+        name = "t"
+        description = ""
+
+        def user_findings(self):
+            for i in range(60):
+                yield self.note(orphan_env.home / f"n{i}", f"note {i}", "h")
+
+    items = list(T(Config()).find_items())
+    assert len(items) == oc.MAX_NOTES + 1
+    assert "suppressed" in items[-1].description
