@@ -204,6 +204,9 @@ class CleanOutcome:
     freed: int = 0
     error: Optional[str] = None
     dry_run: bool = False
+    # Not an error: what else the user should know (e.g. a finding removed
+    # permanently with a copy kept, or a best-effort step that failed).
+    note: Optional[str] = None
 
 
 @dataclass

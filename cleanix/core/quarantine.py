@@ -231,6 +231,43 @@ class Quarantine:
             raise
         self.items.append({"original": src_s, "stored": dest_s, "size": size})
 
+    def store_copy(self, path: os.PathLike | str) -> str:
+        """Copy one regular file into this run (metadata kept) and save the
+        manifest before returning the stored path.
+
+        The entry has ``"type": "copy"``: it is a backup for manual recovery
+        of something removed permanently, never an Undo, so :func:`restore`
+        does not act on it. A link, reparse point or non-regular file is
+        refused (OSError). All or nothing: on failure no entry and no copy is
+        left behind."""
+        import stat as _stat
+
+        src = os.path.abspath(str(path))
+        st = os.lstat(src)
+        if (not _stat.S_ISREG(st.st_mode)
+                or getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT):
+            raise OSError(f"refusing to copy {src}: not a regular file")
+        self._claim()
+        self.files_dir.mkdir(parents=True, exist_ok=True)
+        idx = len(self.items)
+        dest = self.files_dir / f"{idx}__{os.path.basename(src)}"
+        try:
+            shutil.copy2(src, str(dest), follow_symlinks=False)
+            self.items.append({"type": "copy", "original": src, "stored": str(dest),
+                               "size": st.st_size})
+            try:
+                self.save()
+            except BaseException:
+                self.items.pop()
+                raise
+        except BaseException:
+            try:
+                os.unlink(str(dest))
+            except OSError:
+                pass
+            raise
+        return str(dest)
+
     # -- registry backups (RegistryBackupSink) -------------------------------
     def store_registry(self, item, backend) -> None:
         """Back up one registry entry before its delete.
@@ -520,6 +557,16 @@ def restore(run_id: str, *, allow_machine_restore: bool = False) -> Dict:
             else:
                 failed.append((item.get("original", "?"), text))
             continue
+        if kind == "copy":
+            # A copy of something removed permanently (Quarantine.store_copy):
+            # kept for manual recovery, never restored by Undo.
+            skipped += 1
+            not_restored.append((
+                item.get("original", "?"),
+                "removed permanently; not restored automatically. A copy is "
+                f"kept in {run_dir / 'files'}",
+            ))
+            continue
         if kind is not None:
             failed.append((item.get("original", "?"), "unknown entry type"))
             continue
@@ -543,7 +590,7 @@ def restore(run_id: str, *, allow_machine_restore: bool = False) -> Dict:
     if restored and not failed and not skipped:
         shutil.rmtree(run_dir, ignore_errors=True)
     out = {"restored": restored, "failed": failed}
-    if not_restored:  # only while the registry restore gate is closed
+    if not_restored:  # registry gate closed, or copies of permanent removals
         out["not_restored"] = not_restored
     return out
 

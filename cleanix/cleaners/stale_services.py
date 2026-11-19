@@ -96,8 +96,7 @@ class StaleSystemdUnitReporter(OrphanReporter):
 
     def user_findings(self) -> Iterable[Finding]:
         home = Path(utils.home())
-        dirs = [home / d for d in _USER_LOOKUP_HOME]
-        dirs += [oc.in_root(self.sysroot, d) for d in _USER_LOOKUP_SYSTEM_PART]
+        dirs = user_lookup_dirs(home, self.sysroot)
         yield from self._scan_dir(home / ".config/systemd/user", dirs, user=True)
 
     # --------------------------------------------------------------- scan
@@ -281,6 +280,15 @@ class StaleSystemdUnitReporter(OrphanReporter):
             f"Check the directory by hand: ls -l {shlex.quote(logical)}",
             requires_root=not user,
         )
+
+
+def user_lookup_dirs(home: Path, sysroot: str) -> list:
+    """Where a user unit (and its drop-ins) may live: ``home``'s own unit
+    directories first, then the system-wide user-unit directories. Shared
+    with the act-time re-check (:mod:`cleanix.core.remedy_exec`)."""
+    dirs = [Path(home) / d for d in _USER_LOOKUP_HOME]
+    dirs += [oc.in_root(sysroot, d) for d in _USER_LOOKUP_SYSTEM_PART]
+    return dirs
 
 
 def _lmode(p: Path) -> Optional[int]:
