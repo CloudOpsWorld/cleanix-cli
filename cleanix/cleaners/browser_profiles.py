@@ -27,7 +27,8 @@ from typing import Iterable, Optional, Tuple
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
-from cleanix.core.platform import ALL, is_macos
+from cleanix.core import platform, winenv
+from cleanix.core.platform import ALL, WINDOWS, is_macos
 from cleanix.core.utils import home, human_size, iter_children, path_size
 
 # Upper bound on how many items we surface, so a machine with dozens of profiles
@@ -93,13 +94,21 @@ class BrowserProfileReporter(Cleaner):
     )
     requires_root = False
     # Applies everywhere; per-OS paths are resolved inside find_items().
-    platforms = (ALL,)
+    platforms = (ALL, WINDOWS)
 
     # -- support-dir discovery ----------------------------------------------
     def _chromium_roots(self) -> Iterable[Tuple[str, Path]]:
         """Yield (browser label, support dir) for installed chromium browsers."""
         h = home()
-        if is_macos():
+        if platform.is_windows():
+            # The User Data dirs hold the profiles directly.
+            local = winenv.local_appdata()
+            candidates = [
+                ("Chrome", local / "Google" / "Chrome" / "User Data"),
+                ("Edge", local / "Microsoft" / "Edge" / "User Data"),
+                ("Brave", local / "BraveSoftware" / "Brave-Browser" / "User Data"),
+            ]
+        elif is_macos():
             appsup = h / "Library" / "Application Support"
             candidates = [
                 ("Chrome", appsup / "Google" / "Chrome"),
@@ -124,7 +133,9 @@ class BrowserProfileReporter(Cleaner):
 
     def _firefox_roots(self) -> Iterable[Path]:
         h = home()
-        if is_macos():
+        if platform.is_windows():
+            root = winenv.roaming_appdata() / "Mozilla" / "Firefox" / "Profiles"
+        elif is_macos():
             root = h / "Library" / "Application Support" / "Firefox"
         else:
             root = h / ".mozilla" / "firefox"
@@ -204,6 +215,9 @@ class BrowserProfileReporter(Cleaner):
         Returns the set of directory *names* (basename of the Path=value).
         """
         ini = root / "profiles.ini"
+        if root.name == "Profiles" and not ini.exists():
+            # Windows: profiles.ini sits one level above the Profiles dir.
+            ini = root.parent / "profiles.ini"
         names: set = set()
         try:
             if not ini.is_file():

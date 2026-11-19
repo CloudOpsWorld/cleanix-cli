@@ -66,6 +66,15 @@ remove_backup_files: false
 # localepurge-style removal of translations for unused languages. Off by default.
 purge_unused_locales: false
 
+# Orphan reports (report-only): list at most this many findings per cleaner.
+orphan_max_items: 200
+
+# Orphan reports: stop a scan after this many seconds (results are marked partial).
+orphan_max_seconds: 60.0
+
+# Mac app data must be untouched this many days before it is reported as orphaned.
+orphan_min_age_days: 30.0
+
 # Extra paths/globs that must NEVER be deleted (in addition to the built-in
 # protected paths). Supports ~ and shell-style globs.
 protected_globs: []

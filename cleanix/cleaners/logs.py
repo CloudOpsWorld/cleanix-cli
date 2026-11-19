@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 from cleanix.cleaners.base import Cleaner, SCOPE_SYSTEM
 from cleanix.core.models import CleanableItem
@@ -12,6 +13,15 @@ from cleanix.core.utils import older_than, path_size, which
 
 # Rotated / compressed log suffixes that are safe to drop.
 _ROTATED_SUFFIXES = (".gz", ".xz", ".bz2", ".old", ".1", ".2", ".3", ".4")
+
+
+def _walk_files(root: Path) -> Iterator[Path]:
+    """Every file below ``root`` WITHOUT descending into symlinked
+    directories (``Path.rglob`` follows them before Python 3.13, so a
+    symlink under /var/log could make a root scan list another tree)."""
+    for dirpath, _dirnames, filenames in os.walk(str(root), followlinks=False):
+        for name in filenames:
+            yield Path(dirpath) / name
 
 
 class RotatedLogCleaner(Cleaner):
@@ -26,7 +36,7 @@ class RotatedLogCleaner(Cleaner):
         if not root.exists():
             return
         min_age = self.config.log_min_age_days
-        for path in root.rglob("*"):
+        for path in _walk_files(root):
             if not path.is_file() or path.is_symlink():
                 continue
             name = path.name

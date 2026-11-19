@@ -31,6 +31,7 @@ from typing import Iterable, Optional
 
 from cleanix.cleaners.base import SCOPE_SYSTEM, Cleaner
 from cleanix.core.models import CleanableItem
+from cleanix.core.platform import ALL, WINDOWS
 from cleanix.core.utils import run_command, which
 
 _SIZE_RE = re.compile(r"([\d.]+)\s*([KMGT]?B)", re.IGNORECASE)
@@ -225,6 +226,7 @@ class DockerCleaner(_ContainerCleaner):
     name = "Docker leftovers"
     description = "Dangling images, stopped containers, build cache, networks"
     binary = "docker"
+    platforms = (ALL, WINDOWS)
 
 
 class PodmanCleaner(_ContainerCleaner):

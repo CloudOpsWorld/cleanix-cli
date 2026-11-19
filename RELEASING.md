@@ -7,7 +7,7 @@ push-to-`main`-triggers-release flow.
 
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| `.github/workflows/ci.yml` | push / PR to `main`/`master` | Test matrix (Ubuntu + macOS × Python 3.9–3.13), advisory ruff lint & mypy |
+| `.github/workflows/ci.yml` | push / PR to `main`/`master` | Test matrix (Ubuntu + macOS + Windows × Python 3.10–3.13, without PySide6 so GUI tests skip), a `gui-test` job (Ubuntu + macOS + Windows, Python 3.12, `.[gui-test]`, headless Qt), advisory ruff lint & mypy |
 | `.github/workflows/build.yml` | `workflow_call` / manual | Runs tests, builds standalone binaries (Linux + macOS via PyInstaller) and the wheel/sdist (`python -m build` + `twine check`) |
 | `.github/workflows/release.yml` | push to `main`/`master` | Detects a new version, tags it, builds artifacts, creates a GitHub Release, and publishes to PyPI |
 
@@ -25,6 +25,17 @@ push-to-`main`-triggers-release flow.
 
 If the tag already exists, the release is skipped — so pushing unrelated commits
 never re-releases.
+
+## The GUI
+
+The desktop GUI ships inside the same wheel: `pip install "cleanix-cli[gui]"`
+adds PySide6, and the `cleanix-gui` entry point (a `gui-scripts` entry, no
+console window on Windows) is declared in `pyproject.toml`. The standalone CLI
+binaries built by `build.yml` do not include the GUI.
+
+Standalone GUI installers (PyInstaller bundles, a Windows installer, macOS
+`.dmg`, Linux AppImage), code signing/notarisation and a root-owned helper
+location are **Plan 2B** and not part of this pipeline yet.
 
 ## One-time PyPI setup (Trusted Publishing — recommended)
 
