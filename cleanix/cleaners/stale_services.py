@@ -24,21 +24,31 @@ from cleanix.cleaners.base import SCOPE_USER
 from cleanix.cleaners.orphan_common import Finding, OrphanReporter
 from cleanix.core import utils
 from cleanix.core.platform import LINUX
+from cleanix.core.remedy import RemedyKind
 
 _SYSTEM_SCAN = (
     "/etc/systemd/system",
     "/usr/local/lib/systemd/system",
     "/etc/systemd/user",
 )
+_SYSTEM_USER_DIR = "/etc/systemd/user"
+# The only folder whose unit FILES get a system-wide remedy (Task 9b).
+_UNIT_DIR = "/etc/systemd/system"
+# The system unit search path (systemd.unit(5)), plus Debian's /lib.
 _SYSTEM_LOOKUP = (
-    "/etc/systemd/system",
-    "/run/systemd/system",
-    "/run/systemd/generator",
+    "/etc/systemd/system.control",
+    "/run/systemd/system.control",
+    "/run/systemd/transient",
     "/run/systemd/generator.early",
-    "/run/systemd/generator.late",
+    "/etc/systemd/system",
+    "/etc/systemd/system.attached",
+    "/run/systemd/system",
+    "/run/systemd/system.attached",
+    "/run/systemd/generator",
     "/usr/local/lib/systemd/system",
     "/usr/lib/systemd/system",
     "/lib/systemd/system",
+    "/run/systemd/generator.late",
 )
 _USER_LOOKUP_SYSTEM_PART = (
     "/etc/systemd/user",
@@ -95,8 +105,7 @@ class StaleSystemdUnitReporter(OrphanReporter):
 
     def user_findings(self) -> Iterable[Finding]:
         home = Path(utils.home())
-        dirs = [home / d for d in _USER_LOOKUP_HOME]
-        dirs += [oc.in_root(self.sysroot, d) for d in _USER_LOOKUP_SYSTEM_PART]
+        dirs = user_lookup_dirs(home, self.sysroot)
         yield from self._scan_dir(home / ".config/systemd/user", dirs, user=True)
 
     # --------------------------------------------------------------- scan
@@ -115,16 +124,16 @@ class StaleSystemdUnitReporter(OrphanReporter):
             if mode is None:
                 continue
             if stat.S_ISLNK(mode):
-                yield from self._check_link(entry, user)
+                yield from self._check_link(entry, user, lookup)
             elif stat.S_ISREG(mode) and name.endswith(".service"):
                 yield from self._check_unit(entry, lookup, user)
             elif stat.S_ISDIR(mode):
                 if name.endswith(_LINK_SUBDIRS):
-                    yield from self._scan_links_dir(entry, user)
+                    yield from self._scan_links_dir(entry, user, lookup)
                 elif name.endswith(".d"):
                     yield from self._check_dropin(entry, lookup, user)
 
-    def _scan_links_dir(self, d: Path, user: bool) -> Iterator[Finding]:
+    def _scan_links_dir(self, d: Path, user: bool, lookup: list) -> Iterator[Finding]:
         children = oc.list_dir(d)
         if children is None:
             yield self._unreadable(d, user)
@@ -136,10 +145,11 @@ class StaleSystemdUnitReporter(OrphanReporter):
                 continue
             mode = _lmode(child)
             if mode is not None and stat.S_ISLNK(mode):
-                yield from self._check_link(child, user)
+                yield from self._check_link(child, user, lookup, in_link_dir=True)
 
     # ------------------------------------------------------ (b) broken link
-    def _check_link(self, link: Path, user: bool) -> Iterator[Finding]:
+    def _check_link(self, link: Path, user: bool, lookup: Optional[list] = None,
+                    in_link_dir: bool = False) -> Iterator[Finding]:
         try:
             target = os.readlink(link)
         except OSError:
@@ -150,13 +160,56 @@ class StaleSystemdUnitReporter(OrphanReporter):
             return  # unknown, not stale
         if oc.link_target_exists(link, self.sysroot) is not False:
             return
+        # Helper (root) scans: a missing target an ordinary user could have
+        # removed (a folder on the way they can write, a link) is unknown.
+        if oc.evidence_problem(oc.link_dest(link, self.sysroot)):
+            return
         logical = oc.logical_path(self.sysroot, link)
         yield Finding(
             link,
             f"Broken unit link: {logical} -> {target}",
             self._hint(link.name, logical, user),
             requires_root=not user,
+            **self._link_remedy(link, logical, user, lookup, in_link_dir),
         )
+
+    def _link_remedy(self, link: Path, logical: str, user: bool,
+                     lookup: Optional[list], in_link_dir: bool) -> dict:
+        """Finding kwargs for the remedy of a broken unit link.
+
+        User links: no remedy (report only) -- act never removes a link
+        through a plain PATH remedy, and nothing would re-check that it is
+        still broken, so nothing is offered. System-wide links: the
+        LINK remedy (the link itself, elevated helper only) -- but none when
+        it may still be live. systemd adds a ``*.wants``/``*.requires``/
+        ``*.upholds`` dependency by the LINK's name, whatever its target, so
+        such a link still enables its unit when a unit of that name (or its
+        ``prefix@.type`` template) exists anywhere on the load path; links
+        under /etc/systemd/user are resolved by each user's manager against
+        units this scan cannot see (their homes). A dangling ALIAS directly
+        in a scanned folder (``/etc/systemd/system/foo.service``) takes
+        priority over a unit of the same name lower on the load path (e.g.
+        the vendor's ``/usr/lib/systemd/system/foo.service``), which it then
+        shadows; removing it would bring that unit back -- so it gets no
+        remedy either when that name (or its template) exists in any other
+        lookup folder. Unknown is "maybe live"."""
+        if user:
+            return {}
+        if logical == _SYSTEM_USER_DIR or logical.startswith(_SYSTEM_USER_DIR + "/"):
+            return {}
+        if lookup is None:
+            return {}
+        if not in_link_dir:
+            # never the link's own folder: _unit_known would find the link
+            own = os.path.normpath(str(link.parent))
+            lookup = [d for d in lookup if os.path.normpath(str(d)) != own]
+        name = link.name
+        stem, dot, typ = name.rpartition(".")
+        if not dot or _unit_known(name, lookup):
+            return {}
+        if "@" in stem and _unit_known(f"{stem.split('@', 1)[0]}@.{typ}", lookup):
+            return {}
+        return {"remedy_kind": RemedyKind.PATH, "remedy_extra": oc.LINK_REMEDY}
 
     # ------------------------------------------------------ (c) drop-in
     def _check_dropin(self, d: Path, lookup: list, user: bool) -> Iterator[Finding]:
@@ -173,11 +226,16 @@ class StaleSystemdUnitReporter(OrphanReporter):
             if _unit_known(f"{prefix}@.{unit.rsplit('.', 1)[1]}", lookup):
                 return
         logical = oc.logical_path(self.sysroot, d)
+        # A system-wide drop-in for USER units (/etc/systemd/user) applies to
+        # units that may exist only in some user's home, which this scan
+        # cannot see: no remedy (report only), never removed by the helper.
+        for_user_units = not user and logical.startswith(_SYSTEM_USER_DIR + "/")
         yield Finding(
             d,
             f"Settings for a removed service: {logical}",
             self._hint(unit, logical, user),
             requires_root=not user,
+            remedy_kind=None if for_user_units else RemedyKind.PATH,
         )
 
     # ------------------------------------------------------ (a) unit file
@@ -215,12 +273,66 @@ class StaleSystemdUnitReporter(OrphanReporter):
             if any(binary in c for c in conds):
                 return
         logical = oc.logical_path(self.sysroot, path)
+        hint = self._hint(path.name, logical, user)
+        if user:
+            remedy = self._unit_remedy(path.name)
+        else:
+            remedy = self._system_unit_remedy(path, logical, lookup)
         yield Finding(
             path,
             f"Service for a missing program: {path.name} (runs {binaries[0]})",
-            self._hint(path.name, logical, user),
+            hint,
             requires_root=not user,
+            **remedy,
         )
+
+    @staticmethod
+    def _unit_remedy(unit: str) -> dict:
+        """Finding kwargs for a SYSTEMD_UNIT remedy (only for a plain name)."""
+        if not unit.endswith(".service") or not oc.valid_ident(unit):
+            return {}
+        return {
+            "remedy_kind": RemedyKind.SYSTEMD_UNIT,
+            "remedy_extra": (("unit", unit),),
+        }
+
+    def _system_unit_remedy(self, path: Path, logical: str, lookup: list) -> dict:
+        """A system-wide SYSTEMD_UNIT remedy (Task 9b; the elevated helper),
+        only when every precondition holds: the unit file lies DIRECTLY in
+        /etc/systemd/system (never a vendor or /usr/local folder, never
+        /etc/systemd/user); its name is a plain ``.service`` name; no unit of
+        that name (or, for an instance, its template) exists in any other
+        folder of the system search path -- removing this file would bring
+        that one back, still enabled, and ``disable`` by name would hit it;
+        the file is a plain root-owned file only root can change, below
+        folders only system accounts can change; and the package manager
+        positively says no package owns it (unknown backend, error, timeout:
+        no remedy)."""
+        if logical.rsplit("/", 1)[0] != _UNIT_DIR:
+            return {}
+        remedy = self._unit_remedy(path.name)
+        if not remedy:
+            return {}
+        own = os.path.normpath(str(path.parent))
+        others = [d for d in lookup if os.path.normpath(str(d)) != own]
+        name = path.name
+        stem, _dot, typ = name.rpartition(".")
+        if _unit_known(name, others):
+            return {}
+        if "@" in stem and _unit_known(f"{stem.split('@', 1)[0]}@.{typ}", others):
+            return {}
+        if oc.system_file_problem(path):
+            return {}
+        if not self._backend_known:
+            self._backend_known = True
+            self._backend = self.pkg_backend()
+        if not self._backend or self.budget.expired():
+            return {}
+        unowned = oc.query_unowned(self._backend, [logical], self.budget,
+                                   timeout=max(1, min(60, int(self.budget.remaining()))))
+        if logical not in unowned:
+            return {}
+        return remedy
 
     def _binary_present(self, binary: str) -> Optional[bool]:
         """True/False, or None when it cannot be judged."""
@@ -231,11 +343,14 @@ class StaleSystemdUnitReporter(OrphanReporter):
         else:
             candidates = [f"{d}/{binary}" for d in _BIN_DIRS]
         try:
-            return any(
-                os.path.exists(oc.in_root(self.sysroot, c)) for c in candidates
-            )
+            if any(os.path.exists(oc.in_root(self.sysroot, c)) for c in candidates):
+                return True
         except OSError:
             return None
+        # Helper (root) scans: an absence an ordinary user could cause is unknown.
+        if any(oc.evidence_problem(str(oc.in_root(self.sysroot, c))) for c in candidates):
+            return None
+        return False
 
     # ------------------------------------------------------------- misc
     def _reset(self) -> None:
@@ -267,6 +382,15 @@ class StaleSystemdUnitReporter(OrphanReporter):
             f"Check the directory by hand: ls -l {shlex.quote(logical)}",
             requires_root=not user,
         )
+
+
+def user_lookup_dirs(home: Path, sysroot: str) -> list:
+    """Where a user unit (and its drop-ins) may live: ``home``'s own unit
+    directories first, then the system-wide user-unit directories. Shared
+    with the act-time re-check (:mod:`cleanix.core.remedy_exec`)."""
+    dirs = [Path(home) / d for d in _USER_LOOKUP_HOME]
+    dirs += [oc.in_root(sysroot, d) for d in _USER_LOOKUP_SYSTEM_PART]
+    return dirs
 
 
 def _lmode(p: Path) -> Optional[int]:
@@ -347,3 +471,95 @@ def _parse_unit(text: str) -> tuple[list, list]:
         elif key.startswith(("Condition", "Assert")):
             conds.append(value)
     return execs, conds
+
+
+# ------------------------------------------------------- act-time re-check
+_REVERIFY_SECONDS = 120.0
+
+
+def _scan_root_of(logical: str) -> Optional[str]:
+    """The scanned system folder ``logical`` lies in (directly, or in one of
+    its ``*.wants``/``*.requires``/``*.upholds`` folders), else None."""
+    parent = logical.rsplit("/", 1)[0]
+    if parent in _SYSTEM_SCAN:
+        return parent
+    grand, _, sub = parent.rpartition("/")
+    if grand in _SYSTEM_SCAN and sub.endswith(_LINK_SUBDIRS):
+        return grand
+    return None
+
+
+def reverify_system_item(path: str, config) -> Optional[str]:
+    """Act-time re-check of one system-wide finding (``reverify`` table):
+    a broken unit link must still be a link whose target is positively
+    missing (strict evidence); a drop-in folder (directly in a scanned
+    folder, never ``/etc/systemd/user``) must still belong to no known
+    unit. Unit files are not handled here (no PATH remedy; see
+    :func:`reverify_system_unit`). Anything unknown is a reason (fail
+    closed)."""
+    reporter = StaleSystemdUnitReporter(config)
+    reporter.budget.start()
+    real = Path(path)
+    logical = oc.logical_path(reporter.sysroot, real)
+    root = _scan_root_of(logical)
+    if root is None:
+        return "it is not in a folder this scenario checks"
+    if oc.bad_name(real.name):
+        return "its name cannot be checked"
+    mode = _lmode(real)
+    if mode is None:
+        return "it cannot be inspected"
+    if stat.S_ISLNK(mode):
+        if root == _SYSTEM_USER_DIR:
+            return "links for user units are never removed"
+        dirs = [oc.in_root(reporter.sysroot, d) for d in _SYSTEM_LOOKUP]
+        in_link_dir = logical.rsplit("/", 1)[0] != root
+        found = list(reporter._check_link(real, False, dirs, in_link_dir))
+        if not found:
+            return "its target exists now, or cannot be confirmed missing"
+        if found[0].remedy_kind is not RemedyKind.PATH:
+            return "a unit of that name exists now (the link may still enable or shadow it)"
+        return None
+    directly_in_root = logical.rsplit("/", 1)[0] == root
+    if stat.S_ISDIR(mode) and real.name.endswith(".d") and directly_in_root:
+        if root == _SYSTEM_USER_DIR:
+            return "drop-ins for user units are never removed"
+        dirs = [oc.in_root(reporter.sysroot, d) for d in _SYSTEM_LOOKUP]
+        if not list(reporter._check_dropin(real, dirs, user=False)):
+            return "its service exists now, or cannot be confirmed missing"
+        return None
+    return "it is not a link or settings folder this scenario removes"
+
+
+def reverify_system_unit(item, config) -> Optional[str]:
+    """Act-time re-check of one system-wide SYSTEMD_UNIT finding (``reverify``
+    table; strict evidence): a regular ``.service`` file (never a link)
+    directly in /etc/systemd/system whose detector check, re-run on it with
+    the full system search path, still reports a missing program WITH the
+    system remedy for the same unit name -- which re-runs every
+    precondition, the package-ownership query included (fresh). Anything
+    unknown is a reason (fail closed)."""
+    remedy = item.remedy
+    if remedy is None:
+        return "no remedy"
+    reporter = StaleSystemdUnitReporter(config)
+    reporter.budget.start()
+    real = Path(item.path or "")
+    logical = oc.logical_path(reporter.sysroot, real)
+    if logical.rsplit("/", 1)[0] != _UNIT_DIR:
+        return "it is not in a folder this scenario removes unit files from"
+    if oc.bad_name(real.name):
+        return "its name cannot be checked"
+    mode = _lmode(real)
+    if mode is None:
+        return "it cannot be inspected"
+    if not stat.S_ISREG(mode) or not real.name.endswith(".service"):
+        return "it is not a unit file"
+    dirs = [oc.in_root(reporter.sysroot, d) for d in _SYSTEM_LOOKUP]
+    found = list(reporter._check_unit(real, dirs, user=False))
+    if (len(found) != 1 or found[0].note or not found[0].requires_root
+            or found[0].remedy_kind is not RemedyKind.SYSTEMD_UNIT
+            or tuple(found[0].remedy_extra) != tuple(remedy.extra)):
+        return ("its program exists now, a package owns it, another unit of that "
+                "name exists, or this cannot be confirmed; nothing was done")
+    return None

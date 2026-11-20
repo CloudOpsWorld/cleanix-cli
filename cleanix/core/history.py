@@ -60,7 +60,12 @@ def write_manifest(result) -> str:
 
 def record(freed: int, items: int, *, mode: str, registry: int = 0) -> None:
     """Append a completed clean run to the history log. ``mode`` is one of
-    'delete', 'quarantine'. ``registry`` counts removed registry entries."""
+    'delete', 'quarantine', 'mixed' (an act batch that quarantined some
+    items and deleted others, e.g. paths plus launch-job files) or
+    'administrator' (deleted by the elevated helper; see the CLI) or
+    'administrator-quarantine' (moved by the helper into its root-only
+    quarantine: recorded with freed=0, the space is not reclaimed).
+    ``registry`` counts removed registry entries."""
     path = _history_file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

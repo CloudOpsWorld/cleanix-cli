@@ -22,6 +22,7 @@ the least work possible:
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import os
 import stat
@@ -31,6 +32,7 @@ from typing import Dict, Iterable, List
 from cleanix.cleaners.base import Cleaner
 from cleanix.core.models import CleanableItem
 from cleanix.core.platform import ALL, WINDOWS
+from cleanix.core.remedy import path_remedy
 from cleanix.core.utils import home, human_size, modified_within, walk_pruned
 
 # A file touched within the last few minutes may still be growing (a download in
@@ -52,6 +54,14 @@ _MAX_BUCKET = 500
 
 # Cap how many peer paths are spelled out in a group's hint.
 _HINT_PATHS = 8
+
+
+def _survivor_key(path: str) -> tuple:
+    try:
+        mtime = os.lstat(path).st_mtime_ns
+    except OSError:
+        mtime = 0
+    return (mtime, len(path), path)
 
 
 def _partial_hash(path: str) -> str | None:
@@ -112,7 +122,7 @@ class DuplicateFileReporter(Cleaner):
 
         # -- 2/3. hash only within multi-file size buckets ------------------
         # Each emitted group is (reclaimable, size, [paths]).
-        groups: List[tuple[int, int, List[str]]] = []
+        groups: List[tuple[int, int, List[str], str]] = []
         for size, paths in by_size.items():
             if len(paths) < 2 or len(paths) > _MAX_BUCKET:
                 continue
@@ -133,32 +143,45 @@ class DuplicateFileReporter(Cleaner):
                     fh = _full_hash(p)
                     if fh is not None:
                         by_full[fh].append(p)
-                for matches in by_full.values():
+                for fh_key, matches in by_full.items():
                     if len(matches) < 2:
                         continue
                     n = len(matches)
                     reclaimable = size * (n - 1)
-                    groups.append((reclaimable, size, sorted(matches)))
+                    groups.append((reclaimable, size, sorted(matches), fh_key))
 
         # -- 4/5. rank by reclaimable space, cap, and emit ------------------
         groups.sort(key=lambda g: g[0], reverse=True)
-        for reclaimable, size, matches in groups[:top_n]:
+        for reclaimable, size, matches, group_id in groups[:top_n]:
             n = len(matches)
-            representative = matches[0]
-            others = matches[1:]
-            shown = others[:_HINT_PATHS]
-            more = len(others) - len(shown)
-            peers = "; ".join(shown)
-            if more > 0:
-                peers += f"; (+{more} more)"
-            item = self.report_item(
-                representative,
-                f"{n} copies of a {human_size(size)} file — "
-                f"{human_size(reclaimable)} reclaimable",
-                hint=(
-                    f"identical copies: {peers} — remove all but one "
-                    f"if these are redundant"
-                ),
-            )
-            if item:
-                yield item
+            # Every copy is its own item (so a later action can pick which
+            # one survives); all share ``Remedy.group`` = the full SHA-256 of
+            # the content, a stable id for the hash group.
+            # Sizes: the default survivor (oldest copy by mtime, ties by
+            # shortest then lexicographic path) is sized 0 and every other
+            # copy at its real size, so the group sums to (n-1)*size, the
+            # "reclaimable" figure, and totals do not grow n-fold. A size-0
+            # item is only the default survivor; the executor (Task 4)
+            # computes the real freed bytes at act time.
+            survivor = min(matches, key=_survivor_key)
+            for copy in matches:
+                others = [m for m in matches if m != copy]
+                shown = others[:_HINT_PATHS]
+                more = len(others) - len(shown)
+                peers = "; ".join(shown)
+                if more > 0:
+                    peers += f"; (+{more} more)"
+                item = self.report_item(
+                    copy,
+                    f"{n} copies of a {human_size(size)} file — "
+                    f"{human_size(reclaimable)} reclaimable",
+                    hint=(
+                        f"identical copies: {peers} — remove all but one "
+                        f"if these are redundant"
+                    ),
+                    remedy=path_remedy(copy, group=group_id),
+                )
+                if item:
+                    if copy == survivor:
+                        item = dataclasses.replace(item, size=0)
+                    yield item

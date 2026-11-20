@@ -172,6 +172,10 @@ class StaleDesktopEntryReporter(oc.OrphanReporter):
                     return False
                 if oc.is_removable_location(tgt):
                     return False
+            # Helper (root) scans: an absence an ordinary user could have
+            # caused (a folder on the way they can write, a link) is unknown.
+            if oc.evidence_problem(real):
+                return False
         return True
 
     def _on_other_device(self, real: str) -> bool:
@@ -252,6 +256,7 @@ class StaleDesktopEntryReporter(oc.OrphanReporter):
             f"Menu entry for a missing program: {name} ({logical})",
             hint,
             requires_root=system,
+            remedy_kind=oc.RemedyKind.PATH,
         )
 
     # ---- parts
@@ -280,6 +285,51 @@ class StaleDesktopEntryReporter(oc.OrphanReporter):
         for sub, depth in ((".local/share/applications", 3), (".config/autostart", 0)):
             for path, keys, token in self._candidates(h / sub, depth):
                 yield self._finding(path, keys, token, False, None)
+
+    # ------------------------------------------------- act-time re-check
+    def still_stale(self, path: Path) -> Optional[str]:
+        """Why ``path`` (a system-wide menu entry this detector reported)
+        must not be removed now, or None when the scan's evidence still
+        holds: it is a plain ``.desktop`` file directly in one of the
+        scanned system folders, its program is still positively missing
+        (strict evidence: see ``scanmode.evidence_problem``) and, in a
+        package-owned folder, no package owns it now. Anything unknown is
+        a reason (fail closed)."""
+        logical = oc.logical_path(self.sysroot, path)
+        parent = logical.rsplit("/", 1)[0]
+        if parent != _LOCAL_DIR and parent not in _OWNED_DIRS:
+            return "it is not in a folder this scenario checks"
+        name = path.name
+        if (oc.bad_name(name) or not name.endswith(".desktop")
+                or name.startswith("appimagekit_")):
+            return "it is not a menu entry this scenario checks"
+        if os.path.islink(path):
+            return "it is a link"
+        keys = _read_entry(path)
+        if not keys:
+            return "it could not be read"
+        token = self._binary_of(keys)
+        if token is None or not self._is_missing(token):
+            return "its program exists now, or cannot be confirmed missing"
+        if parent in _OWNED_DIRS:
+            backend = self.pkg_backend()
+            if backend is None:
+                return "package ownership cannot be checked now"
+            budget = oc.ScanBudget(3, _REVERIFY_SECONDS)
+            budget.start()
+            if logical not in oc.query_unowned(backend, [logical], budget):
+                return "a package owns it now, or its ownership could not be confirmed"
+        return None
+
+
+_REVERIFY_SECONDS = 120.0
+
+
+def reverify_system_item(path: str, config) -> Optional[str]:
+    """Act-time re-check of one system-wide finding (``reverify`` table)."""
+    reporter = StaleDesktopEntryReporter(config)
+    reporter.budget.start()
+    return reporter.still_stale(Path(path))
 
 
 class BrokenAlternativesReporter(oc.OrphanReporter):

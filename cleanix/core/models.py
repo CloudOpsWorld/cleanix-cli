@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Sequence
 
+from cleanix.core.remedy import Remedy
+
 
 class ItemKind(str, Enum):
     """How an item is removed."""
@@ -84,8 +86,12 @@ class CleanableItem:
     timeout: Optional[int] = None
     # REGISTRY items only: the key or value to remove.
     reg: Optional[RegTarget] = None
+    # Report-only items only: how the finding can be acted on (see remedy.py).
+    remedy: Optional[Remedy] = None
 
     def __post_init__(self) -> None:
+        if self.remedy is not None and not self.report_only:
+            raise ValueError("remedy is only valid on report_only items")
         if self.kind is ItemKind.PATH and not self.path:
             raise ValueError("PATH item requires a path")
         if self.kind is ItemKind.COMMAND and not self.command:
@@ -198,6 +204,9 @@ class CleanOutcome:
     freed: int = 0
     error: Optional[str] = None
     dry_run: bool = False
+    # Not an error: what else the user should know (e.g. a finding removed
+    # permanently with a copy kept, or a best-effort step that failed).
+    note: Optional[str] = None
 
 
 @dataclass

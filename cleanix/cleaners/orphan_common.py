@@ -18,15 +18,130 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import stat as _stat_mod
+import struct
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence, Tuple
 
 from cleanix.cleaners.base import Cleaner
 from cleanix.core import platform as _platform
+from cleanix.core import scanmode
 from cleanix.core.models import CleanableItem, ItemKind
+from cleanix.core.remedy import (
+    Remedy,
+    RemedyKind,
+    fingerprint_of,
+    link_remedy,
+    path_remedy,
+)
 from cleanix.core.utils import _allocated_bytes, run_command, which
+
+# ``Finding.remedy_extra`` marker: the system-wide finding IS a symbolic link
+# (a broken unit link) and its PATH remedy removes the link itself.
+LINK_REMEDY: Tuple[Tuple[str, str], ...] = (("entry", "symlink"),)
+
+
+def evidence_problem(path) -> Optional[str]:
+    """Why the absence of ``path`` must not be trusted (helper/strict mode
+    only; see ``scanmode.evidence_problem``), else None. Detectors call it
+    as ``oc.evidence_problem`` before calling anything "missing"."""
+    return scanmode.evidence_problem(str(path))
+
+
+# The owner a system-wide job/unit/receipt file must have to get a remedy
+# (root; a seam for hermetic tests).
+SYSTEM_FILE_UID = 0
+# System-wide remedy kinds other than PATH (Task 9b; the elevated helper).
+SYSTEM_JOB_KINDS = frozenset({RemedyKind.LAUNCH_JOB, RemedyKind.SYSTEMD_UNIT,
+                              RemedyKind.PKG_RECEIPT})
+
+
+# BSD/macOS ``st_flags`` bits that keep even root from changing or removing
+# a file as expected (immutable / append-only, user or system level).
+_BSD_LOCK_FLAGS = (getattr(_stat_mod, "UF_IMMUTABLE", 0x2) | getattr(_stat_mod, "UF_APPEND", 0x4)
+                   | getattr(_stat_mod, "SF_IMMUTABLE", 0x20000)
+                   | getattr(_stat_mod, "SF_APPEND", 0x40000))
+# Linux inode flags (chattr +i / +a) read with FS_IOC_GETFLAGS, which is
+# _IOR('f', 1, long): its number encodes sizeof(long) of THIS process --
+# 0x80086601 on 64-bit, 0x80046601 on 32-bit (also a 32-bit Python on a
+# 64-bit kernel, via the compat ioctl). A wrong number makes the read fail,
+# which would be treated as "no flags".
+def _getflags_number(long_size: int) -> int:
+    return 0x80006601 | ((long_size & 0x3FFF) << 16)
+
+
+_FS_IOC_GETFLAGS = _getflags_number(struct.calcsize("l"))
+_FS_LOCK_FLAGS = 0x10 | 0x20  # FS_IMMUTABLE_FL | FS_APPEND_FL
+
+
+def _linux_fs_flags(path, st) -> Optional[int]:
+    """The Linux inode flags of ``path`` (the very file ``st`` describes),
+    or None when they cannot be read (then nothing is refused for them)."""
+    try:
+        import array
+        import fcntl
+    except ImportError:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except (OSError, ValueError):
+        return None
+    try:
+        fst = os.fstat(fd)
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+            return None
+        buf = array.array("i", [0])
+        fcntl.ioctl(fd, _FS_IOC_GETFLAGS, buf, True)
+        return int(buf[0])
+    except (OSError, ValueError, OverflowError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def lock_flags_problem(path, st) -> Optional[str]:
+    """Why ``path`` (lstat ``st``) carries an immutable or append-only flag,
+    else None. BSD/macOS: ``st_flags``; Linux: FS_IOC_GETFLAGS, refused only
+    when the flags can be read and are set."""
+    flags = getattr(st, "st_flags", None)
+    if flags is not None:
+        return "is immutable or append-only" if int(flags) & _BSD_LOCK_FLAGS else None
+    if sys.platform.startswith("linux"):
+        fs = _linux_fs_flags(path, st)
+        if fs is not None and fs & _FS_LOCK_FLAGS:
+            return "is immutable or append-only"
+    return None
+
+
+def system_file_problem(path) -> Optional[str]:
+    """Why ``path`` is not a plain file only root can change (a precondition
+    of every system-wide launch job / unit / receipt remedy), else None:
+    a regular file (never a link), owned by root, not group/world
+    writable, one link only, not immutable or append-only. In helper/strict mode its parent chain must
+    also pass the evidence rule (folders only system accounts can change,
+    no links, no access control lists)."""
+    import stat as _stat
+
+    try:
+        st = os.lstat(str(path))
+    except (OSError, ValueError):
+        return "cannot be inspected"
+    if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
+        return "is not a plain file"
+    if st.st_uid != SYSTEM_FILE_UID:
+        return "is not owned by root"
+    if st.st_mode & 0o022:
+        return "is writable by other users"
+    if st.st_nlink != 1:
+        return "has more than one link"
+    problem = lock_flags_problem(path, st)
+    if problem:
+        return problem
+    return evidence_problem(path)
 
 READ_ONLY_COMMANDS: frozenset = frozenset(
     {
@@ -105,6 +220,10 @@ class Finding:
     hint: str
     requires_root: bool = True
     note: bool = False  # notes are never sized (size 0)
+    # Optional remedy kind (never for notes). System-wide (requires_root)
+    # findings honour only PATH (see OrphanReporter._remedy).
+    remedy_kind: Optional[RemedyKind] = None
+    remedy_extra: Tuple[Tuple[str, str], ...] = ()
 
 
 class ScanBudget:
@@ -258,6 +377,19 @@ def logical_path(root: str | Path, real: Path) -> str:
     return "/" if r == "." else "/" + r
 
 
+def link_dest(link: Path, root: str | Path) -> str:
+    """Where the symlink ``link`` points (absolute targets inside ``root``,
+    relative ones against the link's folder; not normalised), or "" when
+    it cannot be read (then any evidence check fails closed)."""
+    try:
+        target = os.readlink(link)
+    except OSError:
+        return ""
+    if target.startswith("/"):
+        return str(in_root(root, target))
+    return str(Path(link).parent / target)
+
+
 def link_target_exists(link: Path, root: str | Path) -> Optional[bool]:
     """Whether the symlink's target exists (one existence check, no walk)."""
     try:
@@ -289,6 +421,15 @@ def safe_label(text: str) -> str:
         "?" if (ord(c) < 32 or 127 <= ord(c) < 160) else c for c in text
     )
     return out[:200]
+
+
+_IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@:+-]{0,254}")
+
+
+def valid_ident(name: str) -> bool:
+    """True for a plain launchd label / systemd unit name (no path or shell
+    metacharacters, no leading dash). Remedies carry only validated names."""
+    return bool(_IDENT.fullmatch(name)) and ".." not in name
 
 
 def bad_name(name: str) -> bool:
@@ -337,7 +478,9 @@ def _parse(paths, rc, text, patterns, max_rc: int = 1) -> Optional[set]:
     # refused, missing) and anything larger mean "unknown", never "unowned".
     if not (0 <= rc <= max_rc):
         return None
-    lines = {ln.strip() for ln in text.splitlines()}
+    # Only the line ending is removed, never spaces: "P " must not answer
+    # for its sibling "P" (paths with surrounding spaces are never queried).
+    lines = {ln.rstrip("\r\n") for ln in text.splitlines()}
     return {p for p in paths if any(pat.format(p=p) in lines for pat in patterns)}
 
 
@@ -393,15 +536,16 @@ def query_unowned(
 ) -> set:
     """Subset of ``logical_paths`` that no package owns (positive evidence only).
 
-    Skipped (counted as owned): paths with glob characters or with newline /
-    CR / NUL (a crafted name could forge an "unowned" output line). A path in a
+    Skipped (counted as owned): paths with glob characters, with newline /
+    CR / NUL (a crafted name could forge an "unowned" output line) or with
+    leading/trailing whitespace (unknown, never matched). A path in a
     usr-merge alias pair is unowned only if both forms are unowned.
     """
     if backend not in _PARSERS:
         return set()
     wanted = [
         p for p in logical_paths
-        if not (_GLOB_CHARS & set(p)) and not bad_name(p)
+        if not (_GLOB_CHARS & set(p)) and not bad_name(p) and p == p.strip()
     ]
     queryable = list(dict.fromkeys(
         q for p in wanted for q in (p, _usr_alias(p)) if q
@@ -503,6 +647,10 @@ class OrphanReporter(Cleaner):
             yield from self._stop_note()
             if self.budget.stop_reason:
                 return
+        if scanmode.is_helper_mode():
+            # The elevated helper acts only on system-wide findings: it never
+            # walks the invoking user's per-user areas for candidates.
+            return
         yield from self._emit(self.user_findings())
         yield from self._stop_note()
 
@@ -564,4 +712,63 @@ class OrphanReporter(Cleaner):
             requires_root=f.requires_root,
             report_only=True,
             hint=f.hint,
+            remedy=self._remedy(f),
         )
+
+    @staticmethod
+    def _remedy(f: Finding) -> Optional[Remedy]:
+        """The remedy for a non-note finding that asks for one.
+
+        System-wide (``requires_root``) findings (the elevated helper's
+        findings action): a PATH remedy for a real file or folder, or --
+        when the detector asks for it with :data:`LINK_REMEDY` -- the
+        symbolic link itself; a launch-job / unit / receipt remedy
+        (Task 9b) only for a plain regular file pinned to its current
+        lstat identity (the detector asks for one only when every
+        precondition holds; see ``system_file_problem``)."""
+        if f.remedy_kind is None or f.note:
+            return None
+        if f.requires_root:
+            if f.remedy_kind in SYSTEM_JOB_KINDS:
+                return _system_job_remedy(f)
+            if f.remedy_kind is not RemedyKind.PATH:
+                return None
+            if f.remedy_extra == LINK_REMEDY:
+                return link_remedy(str(f.path))
+            return path_remedy(str(f.path))
+        fp = fingerprint_of(str(f.path))
+        if f.remedy_kind is RemedyKind.PATH:
+            if fp is None:
+                return None
+            return Remedy(RemedyKind.PATH, fp)
+        return Remedy(f.remedy_kind, fp or (0, 0, 0, 0), extra=f.remedy_extra)
+
+
+def _system_job_remedy(f: Finding) -> Optional[Remedy]:
+    """A system-wide LAUNCH_JOB / SYSTEMD_UNIT / PKG_RECEIPT remedy: one
+    ``(key, name)`` pair and a plain regular file with a real fingerprint
+    (never the zero placeholder); else None."""
+    import stat as _stat
+
+    extra = tuple(f.remedy_extra)
+    if len(extra) != 1 or len(extra[0]) != 2 or not valid_ident(str(extra[0][1])):
+        return None
+    path = str(f.path)
+    if bad_name(os.path.basename(path)):
+        return None
+    from cleanix.core.remedy_exec import is_apple
+
+    # never Apple's, in any letter case: the helper refuses such a request
+    # outright, so one odd item must not carry a remedy into a batch
+    if is_apple(os.path.basename(path)) or is_apple(str(extra[0][1])):
+        return None
+    try:
+        st = os.lstat(path)
+    except (OSError, ValueError):
+        return None
+    if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
+        return None
+    fp = fingerprint_of(path)
+    if fp is None or fp == (0, 0, 0, 0):
+        return None
+    return Remedy(f.remedy_kind, fp, extra=extra)  # type: ignore[arg-type]

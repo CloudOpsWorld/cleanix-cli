@@ -77,6 +77,65 @@ nothing in it beyond *identifiers*, and nothing in its environment:
     same file), and verified in memory; after validation nothing of the
     run is opened or resolved by path (the helper's own %LOCALAPPDATA%
     quarantine is never consulted either).
+11. Findings action (POSIX only; the optional ``findings`` part, never
+    combined with other items: scenario ids, item keys with their remedy
+    fingerprints and kinds, ``permanent``). Validated from its text alone
+    BEFORE the user is bound or any file is read (else exit 1, nothing
+    deleted): every scenario on ``admin_finding_ids`` (system-wide finding
+    detectors, separate from both other allowlists), every key a clean,
+    normalised absolute path strictly inside a root its own detector scans
+    (``finding_path_roots``), never a protected folder, an ancestor of one
+    or the helper's own quarantine; the process is root. Items of a remedy
+    kind the helper does not handle on this system are refused individually
+    (PATH everywhere; launch jobs and package receipts on macOS, systemd
+    units on Linux: ``helper_finding_kinds``); a non-path item must belong
+    to its kind's one scenario and lie DIRECTLY in one of that kind's
+    folders with a plain name, else the whole request is refused. The
+    helper then
+    re-scans with exactly those scenarios in helper scan mode (the
+    detectors skip their per-user candidates) and acts only on items of
+    its OWN scan whose key AND remedy fingerprint equal the request's:
+    report-only, requires_root, PATH remedy, no duplicate group. Anything
+    else is reported (not found / changed / refused) and skipped. One
+    ``actions.act`` batch with ``allow_root``: fingerprint and type
+    re-checked and the parent chain (point 7) re-checked right before each
+    removal, the deletion guard in force. Unless ``permanent``, items are
+    moved into ONE run of a root-owned quarantine the helper creates 0700
+    (``/var/lib/cleanix/quarantine``; macOS ``/Library/Application
+    Support/Cleanix/quarantine``) and validates without following links;
+    if it is not usable nothing is removed. No history; nothing under the
+    user's home. Per-item outcomes and the run id go into the result.
+    Task 9a hardening: (i) only scenarios with an act-time re-verifier
+    (``reverify.REVERIFIERS``) are acted on; it re-checks the finding's
+    ORIGINAL evidence (package ownership re-queried, installed apps
+    re-listed, the program / link target still missing, the unit still
+    unknown) up front and right before each removal, fail closed; (ii)
+    absence evidence is judged by the parent-chain rule bound to the
+    requesting user (``evidence_rule``): a missing path below a folder an
+    ordinary user can write (sticky folders included), below a link, or
+    behind a dangling link is "unknown", never "missing"; (iii) the chain
+    check also refuses a folder carrying an access control list; (iv) the
+    item is compared by (st_dev, st_ino) with the helper's own folders and
+    the folders above them, and the lexical protected/quarantine checks
+    ignore case, so another spelling of the quarantine is never acted on.
+    The root quarantine has no restore or purge yet: the UI must not offer
+    Undo for its items.
+    Task 9b: system-wide launch jobs (no command at all: their program is
+    missing; the plist is removed and launchd forgets the job at the next
+    restart / login), systemd units in
+    /etc/systemd/system (``systemctl disable [--now]``, one
+    ``daemon-reload`` per batch) and package receipts (``pkgutil
+    --forget``) are always PERMANENT. Right before each one the helper
+    re-checks it (``system_remedy.check``), its parent chain and the file
+    itself (root-owned, not group/world writable, one link, no ACL, not
+    immutable or append-only: ``_system_file_problem``) and the detector's original evidence
+    (``reverify``), then copies every file into a copy-only run of the
+    root quarantine (prepared even in permanent mode; ``backup_run`` in
+    the result), then runs the command (allowlisted system-scope argv,
+    fixed tool paths, only inside ``remedy_exec.system_scope``), then
+    removes the file (a receipt: verifies pkgutil removed it). A failing
+    stop command does not block the removal; it becomes a warning in the
+    item's ``note``.
 
 What the design does and does not protect:
 * The nonce only detects stale or mixed-up result files; it provides no
@@ -102,7 +161,13 @@ Known residuals, accepted for now:
     user-writable interpreter or site-packages (a venv in the home, a
     per-user Python) is still user-writable code run as root. A root-owned
     install location plus a launcher check is future work (Plan 2B packaging).
-(c) POSIX ACLs are not inspected; only owner, group and mode bits are.
+(c) POSIX ACLs are not inspected by the ordinary admin-cleaner path; only
+    owner, group and mode bits are. The findings action (point 11) refuses
+    any folder on the chain that carries one (Linux: POSIX/NFSv4 ACL
+    xattrs; macOS: an extended ACL with an ``allow`` entry granting more
+    than reading, via ``acl_get_link_np``/``acl_to_text`` -- deny-only ACLs
+    such as ``everyone deny delete`` pass; unparsable or undeterminable =
+    refused).
 (d) Windows: the result file is written by path, as administrator, into the
     requesting user's directory; a junction swap after validation could
     redirect that fixed-name file write. Handle-based writing is future work.
@@ -151,7 +216,7 @@ import time
 from pathlib import Path
 from typing import FrozenSet, Iterator, List, Optional, Sequence
 
-from cleanix.core import context, elevate, scanmode, service, winregistry
+from cleanix.core import context, elevate, reverify, scanmode, service, winregistry
 from cleanix.core.models import ItemKind, item_key
 
 EXIT_OK = 0
@@ -928,11 +993,157 @@ def static_admin_problem(item, cleaner_id_allowlist=None) -> Optional[str]:
     return None
 
 
+# --------------------------------------------------------------------------
+# access control lists (findings action: a component carrying an ACL is
+# refused -- mode bits alone do not say who may modify it)
+# --------------------------------------------------------------------------
+# Prefixes of Linux xattrs that hold an ACL: POSIX access/default ACLs, the
+# NFSv4 ACL some network filesystems expose, and rich ACLs.
+_ACL_XATTR_PREFIXES = ("system.posix_acl_", "system.nfs4_acl", "system.richacl")
+_ACL_TYPE_EXTENDED = 0x00000100  # macOS <sys/acl.h>
+
+
+def _acl_os() -> str:
+    """"linux", "darwin" or something else (a seam for tests)."""
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return sys.platform
+
+
+def _list_xattrs(path: str) -> List[str]:
+    """Extended attribute names of ``path`` itself (never followed)."""
+    return os.listxattr(path, follow_symlinks=False)  # type: ignore[attr-defined]
+
+
+def _macos_acl_text(path: str) -> Optional[str]:
+    """The extended ACL of ``path`` (not followed) as ``acl_to_text`` prints
+    it, "" when it has none, None when this cannot be determined. CPython
+    has no ACL API and ``os.listxattr`` is Linux-only, so this calls
+    libSystem: ``acl_get_link_np(path, ACL_TYPE_EXTENDED)`` (NULL with
+    ENOENT: no ACL; any other failure: cannot tell), then ``acl_to_text``."""
+    import ctypes
+    import ctypes.util
+    import errno as _errno
+
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+        get = libc.acl_get_link_np
+        get.restype = ctypes.c_void_p
+        get.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        to_text = libc.acl_to_text
+        to_text.restype = ctypes.c_void_p
+        to_text.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ssize_t)]
+        free = libc.acl_free
+        free.restype = ctypes.c_int
+        free.argtypes = [ctypes.c_void_p]
+    except (OSError, AttributeError):
+        return None
+    ctypes.set_errno(0)
+    acl = get(os.fsencode(path), _ACL_TYPE_EXTENDED)
+    if not acl:
+        return "" if ctypes.get_errno() == _errno.ENOENT else None
+    try:
+        length = ctypes.c_ssize_t(0)
+        text = to_text(acl, ctypes.byref(length))
+        if not text:
+            return None
+        try:
+            return ctypes.string_at(text).decode("utf-8", "replace")
+        finally:
+            free(text)
+    finally:
+        free(acl)
+
+
+# macOS ACL permissions an "allow" entry may grant without letting anyone
+# change the folder's entries (everything else, known or not, refuses).
+_MACOS_SAFE_ALLOW = frozenset({
+    "read", "list", "search", "execute", "readattr", "readextattr",
+    "readsecurity", "synchronize",
+})
+_MACOS_ACL_FLAGS = frozenset({
+    "file_inherit", "directory_inherit", "limit_inherit", "only_inherit",
+    "inherited",
+})
+
+
+def _macos_acl_entries_problem(text: str) -> Optional[str]:
+    """Why the ``acl_to_text`` output ``text`` makes a folder untrusted, or
+    None. Deny entries never do (stock folders carry ``group:everyone deny
+    delete``). An ``allow`` entry is accepted only when every permission it
+    grants is read-only (:data:`_MACOS_SAFE_ALLOW`); write, delete,
+    add_file, add_subdirectory, delete_child, append, writeattr,
+    writeextattr, writesecurity, chown or anything unknown refuses. Text
+    that cannot be parsed refuses."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    if lines[0] != "!#acl 1":
+        return "has an access control list that cannot be read"
+    for line in lines[1:]:
+        fields = line.split(":")
+        if len(fields) < 5 or fields[0] not in ("user", "group"):
+            return "has an access control list that cannot be read"
+        kind = [k.strip() for k in fields[-2].split(",") if k.strip()]
+        perms = [x.strip() for x in fields[-1].split(",") if x.strip()]
+        if not kind or kind[0] not in ("allow", "deny") or not perms:
+            return "has an access control list that cannot be read"
+        if any(k not in _MACOS_ACL_FLAGS for k in kind[1:]):
+            return "has an access control list that cannot be read"
+        if kind[0] == "allow" and any(x not in _MACOS_SAFE_ALLOW for x in perms):
+            return "has an access control list that lets others change it"
+    return None
+
+
+def _acl_problem(path: str) -> Optional[str]:
+    """Why ``path`` (a directory on an item's chain) cannot be trusted
+    because of an access control list, or None.
+
+    Linux: any xattr named with one of :data:`_ACL_XATTR_PREFIXES` is a
+    refusal; a filesystem
+    that supports no extended attributes at all (ENOTSUP/EOPNOTSUPP) cannot
+    hold such an ACL (accepted); any other error refuses. The kernel stores
+    these xattrs only for ACLs with entries beyond the base mode bits, so
+    their presence means extended entries. macOS: an ``allow`` entry that
+    grants anything beyond reading refuses, as does an unparsable ACL or
+    not being able to tell; deny-only ACLs pass
+    (:func:`_macos_acl_entries_problem`). Other systems: refused (cannot
+    tell)."""
+    import errno as _errno
+
+    system = _acl_os()
+    if system == "linux":
+        try:
+            names = _list_xattrs(path)
+        except OSError as exc:
+            if exc.errno in (getattr(_errno, "ENOTSUP", None),
+                             getattr(_errno, "EOPNOTSUPP", None)):
+                return None
+            return "has extended attributes that cannot be read (access control list unknown)"
+        except Exception:  # noqa: BLE001 - fail closed
+            return "cannot be checked for an access control list"
+        if any(str(n).startswith(_ACL_XATTR_PREFIXES) for n in names):
+            return "carries an access control list"
+        return None
+    if system == "darwin":
+        try:
+            text = _macos_acl_text(path)
+        except Exception:  # noqa: BLE001 - fail closed
+            text = None
+        if text is None:
+            return "cannot be checked for an access control list"
+        return _macos_acl_entries_problem(text)
+    return "cannot be checked for an access control list on this system"
+
+
 def _path_chain_problem(path: str, expected_uid: Optional[int],
-                        group_ids: Optional[FrozenSet[int]]) -> Optional[str]:
+                        group_ids: Optional[FrozenSet[int]], *,
+                        acls: bool = False) -> Optional[str]:
     """Check every directory from the filesystem root down to the item's
     parent, with lstat, right before the item is deleted. Fails closed: a
-    component that cannot be inspected is a refusal."""
+    component that cannot be inspected is a refusal. ``acls`` (POSIX, the
+    findings action): a component carrying an access control list is
+    refused as well (:func:`_acl_problem`)."""
     if not _is_posix():
         programdata = os.environ.get("ProgramData", "")  # API value (sanitised)
         if programdata and _is_under(path, programdata):
@@ -976,7 +1187,128 @@ def _path_chain_problem(path: str, expected_uid: Optional[int],
         problem = _component_problem(st, expected_uid, group_ids)
         if problem:
             return f"{comp} {problem}"
+        if acls:
+            problem = _acl_problem(str(comp))
+            if problem:
+                return f"{comp} {problem}"
     return None
+
+
+# --------------------------------------------------------------------------
+# trustworthy absence (M1: detectors must not judge "missing" from a path
+# an ordinary user controls)
+# --------------------------------------------------------------------------
+# Root-level usr-merge links the absence rule may resolve (see below).
+_USR_MERGE_ALIASES = frozenset({"bin", "sbin", "lib", "lib32", "lib64", "libx32"})
+_readlink = os.readlink
+
+
+def _evidence_component_problem(st, expected_uid: Optional[int],
+                                group_ids: Optional[FrozenSet[int]]) -> Optional[str]:
+    """The parent-chain rule (:func:`_component_problem`) WITHOUT its sticky
+    exemption: in a sticky world-writable folder (``/tmp``) anyone can still
+    create or remove their own entries, so an absence there proves nothing."""
+    problem = _component_problem(st, expected_uid, group_ids)
+    if problem:
+        return problem
+    mode = st.st_mode
+    if mode & _stat_mod.S_IWOTH:
+        return "is writable by everyone"
+    if mode & _stat_mod.S_IWGRP and _untrusted_group(st, group_ids):
+        return "is writable by a non-system group"
+    return None
+
+
+def _evidence_problem(path: str, expected_uid: Optional[int],
+                      group_ids: Optional[FrozenSet[int]]) -> Optional[str]:
+    """Why the absence of the absolute ``path`` is not trustworthy evidence
+    (an ordinary user could have caused it), or None.
+
+    Walks from ``/`` down (lstat, never following anything): every existing
+    folder on the way must pass the parent-chain rule without the sticky
+    exemption (:func:`_evidence_component_problem`) and carry no access
+    control list. The walk ends at the first missing component (its parent
+    is trusted, so only a system account could have created it): None. A
+    symbolic link anywhere on the way -- including the final component, a
+    dangling link whose target is what decides -- is NOT followed: not
+    trustworthy. One narrow exception (controller ruling, Task 9a round 1):
+    when the FIRST component is a fixed usr-merge alias (``bin``, ``sbin``,
+    ``lib``, ``lib32``, ``lib64``, ``libx32``) and ``/<alias>`` is a
+    symlink owned by root whose text is exactly ``usr/<alias>`` or
+    ``/usr/<alias>``, the path is rewritten to ``/usr/<alias>/...`` and the
+    rewritten path is judged by the normal rules. Any other link (another
+    target, another owner, deeper in the path) stays untrusted. A component
+    that exists but is not a folder (nothing can exist below it) ends the
+    walk: None."""
+    import posixpath
+
+    from cleanix.core.utils import canonical_system_path
+
+    if not isinstance(path, str) or not path.startswith("/") or "\0" in path:
+        return "is not a plain absolute path"
+    # The same normalisation as _path_chain_problem (macOS /tmp, /var, /etc).
+    path = canonical_system_path(path)
+    parts = [p for p in path.split("/") if p not in ("", ".")]
+    if len(parts) > 256:
+        return "is too deep to judge"
+    if parts and parts[0] in _USR_MERGE_ALIASES:
+        alias = parts[0]
+        top = "/" + alias
+        try:
+            st = _lstat(top)
+        except (FileNotFoundError, NotADirectoryError):
+            st = None  # judged by the walk below (a trusted absence)
+        except OSError:
+            return f"{top} cannot be inspected"
+        if st is not None and _stat_mod.S_ISLNK(st.st_mode):
+            try:
+                text = _readlink(top)
+            except OSError:
+                return f"{top} cannot be inspected"
+            if st.st_uid != _ROOT_UID or text not in ("usr/" + alias, "/usr/" + alias):
+                return f"{top} is a symbolic link"
+            parts = ["usr", alias] + parts[1:]
+    current = "/"
+    try:
+        st = _lstat(current)
+    except OSError:
+        return "/ cannot be inspected"
+    idx = 0
+    while True:
+        if _stat_mod.S_ISLNK(st.st_mode):
+            return f"{current} is a symbolic link"
+        if not _stat_mod.S_ISDIR(st.st_mode):
+            return None  # nothing can exist below a non-folder
+        if idx == len(parts):
+            return None  # the path exists as a folder: not missing at all
+        problem = _evidence_component_problem(st, expected_uid, group_ids)
+        if problem is None:
+            problem = _acl_problem(current)
+        if problem:
+            return f"{current} {problem}"
+        name = parts[idx]
+        idx += 1
+        # ``current`` is a verified real folder (never a link), so ".." is
+        # its lexical parent, itself verified on the way down.
+        current = posixpath.dirname(current) if name == ".." else posixpath.join(current, name)
+        try:
+            st = _lstat(current)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError:
+            return f"{current} cannot be inspected"
+
+
+def evidence_rule(expected_uid: Optional[int],
+                  group_ids: Optional[FrozenSet[int]]):
+    """The absence rule registered with ``scanmode.evidence_rule`` while
+    the helper scans and acts on findings (bound to the requesting user)."""
+    def rule(path: str) -> Optional[str]:
+        if not _is_posix():
+            return "cannot be judged on this system"
+        return _evidence_problem(path, expected_uid, group_ids)
+
+    return rule
 
 
 def _user_groups(user: context.TargetUser) -> Optional[FrozenSet[int]]:
@@ -1037,6 +1369,558 @@ def _user_glob(glob: str, home: Path) -> str:
 
 
 # --------------------------------------------------------------------------
+# findings action (POSIX only)
+# --------------------------------------------------------------------------
+FINDINGS_NOT_SUPPORTED = ("acting on findings with administrator rights is not "
+                          "supported on Windows")
+KIND_NOT_SUPPORTED = ("this kind of finding is not handled by the administrator "
+                      "helper yet; nothing was done")
+NOT_FOUND = "not found by the administrator scan; nothing was done"
+CHANGED_SINCE_SCAN = "changed since the scan; nothing was done"
+NO_ACTION = "the administrator scan offers no action for this item; nothing was done"
+NOT_SYSTEM_WIDE = ("not a system-wide finding (it is acted on without administrator "
+                   "rights); nothing was done")
+NO_DUPLICATES = "duplicates are not handled by the administrator helper; nothing was done"
+STOPPED_WHILE_ACTING = ("the helper stopped while acting on it; it may have been "
+                        "removed or moved (a background job or service may already "
+                        "have been stopped)")
+# Remedy kinds (RemedyKind values) the helper acts on on every POSIX system
+# (PATH, Task 9a), plus per platform the system-wide job kinds (Task 9b; see
+# ``helper_finding_kinds``). Every other kind is refused per item.
+_HELPER_FINDING_KINDS = frozenset({"path"})
+_PLATFORM_FINDING_KINDS = {
+    "macos": frozenset({"launch_job", "pkg_receipt"}),
+    "linux": frozenset({"systemd_unit"}),
+}
+NOT_A_PLAIN_SYSTEM_FILE = "the file is not a plain file only root can change"
+NO_BACKUP_LOCATION = ("the administrator quarantine (where a copy is kept before "
+                      "removal) is not usable ({}); nothing was removed")
+# The uid that must own the root quarantine (0; a seam for hermetic tests).
+_ROOT_UID = 0
+_mkdir = os.mkdir
+
+
+def _findings_supported() -> bool:
+    """The one platform gate of the findings action."""
+    return _is_posix()
+
+
+def _is_elevated() -> bool:
+    from cleanix.core import utils
+
+    return utils.is_root()
+
+
+def helper_finding_kinds() -> FrozenSet[str]:
+    """The remedy kinds the helper acts on HERE: "path" everywhere (POSIX);
+    "launch_job" and "pkg_receipt" on macOS only; "systemd_unit" on Linux
+    only."""
+    from cleanix.core import platform as plat
+
+    return _HELPER_FINDING_KINDS | _PLATFORM_FINDING_KINDS.get(plat.current_os(), frozenset())
+
+
+def finding_kind_dirs():
+    """Per non-path kind, the folders its files lie directly in (see
+    ``elevate.finding_kind_dirs``; a seam for hermetic tests)."""
+    return elevate.finding_kind_dirs()
+
+
+def _system_file_problem(path: str) -> Optional[str]:
+    """Why a system-wide job / unit / receipt file must not be acted on as
+    root: it must be a regular file (never a link), owned by root, not
+    group/world writable, with one link only, no immutable/append-only
+    flag and no access control list --
+    so nobody but root can rewrite it (e.g. its Label) between the re-check
+    and the stop command. Fail closed."""
+    try:
+        st = _lstat(path)
+    except OSError:
+        return f"{path} cannot be inspected"
+    if _stat_mod.S_ISLNK(st.st_mode) or not _stat_mod.S_ISREG(st.st_mode):
+        return f"{path} is not a plain file"
+    if st.st_uid != _ROOT_UID:
+        return f"{path} is not owned by root"
+    if st.st_mode & 0o022:
+        return f"{path} is writable by other users"
+    if st.st_nlink != 1:
+        return f"{path} has more than one link"
+    from cleanix.cleaners import orphan_common
+
+    problem = orphan_common.lock_flags_problem(path, st)
+    if problem:
+        return f"{path} {problem}"
+    problem = _acl_problem(path)
+    if problem:
+        return f"{path} {problem}"
+    return None
+
+
+def _job_files(item) -> List[str]:
+    """The files a system-wide job/unit/receipt item acts on (a receipt's
+    ``.bom`` too, when present)."""
+    import posixpath
+
+    path = item.path or ""
+    files = [path]
+    remedy = item.remedy
+    if remedy is not None and getattr(remedy.kind, "value", None) == "pkg_receipt":
+        extra = dict(remedy.extra)
+        pkg_id = extra.get("pkg_id", "")
+        bom = posixpath.join(posixpath.dirname(path), f"{pkg_id}.bom")
+        if pkg_id and os.path.lexists(bom):
+            files.append(bom)
+    return files
+
+
+def admin_finding_ids() -> FrozenSet[str]:
+    """Scenarios the findings action may act on (see
+    ``elevate.admin_finding_ids``); separate from ``admin_cleaner_ids`` and
+    ``admin_registry_cleaner_ids``."""
+    return elevate.admin_finding_ids()
+
+
+def finding_path_roots():
+    """Per-scenario allowed roots (see ``elevate.finding_path_roots``)."""
+    return elevate.finding_path_roots()
+
+
+def _root_quarantine_location():
+    """``(existing system parent, the helper's own folders below it)`` of
+    the root-owned quarantine: ``/var/lib/cleanix/quarantine``, on macOS
+    ``/Library/Application Support/Cleanix/quarantine``."""
+    from cleanix.core.platform import MACOS, current_os
+
+    if current_os() == MACOS:
+        return "/Library/Application Support", ("Cleanix", "quarantine")
+    return "/var/lib", ("cleanix", "quarantine")
+
+
+def root_quarantine_never():
+    """The helper's own folder and its quarantine: never a finding (a
+    request naming them, a folder inside or one containing them refuses)."""
+    import posixpath
+
+    parent, own = _root_quarantine_location()
+    return (posixpath.join(parent, own[0]), posixpath.join(parent, *own))
+
+
+def _quarantine_alias_problem(path: str) -> Optional[str]:
+    """Why ``path`` is (by identity, not by spelling) the helper's own
+    folder or quarantine, lies inside them, or is a folder containing them;
+    else None. Run right before each removal (also in ``permanent`` mode,
+    where the quarantine is never prepared).
+
+    Compares ``(st_dev, st_ino)`` (lstat): the item against the helper's
+    folders and every folder above them, and each folder above the item
+    against the helper's folders. So another spelling of the same folder
+    (a different case on a case-insensitive volume, Unicode normalisation)
+    is still recognised. A helper folder that does not exist protects
+    nothing; one that cannot be inspected refuses."""
+    import posixpath
+
+    parent, own = _root_quarantine_location()
+    ours = set()
+    current = parent
+    for name in own:
+        current = posixpath.join(current, name)
+        try:
+            st = _lstat(current)
+        except FileNotFoundError:
+            break
+        except OSError:
+            return f"{current} cannot be inspected"
+        ours.add((st.st_dev, st.st_ino))
+    above = set()
+    comp = parent
+    while True:
+        try:
+            st = _lstat(comp)
+        except OSError:
+            return f"{comp} cannot be inspected"
+        above.add((st.st_dev, st.st_ino))
+        nxt = posixpath.dirname(comp)
+        if nxt == comp:
+            break
+        comp = nxt
+    try:
+        st = _lstat(path)
+    except OSError:
+        return "it cannot be inspected"
+    ident = (st.st_dev, st.st_ino)
+    if ident in ours or ident in above:
+        return "it is the administrator quarantine or a folder containing it"
+    comp = posixpath.dirname(path)
+    while True:
+        try:
+            st = _lstat(comp)
+        except OSError:
+            return f"{comp} cannot be inspected"
+        if (st.st_dev, st.st_ino) in ours:
+            return "it lies inside the administrator quarantine"
+        nxt = posixpath.dirname(comp)
+        if nxt == comp:
+            break
+        comp = nxt
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class _FindingsPlan:
+    only: List[str]
+    items: List[elevate.FindingSelection]
+    # key -> reason: items refused up front (kind not handled); never scanned for.
+    refused: dict
+    permanent: bool
+
+
+def _prepare_findings(req: elevate.FindingsRequest) -> _FindingsPlan:
+    """Validate the findings action from its text alone, BEFORE any
+    filesystem access (Refused on any problem; nothing is scanned or
+    deleted): POSIX, every scenario on ``admin_finding_ids()``, every key a
+    lexically clean path strictly inside one of its scenario's roots
+    (``finding_path_roots``) that is neither a protected folder, an
+    ancestor of one, nor the helper's own quarantine; and the process runs
+    as root. Items of a remedy kind the helper does not handle are refused
+    individually (``KIND_NOT_SUPPORTED``; ``helper_finding_kinds``); an
+    item of a non-path kind must belong to that kind's one scenario and lie
+    DIRECTLY in one of its folders with a plain name
+    (``elevate.finding_kind_problem``), else the whole request is
+    refused."""
+    if not _findings_supported():
+        raise Refused(FINDINGS_NOT_SUPPORTED)
+    allowed = admin_finding_ids()
+    if not req.only or any(c not in allowed for c in req.only):
+        raise Refused("the findings part names a scenario the helper does not act on")
+    if not req.items:
+        raise Refused("the findings part names no item")
+    roots = finding_path_roots()
+    never = root_quarantine_never()
+    kinds = helper_finding_kinds()
+    kind_dirs = finding_kind_dirs()
+    refused = {}
+    seen = set()
+    for sel in req.items:
+        try:
+            cid, path = elevate.finding_key_parts(sel.key)
+        except ValueError:
+            raise Refused("the findings part names an invalid item") from None
+        if cid not in req.only or sel.key in seen:
+            raise Refused("the findings part names an invalid item")
+        seen.add(sel.key)
+        problem = elevate.finding_path_problem(cid, path, roots, never)
+        if problem:
+            raise Refused(f"the findings part names a path the helper never acts on ({problem})")
+        problem = elevate.finding_kind_problem(cid, sel.kind, path, kind_dirs)
+        if problem:
+            raise Refused(f"the findings part names an item the helper never acts on ({problem})")
+        if sel.kind not in kinds:
+            refused[sel.key] = KIND_NOT_SUPPORTED
+    if not _is_elevated():
+        raise Refused("the helper is not running as root; nothing was removed")
+    # Scan only the scenarios that still have an item to act on.
+    only = [c for c in req.only
+            if any(s.key.split("|", 1)[0] == c and s.key not in refused for s in req.items)]
+    return _FindingsPlan(only, list(req.items), refused, bool(req.permanent))
+
+
+def _finding_problem(item, sel: elevate.FindingSelection, allowed, roots, never):
+    """``(status, reason)`` when the helper must not act on its own scan's
+    ``item`` (already matched to ``sel`` by key), else None."""
+    remedy = item.remedy
+    if (not item.report_only or remedy is None or item.kind is not ItemKind.PATH
+            or not item.path):
+        return "refused", NO_ACTION
+    if item.cleaner_id not in allowed:
+        return "refused", _FIXED_LIST_REASON
+    if not reverify.has_reverifier(item.cleaner_id):
+        return "refused", reverify.NO_REVERIFIER
+    if not item.requires_root:
+        return "refused", NOT_SYSTEM_WIDE
+    if remedy.group:
+        return "refused", NO_DUPLICATES
+    kind = getattr(remedy.kind, "value", None)
+    if kind not in helper_finding_kinds() or kind != sel.kind:
+        return "refused", KIND_NOT_SUPPORTED
+    problem = elevate.finding_kind_problem(item.cleaner_id, str(kind), item.path,
+                                           finding_kind_dirs())
+    if problem:
+        return "refused", f"the helper never acts on this item ({problem})"
+    try:
+        fp = tuple(int(x) for x in remedy.fingerprint)
+    except (TypeError, ValueError):
+        return "refused", NO_ACTION
+    if fp != tuple(sel.fingerprint):
+        return "skipped", CHANGED_SINCE_SCAN
+    problem = elevate.finding_path_problem(item.cleaner_id, item.path, roots, never)
+    if problem:
+        return "refused", f"the helper never acts on this path ({problem})"
+    return None
+
+
+def _own_dir_problem(st, private: bool) -> Optional[str]:
+    if _stat_mod.S_ISLNK(st.st_mode):
+        return "is a symbolic link"
+    if not _stat_mod.S_ISDIR(st.st_mode):
+        return "is not a directory"
+    if st.st_uid != _ROOT_UID:
+        return "is not owned by root"
+    if st.st_mode & (0o077 if private else 0o022):
+        return "is accessible by other users" if private else "is writable by other users"
+    return None
+
+
+def _prepare_root_quarantine(expected_uid: Optional[int],
+                             group_ids: Optional[FrozenSet[int]]) -> Path:
+    """Create (if needed) and validate the helper's root-owned quarantine
+    directory; Refused on any doubt (then nothing is removed).
+
+    Every component of the system parent (``/var/lib`` or
+    ``/Library/Application Support``) must pass the parent-chain rule
+    (lstat, no link, modifiable only by root/system accounts). The
+    helper's own folders are created ``0700`` if missing and must be real
+    directories (never followed), owned by root, the outer one not
+    writable and the quarantine itself not accessible by anyone else. The
+    quarantine is then opened ``O_DIRECTORY|O_NOFOLLOW`` and the opened
+    directory must be the one just checked."""
+    import posixpath
+    from pathlib import PurePosixPath
+
+    parent, own = _root_quarantine_location()
+    parts = PurePosixPath(parent).parts
+    for i in range(1, len(parts) + 1):
+        comp = str(PurePosixPath(*parts[:i]))
+        try:
+            st = _lstat(comp)
+        except OSError:
+            raise Refused(f"{comp} cannot be inspected") from None
+        problem = _component_problem(st, expected_uid, group_ids) or _acl_problem(comp)
+        if problem:
+            raise Refused(f"{comp} {problem}")
+    current = parent
+    st = None
+    for idx, name in enumerate(own):
+        current = posixpath.join(current, name)
+        private = idx == len(own) - 1
+        try:
+            st = _lstat(current)
+        except FileNotFoundError:
+            try:
+                _mkdir(current, 0o700)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise Refused(f"{current} could not be created") from None
+            try:
+                st = _lstat(current)
+            except OSError:
+                raise Refused(f"{current} cannot be inspected") from None
+        except OSError:
+            raise Refused(f"{current} cannot be inspected") from None
+        problem = _own_dir_problem(st, private) or _acl_problem(current)
+        if problem:
+            raise Refused(f"{current} {problem}")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(current, flags)
+    except OSError:
+        raise Refused(f"{current} could not be opened") from None
+    try:
+        fst = _fstat(fd)
+    finally:
+        os.close(fd)
+    problem = _own_dir_problem(fst, True)
+    if problem or (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+        raise Refused(f"{current} changed while it was being checked")
+    return Path(current)
+
+
+def _execute_findings(session: _Session, plan: _FindingsPlan, config, cancel,
+                      expected_uid: Optional[int],
+                      group_ids: Optional[FrozenSet[int]]) -> bool:
+    """The findings action (validated by ``_prepare_findings``). Re-scans
+    as root, in helper scan mode, with exactly the requested scenarios, and
+    acts ONLY on items of its own scan whose key AND remedy fingerprint
+    equal the request's and that pass ``_finding_problem``: one
+    ``actions.act`` batch (deletion guard, fingerprint/type re-check and
+    the parent-chain check right before each removal), into ONE run in the
+    root-owned quarantine (``permanent``: deleted, no quarantine). No
+    history, nothing under the user's home. Returns True when the deadline
+    stopped it; raises service.Cancelled when it is reached while
+    scanning."""
+    from cleanix.core import actions
+
+    allowed = admin_finding_ids()
+    roots = finding_path_roots()
+    never = root_quarantine_never()
+    order = [s.key for s in plan.items]
+    sels = {s.key: s for s in plan.items}
+    out: dict = {}
+
+    def put(key: str, status: str, reason: str = "", freed: int = 0) -> None:
+        out[key] = elevate.FindingOutcome(key=key, status=status,
+                                          freed=max(0, int(freed)), reason=reason)
+
+    def flush() -> None:
+        with session.lock:
+            session.findings = [out[k] for k in order if k in out]
+
+    try:
+        for key, why in plan.refused.items():
+            put(key, "refused", why)
+            session.note(refused=1)
+        scan_keys = [k for k in order if k not in plan.refused]
+        flush()
+        if not scan_keys:
+            return False
+        # Absence evidence (a missing program / link target) is judged by the
+        # parent-chain rule bound to the requesting user (M1), here and in
+        # the act-time re-checks below.
+        rule = evidence_rule(expected_uid, group_ids)
+        with scanmode.helper_mode(), scanmode.evidence_rule(rule):
+            scan = service.scan(config, only=plan.only, cancel=cancel)
+        found = {}
+        for item in scan.all_items():
+            key = item_key(item)
+            if key in sels and key not in found:
+                found[key] = item
+        candidates = []
+        for key in scan_keys:
+            item = found.get(key)
+            if item is None:
+                put(key, "not_found", NOT_FOUND)
+                session.note(unmatched=1)
+                continue
+            why = _finding_problem(item, sels[key], allowed, roots, never)
+            if why is not None:
+                put(key, why[0], why[1])
+                if why[0] == "refused":
+                    session.note(refused=1)
+                else:
+                    session.note(unmatched=1)
+                continue
+            candidates.append(item)
+        flush()
+        if not candidates:
+            return False
+        with session.lock:
+            session.total += len(candidates)
+        # System-wide jobs/units/receipts are always permanent, but a copy
+        # of each file is kept first: in a copy-only run of the root-owned
+        # quarantine, which is therefore prepared even in permanent mode.
+        needs_backup = any(getattr(i.remedy.kind, "value", None) != "path"
+                           for i in candidates)
+        qroot = None
+        if not plan.permanent or needs_backup:
+            try:
+                qroot = _prepare_root_quarantine(expected_uid, group_ids)
+            except Refused as exc:
+                if plan.permanent:
+                    reason = NO_BACKUP_LOCATION.format(exc)
+                else:
+                    reason = (f"the administrator quarantine is not usable ({exc}); "
+                              "nothing was removed")
+                for item in candidates:
+                    put(item_key(item), "not_removed", reason)
+                session.note(error=f"findings not removed: {reason}")
+                return False
+
+        def chain(item) -> Optional[str]:
+            path = item.path or ""
+            problem = _path_chain_problem(path, expected_uid, group_ids, acls=True)
+            if problem:
+                return f"untrusted parent directory ({problem})"
+            alias = _quarantine_alias_problem(path)
+            if alias:
+                return f"not removed: {alias}"
+            if getattr(item.remedy.kind, "value", None) != "path":
+                for f in _job_files(item):
+                    problem = _system_file_problem(f)
+                    if problem:
+                        return f"{NOT_A_PLAIN_SYSTEM_FILE} ({problem})"
+            return None
+
+        # Until an item's fate is known it is reported as possibly acted on:
+        # if the watchdog ends the process mid-batch, the result it writes
+        # never claims "not removed" for something already moved/deleted.
+        for item in candidates:
+            put(item_key(item), "not_removed", STOPPED_WHILE_ACTING)
+        done = set()
+        stopped = [False]
+
+        def on_item(item, outcome, reason) -> None:
+            key = item_key(item)
+            with session.lock:
+                done.add(key)
+                session.processed += 1
+                if reason == actions.STOPPED_AT_DEADLINE:
+                    # the deadline passed during its own re-check: not removed
+                    stopped[0] = True
+                    put(key, "not_removed", reason)
+                    session.errors.append(f"{item.description}: {reason}")
+                elif outcome is None or (reason is not None and not outcome.removed):
+                    put(key, "skipped", reason or "skipped")
+                    session.errors.append(f"{item.description}: skipped: {reason}")
+                elif outcome.removed:
+                    put(key, "removed", "", outcome.freed)
+                    session.freed += max(0, int(outcome.freed))
+                    session.removed += 1
+                else:
+                    # e.g. "partially removed": the bytes really freed count.
+                    put(key, "not_removed", outcome.error or "not removed", outcome.freed)
+                    session.freed += max(0, int(outcome.freed or 0))
+                    session.errors.append(f"{item.description}: {outcome.error}")
+                session.findings = [out[k] for k in order if k in out]
+
+        def on_claim(run_id: str) -> None:
+            with session.lock:
+                session.quarantine_run = str(run_id)
+
+        def on_backup_claim(run_id: str) -> None:
+            with session.lock:
+                session.backup_run = str(run_id)
+
+        flush()
+        old_mask = os.umask(0o077)
+        try:
+            # act re-runs each finding's re-verifier (reverify.REVERIFIERS)
+            # after ``chain``, up front and right before each removal.
+            with scanmode.helper_mode(), scanmode.evidence_rule(rule):
+                summary = actions.act(candidates, config, dry_run=False,
+                                      permanent=plan.permanent, cancel=cancel,
+                                      record_history=False, allow_root=True,
+                                      quarantine_root=None if plan.permanent else qroot,
+                                      extra_check=chain,
+                                      on_item=on_item, on_quarantine_claim=on_claim,
+                                      backup_root=qroot if needs_backup else None,
+                                      on_backup_claim=on_backup_claim)
+        finally:
+            os.umask(old_mask)
+        with session.lock:
+            # A claimed run that ended up empty was discarded ("").
+            session.quarantine_run = str(summary.quarantine_run or "")
+            session.backup_run = str(summary.backup_run or "")
+            # What was done beyond the status (permanent removal, where the
+            # copy is, command warnings): known only once act returned.
+            for outcome in summary.result.outcomes:
+                key = item_key(outcome.item)
+                if outcome.note and key in out:
+                    out[key] = dataclasses.replace(out[key], note=str(outcome.note))
+            session.findings = [out[k] for k in order if k in out]
+        if summary.undo_record_error:
+            session.note(error=summary.undo_record_error)
+        hit = stopped[0]
+        for item in candidates:
+            key = item_key(item)
+            if key not in done:
+                put(key, "not_removed", "deadline reached; not processed")
+                hit = True
+        return hit
+    finally:
+        flush()
+
+
+# --------------------------------------------------------------------------
 # session: single final result write + watchdog
 # --------------------------------------------------------------------------
 WATCHDOG_LOCK_TIMEOUT = 5.0
@@ -1061,6 +1945,10 @@ class _Session:
         self.total = 0
         self.unmatched = 0
         self.refused = 0
+        # findings action
+        self.findings: List[elevate.FindingOutcome] = []
+        self.quarantine_run = ""
+        self.backup_run = ""
 
     def record(self, summary) -> None:
         """Add one item's clean summary to the tally."""
@@ -1082,7 +1970,9 @@ class _Session:
         return elevate.HelperResult(
             freed=self.freed, removed=self.removed,
             errors=list(self.errors) + list(extra_errors), unmatched=self.unmatched,
-            nonce=self.nonce, deadline_hit=hit, refused=self.refused)
+            nonce=self.nonce, deadline_hit=hit, refused=self.refused,
+            findings=list(self.findings), quarantine_run=self.quarantine_run,
+            backup_run=self.backup_run)
 
     def _write(self, result: elevate.HelperResult) -> bool:
         try:
@@ -1191,6 +2081,16 @@ def _run_session(session: _Session, config_path: Optional[str],
         except ValueError as exc:
             raise Refused(str(exc)) from None
         session.nonce = selection.nonce
+        findings_plan = None
+        if selection.findings is not None:
+            # Lexical only, BEFORE the user is bound or any of their files
+            # (config) is read.
+            try:
+                findings_plan = _prepare_findings(selection.findings)
+            except Refused:
+                raise
+            except Exception:  # noqa: BLE001 - fail closed, never echo details
+                raise Refused("the findings part could not be validated") from None
         name = _check_identity(selection.invoking_user, expected_uid)
         user = _bind_user(name, expected_uid)
         config = _load_config(config_path, Path(user.home), expected_uid)
@@ -1209,7 +2109,7 @@ def _run_session(session: _Session, config_path: Optional[str],
     try:
         return _execute(session, selection, config, cancel, deadline, start,
                         expected_uid, _user_groups(user) if _is_posix() else frozenset(),
-                        reg_plan)
+                        reg_plan, findings_plan)
     except Exception as exc:  # noqa: BLE001
         session.finish([f"internal error in the elevated helper ({type(exc).__name__})"])
         if session.aborted:
@@ -1288,7 +2188,8 @@ def _execute_registry(session: _Session, plan: _RegistryPlan, config, cancel,
 def _execute(session: _Session, selection: elevate.Selection, config, cancel,
              deadline: float, start: float, expected_uid: Optional[int],
              group_ids: Optional[FrozenSet[int]],
-             reg_plan: Optional[_RegistryPlan] = None) -> int:
+             reg_plan: Optional[_RegistryPlan] = None,
+             findings_plan: Optional["_FindingsPlan"] = None) -> int:
     def finish(extra=(), hit=False) -> int:
         ok = session.finish(extra, hit)
         if session.aborted:
@@ -1296,6 +2197,18 @@ def _execute(session: _Session, selection: elevate.Selection, config, cancel,
         if not ok:
             return EXIT_INTERNAL
         return EXIT_DEADLINE if hit else EXIT_OK
+
+    if findings_plan is not None:
+        # Exclusive (parse_request refuses a findings request with other
+        # items): nothing else is scanned or cleaned in this run.
+        try:
+            if _execute_findings(session, findings_plan, config, cancel,
+                                 expected_uid, group_ids):
+                return finish(["deadline reached; the remaining findings were not removed"],
+                              hit=True)
+        except service.Cancelled:
+            return finish(["deadline reached while scanning; nothing was removed"], hit=True)
+        return finish()
 
     if reg_plan is not None:
         try:

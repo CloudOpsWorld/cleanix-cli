@@ -317,7 +317,7 @@ class SimpleView(QWidget):
             lay.addWidget(w)
         lay.addStretch(1)
 
-    def _section(self, title: str, tree: GroupedResults, min_height: int = 160):
+    def _section(self, title: str, tree: GroupedResults, min_height: int = 60):
         toggle = QToolButton()
         toggle.setText(title)
         toggle.setCheckable(True)

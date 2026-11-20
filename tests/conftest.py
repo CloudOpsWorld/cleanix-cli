@@ -142,3 +142,17 @@ def orphan_env(tmp_path, monkeypatch):
     monkeypatch.setattr(orphan_common, "run_command", cmds.run_command)
     monkeypatch.setattr(orphan_common, "which", cmds.which)
     return SimpleNamespace(root=root, home=home, cmds=cmds)
+
+
+@pytest.fixture
+def beta_system_actions(monkeypatch):
+    """OPT-IN (never autouse): turn the system-wide beta gate on for a test
+    that exercises the system-wide path -- CLEANIX_BETA_SYSTEM_ACTIONS=1,
+    not a frozen binary, not a root process (even if the suite runs as
+    root). The gate's own tests do not use it."""
+    from cleanix.core import system_findings
+
+    monkeypatch.setenv(system_findings.BETA_ENV, "1")
+    monkeypatch.setattr(system_findings, "is_frozen", lambda: False)
+    monkeypatch.setattr(system_findings, "euid_is_root", lambda: False)
+    return True

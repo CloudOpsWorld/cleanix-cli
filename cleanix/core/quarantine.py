@@ -29,6 +29,10 @@ from cleanix.core.utils import path_size
 _ERROR_NOT_SAME_DEVICE = 17  # Windows winerror for a cross-volume rename
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
+# The one spelling of "cannot be moved into the administrator quarantine
+# because it is on another filesystem" (system_findings matches exactly this).
+CROSS_FILESYSTEM_QUARANTINE = "on another filesystem than the administrator quarantine"
+
 
 def _rename(src: str, dst: str) -> None:
     """os.rename indirection (tests force the cross-volume fallback)."""
@@ -97,6 +101,47 @@ def _win_copy_no_reparse(src: str, dst: str) -> None:
     shutil.copystat(src, dst)
 
 
+# Longest stored file name, in bytes (filesystem encoding). 255 is the usual
+# POSIX NAME_MAX; 200 also stays below Windows' 255 UTF-16 units for any name.
+MAX_STORED_NAME_BYTES = 200
+
+
+def stored_name(idx: int, name: str) -> str:
+    """The name of item ``idx`` inside a run's ``files`` folder.
+
+    ``f"{idx}__{name}"`` when that fits in :data:`MAX_STORED_NAME_BYTES`
+    (unchanged for every ordinary name). A longer one (the index prefix
+    pushes a 255-byte name over the filesystem limit) is shortened
+    deterministically: ``f"{idx}__{hash12}__{head}"``, where ``hash12`` is
+    the first 12 hex digits of the SHA-256 of the full name's bytes and
+    ``head`` the longest leading part of the name that fits, cut on a
+    character boundary. The original path (with the full name) is in the
+    manifest entry, which also records ``name``."""
+    plain = f"{idx}__{name}"
+    if len(os.fsencode(plain)) <= MAX_STORED_NAME_BYTES:
+        return plain
+    raw = os.fsencode(name)
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    prefix = f"{idx}__{digest}__"
+    budget = MAX_STORED_NAME_BYTES - len(os.fsencode(prefix))
+    head = ""
+    used = 0
+    for ch in name:
+        size = len(os.fsencode(ch))
+        if used + size > budget:
+            break
+        head += ch
+        used += size
+    return prefix + head
+
+
+def _file_entry(src: str, dest: Path, size: int, name: str) -> Dict:
+    entry = {"original": src, "stored": str(dest), "size": size}
+    if not dest.name.endswith("__" + name):
+        entry["name"] = name  # the stored name was shortened (see stored_name)
+    return entry
+
+
 def quarantine_root() -> Path:
     from cleanix.core import platform as plat
     from cleanix.core import winenv
@@ -125,7 +170,15 @@ class Quarantine:
     anything was written. :meth:`save` refuses to replace a manifest this
     object did not write."""
 
-    def __init__(self, run_id: str):
+    def __init__(self, run_id: str, root: Optional[Path] = None,
+                 on_claim=None):
+        # ``root`` (the elevated helper only): a quarantine root the caller
+        # created and validated itself; it is used instead of
+        # ``quarantine_root()`` and never created here. In that mode each
+        # item's origin is saved in the manifest BEFORE it is moved, and
+        # ``on_claim(run_id)`` is called once the run directory exists.
+        self._root: Optional[Path] = Path(root) if root is not None else None
+        self._on_claim = on_claim
         self._set_id(run_id)
         self.items: List[Dict] = []
         # item_key -> index of its registry entry in ``items`` (this process only)
@@ -133,25 +186,35 @@ class Quarantine:
         self._claimed = False
         self._written: Optional[str] = None  # sha256 of the manifest we last wrote
 
+    def _base(self) -> Path:
+        return self._root if self._root is not None else quarantine_root()
+
     def _set_id(self, run_id: str) -> None:
         self.run_id = run_id
-        self.dir = quarantine_root() / run_id
+        self.dir = self._base() / run_id
         self.files_dir = self.dir / "files"
 
     def _claim(self) -> None:
-        """Create this run's directory exclusively (retrying with a fresh id)."""
+        """Create this run's directory exclusively (retrying with a fresh id).
+        An explicit ``root`` must already exist (it is never created here)."""
         if self._claimed:
             return
-        quarantine_root().mkdir(parents=True, exist_ok=True)
+        if self._root is None:
+            quarantine_root().mkdir(parents=True, exist_ok=True)
         for _ in range(32):
             try:
-                self.dir.mkdir(exist_ok=False)
+                if self._root is None:
+                    self.dir.mkdir(exist_ok=False)
+                else:
+                    self.dir.mkdir(mode=0o700, exist_ok=False)
             except FileExistsError:
                 self._set_id(_make_run_id())
                 continue
             self._claimed = True
+            if self._on_claim is not None:
+                self._on_claim(self.run_id)
             return
-        raise FileExistsError(f"could not create a unique quarantine run under {quarantine_root()}")
+        raise FileExistsError(f"could not create a unique quarantine run under {self._base()}")
 
     def store(self, path: os.PathLike | str) -> None:
         """Move ``path`` into this quarantine run, recording its origin."""
@@ -163,11 +226,42 @@ class Quarantine:
         size = path_size(src)
         self.files_dir.mkdir(parents=True, exist_ok=True)
         idx = len(self.items)
-        dest = self.files_dir / f"{idx}__{src.name}"
+        dest = self.files_dir / stored_name(idx, src.name)
+        entry = _file_entry(str(src), dest, size, src.name)
+        if self._root is not None:
+            # The elevated helper's root quarantine. The origin is recorded
+            # (manifest saved) BEFORE the move, so a process killed right
+            # after it never leaves an unrecorded item; then a rename only.
+            # Never the copy fallback, which as root could fill the system
+            # volume and leave a partial copy outside the manifest.
+            self.items.append(entry)
+            try:
+                self.save()
+            except BaseException:
+                self.items.pop()
+                raise
+            try:
+                _rename(str(src), str(dest))
+            except OSError as exc:
+                # Only a failed rename (OSError: nothing was moved) drops the
+                # entry. An asynchronous exception (KeyboardInterrupt, the
+                # watchdog's unwind) may arrive after the rename completed:
+                # the entry then stays recorded (at worst a phantom entry
+                # whose stored file is missing), never a real move unrecorded.
+                self.items.pop()
+                try:
+                    self.save()
+                except Exception:  # noqa: BLE001 - the final save retries
+                    pass
+                if _is_cross_volume(exc):
+                    raise OSError(
+                        f"it is {CROSS_FILESYSTEM_QUARANTINE}; nothing was moved "
+                        "(delete it permanently instead)"
+                    ) from None
+                raise
+            return
         shutil.move(str(src), str(dest))
-        self.items.append(
-            {"original": str(src), "stored": str(dest), "size": size}
-        )
+        self.items.append(entry)
 
     def _store_windows(self, path: os.PathLike | str) -> None:
         """Windows store: check and act on the same canonical path.
@@ -190,7 +284,7 @@ class Quarantine:
         size = path_size(src)
         self.files_dir.mkdir(parents=True, exist_ok=True)
         idx = len(self.items)
-        dest = self.files_dir / f"{idx}__{src.name}"
+        dest = self.files_dir / stored_name(idx, src.name)
         dest_s = str(dest)
         try:
             _rename(src_s, dest_s)
@@ -198,7 +292,7 @@ class Quarantine:
             if not _is_cross_volume(exc):
                 raise
         else:
-            self.items.append({"original": src_s, "stored": dest_s, "size": size})
+            self.items.append(_file_entry(src_s, dest, size, src.name))
             return
 
         link = _win_find_reparse(src_s)
@@ -229,7 +323,54 @@ class Quarantine:
             })
             self.save()
             raise
-        self.items.append({"original": src_s, "stored": dest_s, "size": size})
+        self.items.append(_file_entry(src_s, dest, size, src.name))
+
+    def store_copy(self, path: os.PathLike | str) -> str:
+        """Copy one regular file into this run (metadata kept) and save the
+        manifest before returning the stored path.
+
+        The entry has ``"type": "copy"``: it is a backup for manual recovery
+        of something removed permanently, never an Undo, so :func:`restore`
+        does not act on it. A link, reparse point or non-regular file is
+        refused (OSError). All or nothing: on failure no entry and no copy is
+        left behind."""
+        import stat as _stat
+
+        src = os.path.abspath(str(path))
+        st = os.lstat(src)
+        if (not _stat.S_ISREG(st.st_mode)
+                or getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT):
+            raise OSError(f"refusing to copy {src}: not a regular file")
+        self._claim()
+        self.files_dir.mkdir(parents=True, exist_ok=True)
+        idx = len(self.items)
+        base = os.path.basename(src)
+        dest = self.files_dir / stored_name(idx, base)
+        try:
+            shutil.copy2(src, str(dest), follow_symlinks=False)
+            # The copy is readable by its owner only (a root-owned copy of a
+            # system file stays private); the original's mode, owner and
+            # (macOS) flags are recorded from the lstat taken before copying.
+            os.chmod(str(dest), 0o600)
+            entry = _file_entry(src, dest, st.st_size, base)
+            entry = {"type": "copy", **entry, "mode": _stat.S_IMODE(st.st_mode),
+                     "uid": int(getattr(st, "st_uid", 0)),
+                     "gid": int(getattr(st, "st_gid", 0))}
+            if getattr(st, "st_flags", None) is not None:
+                entry["flags"] = int(st.st_flags)
+            self.items.append(entry)
+            try:
+                self.save()
+            except BaseException:
+                self.items.pop()
+                raise
+        except BaseException:
+            try:
+                os.unlink(str(dest))
+            except OSError:
+                pass
+            raise
+        return str(dest)
 
     # -- registry backups (RegistryBackupSink) -------------------------------
     def store_registry(self, item, backend) -> None:
@@ -361,6 +502,15 @@ class Quarantine:
         (only empty directories are removed; nothing else is touched)."""
         if not self._claimed or self.items:
             return
+        if self._written is not None:
+            # An empty manifest this run wrote itself (root mode records an
+            # item before moving it and drops it again if the move fails).
+            target = self.dir / "manifest.json"
+            try:
+                if hashlib.sha256(target.read_bytes()).hexdigest() == self._written:
+                    os.unlink(str(target))
+            except OSError:
+                pass
         for d in (self.dir / "registry", self.files_dir, self.dir):
             try:
                 os.rmdir(str(d))
@@ -372,9 +522,10 @@ class Quarantine:
         return describe_registry_entries(run_id)
 
 
-def new_run() -> Quarantine:
-    """A new run. Nothing is created on disk until the first write."""
-    return Quarantine(_make_run_id())
+def new_run(root: Optional[Path] = None, on_claim=None) -> Quarantine:
+    """A new run. Nothing is created on disk until the first write.
+    ``root``/``on_claim``: see :class:`Quarantine` (elevated helper only)."""
+    return Quarantine(_make_run_id(), root=root, on_claim=on_claim)
 
 
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
@@ -463,8 +614,11 @@ def _size_of(item: Dict) -> int:
 
 def latest_run() -> Optional[str]:
     """The most recently created run (by the manifest's ``created`` time,
-    then the id), never by the lexical order of pid digits."""
-    runs = list_runs()
+    then the id), never by the lexical order of pid digits. A run holding
+    only copies of permanent removals (``store_copy``: nothing restore acts
+    on, no registry entry) is never "the run to undo"."""
+    runs = [r for r in list_runs()
+            if not (r["count"] and not r["removed_count"] and not r["registry"])]
     if not runs:
         return None
 
@@ -520,6 +674,16 @@ def restore(run_id: str, *, allow_machine_restore: bool = False) -> Dict:
             else:
                 failed.append((item.get("original", "?"), text))
             continue
+        if kind == "copy":
+            # A copy of something removed permanently (Quarantine.store_copy):
+            # kept for manual recovery, never restored by Undo.
+            skipped += 1
+            not_restored.append((
+                item.get("original", "?"),
+                "removed permanently; not restored automatically. A copy is "
+                f"kept in {run_dir / 'files'}",
+            ))
+            continue
         if kind is not None:
             failed.append((item.get("original", "?"), "unknown entry type"))
             continue
@@ -543,7 +707,7 @@ def restore(run_id: str, *, allow_machine_restore: bool = False) -> Dict:
     if restored and not failed and not skipped:
         shutil.rmtree(run_dir, ignore_errors=True)
     out = {"restored": restored, "failed": failed}
-    if not_restored:  # only while the registry restore gate is closed
+    if not_restored:  # registry gate closed, or copies of permanent removals
         out["not_restored"] = not_restored
     return out
 

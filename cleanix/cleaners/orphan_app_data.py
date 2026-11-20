@@ -11,6 +11,18 @@ least ``orphan_min_age_days`` old, is not Apple's, and nothing installed
 shares its id, an id prefix or its vendor. Human-named folders ("Slack",
 "Google") are never reported. If the list of installed apps cannot be built
 nothing is reported and one "Not checked" note is shown instead.
+
+The elevated helper's act-time re-check (``reverify_system_item``) rebuilds
+the inventory (Spotlight required) before removing a system-wide entry. The
+inventory deliberately includes user-writable places (``~/Applications``,
+home tool folders, admin-writable ``/Applications``) and is NOT subject to
+the helper's "absence an ordinary user could cause is unknown" rule
+(controller ruling, Task 9a round 1): a user who removes their own app
+turning its ``/Library`` data into a finding is correct -- the app is
+uninstalled. Those places can only add "still installed" evidence. The
+re-check includes EVERY human user's home (``human_homes``; the helper is
+bound to the requesting user only) and accepts Spotlight's answer only when
+it names every app bundle the walk found; anything else is "unknown".
 """
 
 from __future__ import annotations
@@ -75,6 +87,9 @@ _STEAM_DIRS = (
 _STEAM_APPS = "Library/Application Support/Steam/steamapps"
 _ACF_NAME = re.compile(r'^\s*"name"\s+"([^"]{1,200})"', re.M)
 _LAUNCH_DIRS = ("/Library/LaunchAgents", "/Library/LaunchDaemons")
+# The system-wide folders scanned (folders in the first, .plist files in the
+# second). Also the elevated helper's allowed roots for this scenario.
+SYSTEM_DIRS = ("/Library/Application Support", "/Library/Preferences")
 
 
 # --------------------------------------------------------------- id helpers
@@ -152,8 +167,12 @@ class _Unknown(Exception):
 
 
 class _Ctx:
-    def __init__(self, budget):
+    def __init__(self, budget, root="/"):
         self.budget = budget
+        self.root = root
+        # logical paths of top-level app bundles that are real folders (the
+        # act-time check requires Spotlight to list every one of them)
+        self.top_paths: list = []
         self.ids: set = set()
         self.top_ids: set = set()  # ids of top-level apps from the app folders
         self.noid: list = []       # folder names of apps without a readable id
@@ -242,6 +261,8 @@ def _walk_apps(directory: Path, ctx: _Ctx, depth: int, max_depth: int) -> bool:
         if child.name.endswith(".app"):
             if os.path.isdir(child):  # a symlinked (cask) app is still an app
                 _collect_bundle(child, ctx, top=True)
+                if _is_real_dir(child):
+                    ctx.top_paths.append(oc.logical_path(ctx.root, child))
         elif depth < max_depth and _is_real_dir(child):
             _walk_apps(child, ctx, depth + 1, max_depth)
     return True
@@ -282,21 +303,36 @@ def _tool_names(root, homes, ctx: "_Ctx") -> list:
     return names
 
 
-def _inventory(root, homes: Iterable[Path], budget=None) -> Optional[tuple]:
+def _inventory(root, homes: Iterable[Path], budget=None, *,
+               require_mdfind: bool = False) -> Optional[tuple]:
     """``(ids, names_of_apps_without_id)`` or None when the inventory cannot
     be trusted: ``/Applications`` unreadable, fewer than MIN_APPS distinct app
-    ids, too many apps with no readable id, or the budget ran out."""
+    ids, too many apps with no readable id, or the budget ran out.
+    ``require_mdfind`` (the act-time re-check, strict): every app folder
+    walked (``/System/Applications``, the other app roots, each home's
+    ``Applications``) must be readable, and Spotlight's list of app bundles
+    must be available AND plausible: it must name every top-level app
+    bundle the walk found (real folders, not links; at least MIN_APPS of
+    them, so an empty walk never passes); otherwise None
+    (unknown). Spotlight disabled, still indexing or not visible from the
+    helper's environment thus never counts as "no such app"."""
     homes = [Path(h) for h in homes]
-    ctx = _Ctx(budget)
+    ctx = _Ctx(budget, root)
     try:
         apps = oc.in_root(root, "/Applications")
         if not os.path.isdir(apps) or not _walk_apps(apps, ctx, 1, 3):
             return None
         for logical, depth in _APP_ROOTS[1:]:
-            _walk_apps(oc.in_root(root, logical), ctx, 1, depth)
+            if not _walk_apps(oc.in_root(root, logical), ctx, 1, depth) and require_mdfind:
+                return None
         for h in homes:
-            _walk_apps(h / "Applications", ctx, 1, 3)
+            if not _walk_apps(h / "Applications", ctx, 1, 3) and require_mdfind:
+                return None
         if len(ctx.top_ids) < MIN_APPS:
+            return None
+        if require_mdfind and len(set(ctx.top_paths)) < MIN_APPS:
+            # strict: at least MIN_APPS REAL (non-link) bundles walked, so
+            # "Spotlight lists every walked bundle" is never vacuous
             return None
         if len(ctx.noid) > 3 or len(ctx.noid) * 10 > ctx.apps:
             return None
@@ -304,6 +340,12 @@ def _inventory(root, homes: Iterable[Path], budget=None) -> Optional[tuple]:
         rc, out, _ = oc.run(
             ["mdfind", "kMDItemContentType == 'com.apple.application-bundle'"]
         )
+        if require_mdfind:
+            if rc != 0:
+                return None
+            listed = {ln.strip() for ln in out.splitlines()[:MAX_MDFIND_PATHS]}
+            if any(p not in listed for p in ctx.top_paths):
+                return None  # empty, partial or implausible: unknown
         if rc == 0:
             for n, line in enumerate(out.splitlines()):
                 if n >= MAX_MDFIND_PATHS:
@@ -348,17 +390,69 @@ class OrphanAppDataReporter(oc.OrphanReporter):
         self._index: Optional[_Index] = None
         self._index_built = False
 
+    @staticmethod
+    def _homes() -> list:  # the scan's homes (requesting user / targets)
+        homes = [home()]
+        try:
+            homes += [u.home for u in context.get_target_users()]
+        except Exception:  # noqa: BLE001 - fall back to the current user
+            pass
+        return homes
+
     def _installed(self) -> Optional[_Index]:
         if not self._index_built:
             self._index_built = True
-            homes = [home()]
-            try:
-                homes += [u.home for u in context.get_target_users()]
-            except Exception:  # noqa: BLE001 - fall back to the current user
-                pass
-            inv = _inventory(self.sysroot, homes, self.budget)
+            inv = _inventory(self.sysroot, self._homes(), self.budget)
             self._index = _Index(*inv) if inv is not None else None
         return self._index
+
+    # ------------------------------------------------- act-time re-check
+    def still_orphaned(self, real: Path) -> Optional[str]:
+        """Why ``real`` (a system-wide finding: an entry directly in one of
+        :data:`SYSTEM_DIRS`) must not be removed now, or None when no
+        installed app uses its id: the installed-apps inventory is rebuilt
+        (Spotlight's list of app bundles required) and the id checked
+        exactly as the scan did. An inventory that cannot be built is a
+        reason (fail closed)."""
+        logical = oc.logical_path(self.sysroot, real)
+        parent = logical.rsplit("/", 1)[0]
+        if parent not in SYSTEM_DIRS:
+            return "it is not in a folder this scenario checks"
+        dirs = parent == SYSTEM_DIRS[0]
+        name = real.name
+        if oc.bad_name(name) or (not dirs and not name.endswith(".plist")):
+            return "its name is not a bundle id"
+        bid = candidate_id(name)
+        if bid is None:
+            return "its name is not a bundle id"
+        cutoff = time.time() - float(self.config.orphan_min_age_days) * 86400
+        try:
+            newest = real.lstat().st_mtime
+        except OSError:
+            return "it cannot be inspected"
+        if dirs:
+            newest = max(newest, self._newest_child_mtime(real))
+        if newest > cutoff:
+            return "it changed recently (it may be in use)"
+        from cleanix.core import reverify
+
+        def build():
+            # EVERY human user's home (the helper is bound to the requesting
+            # user only): an app in anyone's ~/Applications counts.
+            others = human_homes(self.sysroot)
+            if others is None:
+                return None
+            homes = list(dict.fromkeys(list(self._homes()) + others))
+            return _inventory(self.sysroot, homes, self.budget, require_mdfind=True)
+
+        # Built at most once up front and once before the first removal of
+        # a helper batch (reverify.cached); afresh outside a batch.
+        inv = reverify.cached("orphan_app_data.inventory", build)
+        if inv is None:
+            return "the installed apps could not be listed now"
+        if is_excluded(bid, _Index(*inv)):
+            return f"an installed app now uses the id {bid}"
+        return None
 
     # ------------------------------------------------------------ discovery
     def system_findings(self) -> Iterable[oc.Finding]:
@@ -375,9 +469,8 @@ class OrphanAppDataReporter(oc.OrphanReporter):
                 requires_root=False,
             )
             return
-        lib = oc.in_root(self.sysroot, "/Library")
-        yield from self._scan_dir(lib / "Application Support", dirs=True, system=True)
-        yield from self._scan_dir(lib / "Preferences", dirs=False, system=True)
+        for logical, dirs in zip(SYSTEM_DIRS, (True, False)):
+            yield from self._scan_dir(oc.in_root(self.sysroot, logical), dirs=dirs, system=True)
 
     def user_findings(self) -> Iterable[oc.Finding]:
         if self._installed() is None:
@@ -439,6 +532,7 @@ class OrphanAppDataReporter(oc.OrphanReporter):
                 f"Left by a removed app: {bid} ({real_logical})",
                 self._hint(bid, real_logical),
                 requires_root=system,
+                remedy_kind=oc.RemedyKind.PATH,
             )
 
     def _newest_child_mtime(self, directory: Path) -> float:
@@ -468,3 +562,38 @@ class OrphanAppDataReporter(oc.OrphanReporter):
             f"If you no longer need it, move {shlex.quote(logical)} "
             "to the Trash in Finder."
         )
+
+
+# Lowest uid of a human account on macOS (the helper's _human_uid_min there).
+HUMAN_UID_MIN = 501
+
+
+def human_homes(root) -> Optional[list]:
+    """The home folders under ``/Users`` that belong to human accounts
+    (owner uid >= :data:`HUMAN_UID_MIN`; lstat only, never followed), or
+    None when they cannot all be determined (``/Users`` unreadable, an
+    entry that cannot be inspected, a human-owned link or an odd name)."""
+    users = oc.in_root(root, "/Users")
+    children = oc.list_dir(users)
+    if children is None:
+        return None
+    out = []
+    for child in sorted(children):
+        try:
+            st = os.lstat(child)
+        except OSError:
+            return None
+        if st.st_uid < HUMAN_UID_MIN:
+            continue  # Shared, root-owned entries
+        if oc.bad_name(child.name) or _stat.S_ISLNK(st.st_mode):
+            return None
+        if _stat.S_ISDIR(st.st_mode):
+            out.append(child)
+    return out
+
+
+def reverify_system_item(path: str, config) -> Optional[str]:
+    """Act-time re-check of one system-wide finding (``reverify`` table)."""
+    reporter = OrphanAppDataReporter(config)
+    reporter.budget.start()
+    return reporter.still_orphaned(Path(path))

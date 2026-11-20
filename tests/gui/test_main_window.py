@@ -84,15 +84,21 @@ def _window(qtbot, **kw):
 
 
 # ---- wiring ---------------------------------------------------------------
-def test_power_view_has_all_tabs_in_order(qtbot):
+@pytest.mark.parametrize("osname", ["linux", "macos"])
+def test_power_view_has_all_tabs_in_order(qtbot, monkeypatch, osname):
+    # Task 12: Review after Scan; Registry only on Windows (test_tabs.py).
+    from cleanix.gui import main_window
+    from cleanix.gui.review_tab import ReviewTab
+
+    monkeypatch.setattr(main_window, "current_os", lambda: osname)
     w = _window(qtbot)
     assert isinstance(w.simple_page, SimpleView) and w.simple_page is w.simple_view
     assert isinstance(w.power_page, PowerView) and w.power_page is w.power_view
     assert w.stack.count() == 2
     assert w.power_view.panel_titles() == [
-        "Scan", "Quarantine", "History", "Schedule", "Settings", "Findings"]
+        "Scan", "Review", "Quarantine", "History", "Schedule", "Settings", "Findings"]
     tabs = w.power_view.tabs
-    for idx, cls in enumerate((QuarantinePanel, HistoryPanel, SchedulePanel,
+    for idx, cls in enumerate((ReviewTab, QuarantinePanel, HistoryPanel, SchedulePanel,
                                SettingsPanel, FindingsPanel), start=1):
         assert isinstance(tabs.widget(idx), cls)
 

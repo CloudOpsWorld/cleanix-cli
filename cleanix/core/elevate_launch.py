@@ -14,7 +14,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from cleanix.core import utils, winenv
 from cleanix.core.platform import LINUX, MACOS, WINDOWS, current_os
@@ -37,6 +37,14 @@ class ElevationFailed(Exception):
     def __init__(self, message: str = "", exit_code: Optional[int] = None):
         super().__init__(message)
         self.exit_code = exit_code
+
+
+class ElevationNotStarted(ElevationFailed):
+    """The elevation prompt or the helper could not be started at all (the
+    prompt program could not be executed, or pkexec could not run the
+    helper): the helper did not run, nothing was done. A subclass, so
+    callers that catch ElevationFailed behave as before. Other launch
+    failures (osascript, Windows) still raise plain ElevationFailed."""
 
 
 def _invoker_uid() -> int:
@@ -76,7 +84,7 @@ def _run(argv: List[str], timeout: int):
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
     except OSError as exc:
-        raise ElevationFailed(f"could not start the elevation prompt: {exc}") from exc
+        raise ElevationNotStarted(f"could not start the elevation prompt: {exc}") from exc
     try:
         _out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -144,7 +152,8 @@ def launch_elevated(argv: Sequence[str], *, timeout: int = 3600) -> int:
         if rc == 127:
             if "no authentication agent" in err.lower():
                 raise ElevationUnavailable("no polkit authentication agent is running")
-            raise ElevationFailed(err.strip() or "pkexec could not run the helper", exit_code=rc)
+            raise ElevationNotStarted(err.strip() or "pkexec could not run the helper",
+                                      exit_code=rc)
     elif osname == MACOS:
         script = ('do shell script "%s" with administrator privileges'
                   % _applescript_quote(shlex.join(args)))
@@ -156,3 +165,82 @@ def launch_elevated(argv: Sequence[str], *, timeout: int = 3600) -> int:
     if rc != 0:
         raise ElevationFailed(err.strip() or f"exit code {rc}", exit_code=rc)
     return 0
+
+
+def run_findings_request(findings, invoking_user: str, *,
+                         launcher: Optional[Callable[[List[str]], int]] = None,
+                         config_path: Optional[str] = None):
+    """Send one findings request (``elevate.FindingsRequest``) to the
+    elevated helper and return its ``elevate.HelperResult``.
+
+    Writes the request into a fresh private request directory, launches the
+    helper through ``launcher`` (default :func:`launch_elevated`; one
+    prompt), then reads the result, which must carry this request's nonce.
+    A helper that refused or failed after writing its result (exit 1-3)
+    still returns that result. Raises ElevationDeclined /
+    ElevationUnavailable / ElevationFailed (no usable result) and
+    ValueError, before any prompt, for a request the helper's lexical
+    checks would refuse (platform, scenario allowlist, paths, size) or
+    that cannot be written. A result naming an item that was not requested
+    is ElevationFailed. The request directory is always removed. Nothing
+    here touches the items themselves."""
+    import shutil
+
+    from cleanix import elevated
+    from cleanix.core import elevate
+
+    if not elevated._findings_supported():
+        raise ValueError(elevated.FINDINGS_NOT_SUPPORTED)
+    if getattr(sys, "frozen", False):
+        # elevated_command runs `sys.executable -I -m cleanix.elevated`; in a
+        # standalone binary that is the cleanix binary itself, which refuses
+        # -I: never ask for the password for a helper that cannot start.
+        raise ValueError("the standalone binary cannot start the administrator "
+                         "helper; install with pip/pipx to act on system-wide findings")
+    allowed = elevated.admin_finding_ids()
+    if not findings.only or any(c not in allowed for c in findings.only):
+        raise ValueError("the request names a scenario the administrator helper does not act on")
+    roots = elevated.finding_path_roots()
+    never = elevated.root_quarantine_never()
+    for sel in findings.items:
+        cid, path = elevate.finding_key_parts(sel.key)
+        problem = (elevate.finding_path_problem(cid, path, roots, never)
+                   or elevate.finding_kind_problem(cid, sel.kind, path,
+                                                   elevated.finding_kind_dirs()))
+        if problem:
+            raise ValueError(f"the administrator helper never acts on this item ({problem})")
+    selection = elevate.Selection(invoking_user=invoking_user, only=[], keys=[],
+                                  use_quarantine=False, findings=findings)
+    # Round-trip through the strict parser first: never prompt for a request
+    # the helper would refuse anyway.
+    request_dir = elevate.make_request_dir()
+    try:
+        request_path = elevate.write_request(request_dir, selection)
+        data = request_path.read_bytes()
+        if len(data) > elevate.MAX_REQUEST_BYTES:
+            raise ValueError("the request is too large; select fewer items")
+        elevate.parse_request(data)
+        result_path = request_dir / elevate.RESULT_NAME
+        argv = elevated_command(request_path, result_path, config_path)
+        launch = launcher or launch_elevated
+        failure: Optional[ElevationFailed] = None
+        try:
+            launch(argv)
+        except ElevationFailed as exc:
+            if exc.exit_code not in (1, 2, 3):
+                raise
+            failure = exc
+        try:
+            result = elevate.read_result(result_path)
+        except (ValueError, OSError):
+            if failure is not None:
+                raise failure
+            raise ElevationFailed("the helper's result could not be read") from None
+        if result.nonce != selection.nonce:
+            raise ElevationFailed("the helper returned a stale or unexpected result")
+        requested = {s.key for s in findings.items}
+        if any(o.key not in requested for o in result.findings):
+            raise ElevationFailed("the helper's result names an item that was not requested")
+        return result
+    finally:
+        shutil.rmtree(request_dir, ignore_errors=True)

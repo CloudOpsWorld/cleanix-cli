@@ -12,7 +12,7 @@ from typing import Any, Callable, List, Mapping, Optional, Sequence
 
 from cleanix.config import Config
 from cleanix.core import history, safety
-from cleanix.core.engine import Engine
+from cleanix.core.engine import DeleteCB, Engine, PrecheckCB
 from cleanix.core.models import (
     CleanableItem,
     CleanOutcome,
@@ -70,6 +70,31 @@ def scan(
     return result
 
 
+def act(
+    items: Sequence[CleanableItem],
+    config: Config,
+    *,
+    dry_run: bool = True,
+    permanent: bool = False,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+    cancel: CancelCB = None,
+    record_history: bool = True,
+    protect=None,
+) -> CleanSummary:
+    """Act on report-only findings; see :func:`cleanix.core.actions.act`.
+
+    Each finding is re-verified, then removed through :func:`clean` (same
+    guard, quarantine, history and Undo). ``permanent`` deletes instead of
+    quarantining. ``protect``: kept duplicate copies planned outside this
+    batch (``findings.kept_context``); they are never acted on."""
+    from cleanix.core import actions  # actions imports this module
+
+    return actions.act(
+        items, config, dry_run=dry_run, permanent=permanent, progress=progress,
+        cancel=cancel, record_history=record_history, protect=protect,
+    )
+
+
 def clean(
     items: Sequence[CleanableItem],
     config: Config,
@@ -84,9 +109,25 @@ def clean(
     registry_backup_dir: Optional[Path] = None,
     registry_backup_root: Optional[Path] = None,
     registry_verified_backups: Optional[Mapping[str, Any]] = None,
+    precheck: PrecheckCB = None,
+    delete_instead: DeleteCB = None,
+    quarantine_root: Optional[Path] = None,
+    on_outcome: Optional[Callable[[CleanOutcome], None]] = None,
+    remove_path: Optional[Callable[[str], tuple]] = None,
+    on_quarantine_claim: Optional[Callable[[str], None]] = None,
 ) -> CleanSummary:
     """Clean ``items``. ``cancel`` must be thread-safe: it may be called from
     worker threads.
+
+    ``quarantine_root`` (the elevated helper only): the quarantine run is
+    created under this already-validated, root-owned directory instead of
+    the user's quarantine root. Only then may ``record_history=False`` be
+    combined with a quarantine: the run's own manifest (in that directory)
+    is the restore index, and nothing is written under the user's home.
+    Registry items are refused in that mode. ``on_quarantine_claim(run_id)``
+    (only with ``quarantine_root``) is called once that run's directory
+    exists. ``on_outcome`` and ``remove_path`` are passed to
+    :meth:`Engine.clean` (default None changes nothing).
 
     ``record_history=False`` skips history and the manifest (the elevated
     helper must write nothing under the user's home; the GUI records history
@@ -115,12 +156,18 @@ def clean(
     Once items were removed, a failing final manifest save is not raised:
     ``quarantine_run`` is still returned and ``undo_record_error`` says
     where the backup files are.
+
+    ``precheck`` is passed to :meth:`Engine.clean` (re-verify each path right
+    before it is removed; default None changes nothing). ``delete_instead``
+    is passed on too (PATH items deleted, not moved, in a quarantine run).
     """
     from cleanix.core import regclean
 
     items = list(items)
     has_registry = any(i.kind is ItemKind.REGISTRY for i in items)
-    if not record_history and use_quarantine and not dry_run:
+    if quarantine_root is not None and has_registry:
+        raise ValueError("registry entries are never cleaned into an explicit quarantine root")
+    if not record_history and use_quarantine and not dry_run and quarantine_root is None:
         raise ValueError("record_history=False cannot be combined with quarantine")
     if not record_history and has_registry and not dry_run and not registry_backup_elsewhere:
         raise ValueError(
@@ -141,7 +188,8 @@ def clean(
     if not dry_run and (use_quarantine or needs_reg_run):
         from cleanix.core import quarantine as qmod
 
-        run = qmod.new_run()
+        run = (qmod.new_run() if quarantine_root is None
+               else qmod.new_run(root=quarantine_root, on_claim=on_quarantine_claim))
     quarantine = run if use_quarantine else None
     registry_backup = None
     if not dry_run:
@@ -164,14 +212,28 @@ def clean(
     result = Engine([]).clean(
         items, dry_run=dry_run, quarantine=quarantine,
         progress=on_progress, cancel=cancel, registry_backup=registry_backup,
+        precheck=precheck, delete_instead=delete_instead,
+        **{k: v for k, v in (("on_outcome", on_outcome), ("remove_path", remove_path))
+           if v is not None},
     )
 
     manifest: Optional[str] = None
     run_id: Optional[str] = None
     if not dry_run and record_history and result.outcomes:
+        mode = "quarantine" if quarantine else "delete"
+        if quarantine is not None and delete_instead is not None:
+            # An act batch (actions.act): job/unit files are deleted (a copy
+            # kept), not moved into the quarantine. Record what really
+            # happened: only deletions -> "delete", both -> "mixed".
+            removed = [o for o in result.outcomes if o.removed]
+            deleted = sum(1 for o in removed if delete_instead(o.item))
+            if removed and deleted == len(removed):
+                mode = "delete"
+            elif deleted:
+                mode = "mixed"
         history.record(
             result.freed, result.removed_count,
-            mode="quarantine" if quarantine else "delete",
+            mode=mode,
             registry=sum(1 for o in result.outcomes
                          if o.removed and o.item.kind is ItemKind.REGISTRY),
         )

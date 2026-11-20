@@ -23,6 +23,10 @@ from cleanix.core import history, quarantine, regpromises
 from cleanix.core.utils import human_size
 
 _MAX_ERRORS_SHOWN = 3
+COPIES_ONLY_NOTE = " (copies only; not restorable)"
+COPIES_ONLY_RESTORE = ("This run only holds copies of files that were removed "
+                       "permanently (background jobs / services): Restore does not "
+                       "bring them back. The copies are kept for manual recovery.")
 
 
 def _default_confirm(message: str) -> bool:
@@ -71,8 +75,10 @@ class QuarantinePanel(QWidget):
         super().__init__(parent)
         self._confirm = confirm or _default_confirm
         self._run_ids: List[str] = []
+        self._copies_only: set = set()
 
         self.summary_label = QLabel("")
+        self.summary_label.setTextFormat(Qt.TextFormat.PlainText)
         self.table = _make_table(["Run", "Time", "Items", "Size"], "Quarantine runs")
         self.restore_btn = QPushButton("Restore")
         self.restore_btn.setAccessibleName("Restore selected quarantine run")
@@ -81,6 +87,8 @@ class QuarantinePanel(QWidget):
         self.empty_btn = QPushButton("Empty all")
         self.empty_btn.setAccessibleName("Empty all quarantine runs")
         self.status_label = QLabel("")
+        # Paths and reasons come from manifests: never rendered as rich text.
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.status_label.setWordWrap(True)
         self.status_label.setAccessibleName("Quarantine status")
 
@@ -116,6 +124,7 @@ class QuarantinePanel(QWidget):
     def refresh(self) -> None:
         runs = quarantine.list_runs()
         self._run_ids = [r["run_id"] for r in runs]
+        self._copies_only = {r["run_id"] for r in runs if self.copies_only(r)}
         self.table.setRowCount(len(runs))
         for row, r in enumerate(runs):
             self.table.setItem(row, 0, _item(str(r["run_id"])))
@@ -125,6 +134,8 @@ class QuarantinePanel(QWidget):
                 items += f" ({r['registry']} registry)"
                 if not regpromises.registry_undo_shipped():
                     items += " - registry restore not enabled"
+            if r["run_id"] in self._copies_only:
+                items += COPIES_ONLY_NOTE
             self.table.setItem(row, 2, _item(items, True))
             self.table.setItem(row, 3, _item(human_size(r.get("size", 0)), True))
         total = sum(r.get("size", 0) for r in runs)
@@ -132,6 +143,17 @@ class QuarantinePanel(QWidget):
             self.summary_label.setText(f"{len(runs)} run(s), {human_size(total)} in quarantine")
         else:
             self.summary_label.setText("Quarantine is empty.")
+
+    @staticmethod
+    def copies_only(run: Dict) -> bool:
+        """A run that only holds copies of files removed permanently (e.g.
+        launch-job / unit files acted on from the Review tab): Restore never
+        acts on them, so it is not an Undo."""
+        if "removed_count" not in run:  # unknown: never guess
+            return False
+        return (int(run.get("count", 0) or 0) > 0
+                and int(run.get("removed_count", 0) or 0) == 0
+                and int(run.get("registry", 0) or 0) == 0)
 
     def _selected_run(self) -> Optional[str]:
         row = self.table.currentRow()
@@ -164,6 +186,9 @@ class QuarantinePanel(QWidget):
         if not run_id:
             self.status_label.setText("Select a run first.")
             return
+        if run_id in self._copies_only:
+            self.status_label.setText(COPIES_ONLY_RESTORE)
+            return
         if not self._confirm(f"Restore run {run_id} to its original locations?"):
             return
         try:
@@ -177,10 +202,16 @@ class QuarantinePanel(QWidget):
         restored, failed = len(result.get("restored", [])), result.get("failed", [])
         text = f"{restored} restored, {len(failed)} failed."
         held = result.get("not_restored", [])
+        copies = [h for h in held if str(h[1]).startswith("removed permanently")]
+        held = [h for h in held if h not in copies]
         if held:
             text += (f" {len(held)} registry entr{'y' if len(held) == 1 else 'ies'} "
                      "not restored: registry restore is not enabled in this "
                      "version (the backup files stay in the run).")
+        if copies:
+            text += (f" {len(copies)} file(s) had been removed permanently: only a "
+                     "copy is kept in the run for manual recovery; they are not "
+                     "restored.")
         if failed:
             text += " " + self._errors_text([f"{p} ({why})" for p, why in failed])
         self.status_label.setText(text)
@@ -257,6 +288,7 @@ class HistoryPanel(QWidget):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.totals_label = QLabel("")
+        self.totals_label.setTextFormat(Qt.TextFormat.PlainText)
         self.totals_label.setAccessibleName("Lifetime totals")
         self.sparkline = SparklineWidget()
         self.table = _make_table(["Time", "Mode", "Items", "Reclaimed"], "Recent runs")

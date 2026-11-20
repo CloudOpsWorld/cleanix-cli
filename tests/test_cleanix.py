@@ -699,8 +699,9 @@ def test_duplicates_reported_as_group(tmp_path, monkeypatch):
         (tmp_path / name).write_bytes(blob)
         _os.utime(tmp_path / name, (old, old))
     items = list(duplicates.DuplicateFileReporter(Config()).find_items())
-    assert len(items) == 1 and items[0].report_only
-    assert human_size(12 * 1024 * 1024) in items[0].description
+    # every copy is its own item (so one can be kept and the rest removed)
+    assert len(items) == 2 and all(i.report_only for i in items)
+    assert all(human_size(12 * 1024 * 1024) in i.description for i in items)
 
 
 def test_duplicates_ignores_unique_small_and_symlinks(tmp_path, monkeypatch):

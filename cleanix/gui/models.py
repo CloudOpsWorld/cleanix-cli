@@ -35,9 +35,13 @@ def badge_for(info: catalog.CleanerInfo) -> str:
 
 
 class CleanerListModel(QAbstractListModel):
-    def __init__(self, config: Config, parent=None) -> None:
+    def __init__(self, config: Config, parent=None, *, exclude=()) -> None:
+        """``exclude``: cleaner ids never listed (e.g. the registry
+        detectors, which live on their own tab)."""
         super().__init__(parent)
-        self._infos: List[catalog.CleanerInfo] = catalog.list_cleaners(config)
+        skip = frozenset(exclude or ())
+        self._infos: List[catalog.CleanerInfo] = [
+            i for i in catalog.list_cleaners(config) if i.id not in skip]
         self._checked: Dict[str, bool] = {
             i.id: i.default_enabled for i in self._infos
         }

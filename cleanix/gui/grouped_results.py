@@ -7,16 +7,18 @@ keys (``models.item_key``), never in widget state; group ticks are derived.
 
 from __future__ import annotations
 
+import html
 from typing import Callable, Dict, Iterable, List, Optional, Set
 
 from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QApplication, QHeaderView, QMenu, QTreeWidget, QTreeWidgetItem,
+    QTreeWidgetItemIterator,
 )
 
 from cleanix.core.curation import Group, Safety, display_label, shorten_path
-from cleanix.core.models import CleanableItem, ItemKind, item_key, item_target
+from cleanix.core.models import CleanableItem, ItemKind, _visible, item_key, item_target
 from cleanix.core.utils import human_size
 from cleanix.gui import elevation, reveal
 from cleanix.gui.models import size_text
@@ -41,6 +43,28 @@ _BADGE_DARK = {
     Safety.ADMIN: "#90caf9",
     Safety.PERMANENT: "#ef9a9a",
 }
+
+
+def badge_color(safety: Safety, dark: bool) -> str:
+    """Badge text colour for ``safety`` on a dark or a light base."""
+    return (_BADGE_DARK if dark else _BADGE_LIGHT)[safety]
+
+
+def shown(text) -> str:
+    """Display form of scan-derived text (names, paths, registry keys,
+    hints): control, format (bidi) and separator characters are shown as
+    backslash-u escapes, as the CLI's ``report.safe`` does. Copy path still
+    copies the original target."""
+    return _visible(str(text or ""))
+
+
+def plain_tip(*parts) -> str:
+    """A tooltip showing ``parts`` literally, one per line (each part
+    sanitised first; the whole escaped and marked as rich text so Qt never
+    interprets a name such as ``<b>x</b>``)."""
+    body = html.escape(chr(10).join(shown(p) for p in parts if p), quote=False)
+    return "<qt>" + body.replace(chr(10), "<br>") + "</qt>"
+
 
 REVIEW_ONLY_REASON = "Review only: Cleanix never deletes this."
 ADMIN_REASON = "Needs administrator permission."
@@ -96,6 +120,8 @@ class GroupedResults(QTreeWidget):
             hdr.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
 
         self.itemExpanded.connect(self._on_expanded)
+        self.itemExpanded.connect(lambda _row: self._fit_height())
+        self.itemCollapsed.connect(lambda _row: self._fit_height())
         self.itemChanged.connect(self._on_changed)
         self.itemDoubleClicked.connect(self._on_double_clicked)
         self.customContextMenuRequested.connect(self._on_menu)
@@ -135,7 +161,28 @@ class GroupedResults(QTreeWidget):
             self._rebuild_rows(set())
         finally:
             self._busy = prev
+        self._fit_height()
         self.selection_changed.emit()
+
+    MAX_FIT_ROWS = 14
+
+    def _fit_height(self) -> None:
+        """Size the tree to its visible rows (capped), so a handful of results
+        does not leave a page-high blank, striped area."""
+        rows = 0
+        it = QTreeWidgetItemIterator(self)
+        while it.value() is not None and rows < self.MAX_FIT_ROWS:
+            row = it.value()
+            parent, shown = row.parent(), not row.isHidden()
+            while shown and parent is not None:
+                shown = parent.isExpanded() and not parent.isHidden()
+                parent = parent.parent()
+            if shown:
+                rows += 1
+            it += 1
+        row_h = max(self.sizeHintForRow(0), 22) if self.topLevelItemCount() else 22
+        head = self.header().sizeHint().height()
+        self.setMaximumHeight(head + (rows + 1) * row_h + 2 * self.frameWidth() + 6)
 
     def set_allow_admin_items(self, allow: bool, reason: str = "") -> None:
         """Change admin availability at runtime; rows and selection follow."""
@@ -257,8 +304,7 @@ class GroupedResults(QTreeWidget):
     def _badge(self, row: QTreeWidgetItem, safety: Safety) -> None:
         row.setText(2, safety.value)
         dark = self.palette().base().color().lightness() < 128
-        row.setForeground(2, QBrush(QColor(
-            (_BADGE_DARK if dark else _BADGE_LIGHT)[safety])))
+        row.setForeground(2, QBrush(QColor(badge_color(safety, dark))))
         row.setToolTip(2, f"Safety: {safety.value}")
 
     def _make_group_row(self, gi: int, g: Group) -> QTreeWidgetItem:
@@ -301,17 +347,17 @@ class GroupedResults(QTreeWidget):
         g = self._groups[gi]
         row = QTreeWidgetItem()
         row.setData(0, _ROLE, _Row("item", gi, item))
-        label = display_label(item, self._home)
+        label = shown(display_label(item, self._home))
         row.setText(0, label)
         full = item_target(item)
         if item.kind is ItemKind.COMMAND:
-            row.setText(1, item.hint or "Runs a command")
+            row.setText(1, shown(item.hint or "Runs a command"))
         elif item.kind is ItemKind.REGISTRY:
-            row.setText(1, full)
+            row.setText(1, shown(full))
         else:
-            row.setText(1, shorten_path(full, self._home))
+            row.setText(1, shown(shorten_path(full, self._home)))
         reason = self.refusal_reason(item)
-        tip = chr(10).join(t for t in (full, reason, item.hint) if t)
+        tip = plain_tip(full, reason, item.hint)
         row.setToolTip(0, tip)
         row.setToolTip(1, tip)
         safety = self._item_safety(g, item)
@@ -327,7 +373,7 @@ class GroupedResults(QTreeWidget):
                               else Qt.CheckState.Unchecked)
         else:
             row.setFlags(flags)
-            row.setText(1, f"{reason} {item.hint}" if item.hint else reason)
+            row.setText(1, shown(f"{reason} {item.hint}" if item.hint else reason))
         row.setData(0, _ACCESSIBLE,
                     f"{label}, {safety.value}, {size_text([item])}")
         return row

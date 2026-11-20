@@ -82,6 +82,35 @@ def safe(text) -> str:
     return escape(_visible(str(text)))
 
 
+# C1 controls and the bidirectional formatting characters (marks, embeddings,
+# overrides, isolates): removed outright from text written by the elevated
+# helper, so a hostile file name or command output can never reorder or
+# recolour what the user reads.
+_HELPER_STRIP = frozenset(
+    [chr(c) for c in range(0x80, 0xA0)]
+    + ["؜", "‎", "‏"]
+    + [chr(c) for c in range(0x202A, 0x202F)]
+    + [chr(c) for c in range(0x2066, 0x206A)]
+)
+
+
+def helper_safe(text) -> str:
+    """:func:`safe` for text that comes from the elevated helper's result
+    (item keys, reasons, notes, run ids): C1 controls and bidi formatting
+    characters are stripped, lone surrogates become U+FFFD, then everything
+    else goes through :func:`safe` (other controls shown as escapes, markup
+    brackets escaped)."""
+    out = []
+    for ch in str(text):
+        if ch in _HELPER_STRIP:
+            continue
+        if 0xD800 <= ord(ch) <= 0xDFFF:
+            out.append("�")
+            continue
+        out.append(ch)
+    return safe("".join(out))
+
+
 def registry_notice() -> str:
     """What may truthfully be promised about registry removal right now; read
     from ``regpromises`` so every UI changes in one place."""

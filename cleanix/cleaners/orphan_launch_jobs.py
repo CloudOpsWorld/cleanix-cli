@@ -28,6 +28,8 @@ from cleanix.core.utils import current_uid, home
 
 MAX_PLIST_BYTES = 1024 * 1024
 _SIP_PREFIXES = ("/System", "/bin", "/sbin", "/usr")  # /usr/local is not SIP
+# System-wide job folders scanned (also the elevated helper's allowed roots).
+SYSTEM_DIRS = ("/Library/LaunchAgents", "/Library/LaunchDaemons")
 
 
 def job_program(plist: dict) -> Optional[str]:
@@ -73,7 +75,7 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
 
     # ------------------------------------------------------------ discovery
     def system_findings(self) -> Iterable[oc.Finding]:
-        for sub in ("/Library/LaunchAgents", "/Library/LaunchDaemons"):
+        for sub in SYSTEM_DIRS:
             yield from self._scan_dir(oc.in_root(self.sysroot, sub), system=True)
 
     def user_findings(self) -> Iterable[oc.Finding]:
@@ -104,12 +106,15 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
     def _check(self, plist: Path, system: bool) -> Optional[oc.Finding]:
         logical = oc.logical_path(self.sysroot, plist)
         if os.path.islink(plist):
-            if oc.link_target_exists(plist, self.sysroot) is False:
+            if (oc.link_target_exists(plist, self.sysroot) is False
+                    and not oc.evidence_problem(oc.link_dest(plist, self.sysroot))):
                 return oc.Finding(
                     plist,
                     f"Broken job link: {logical}",
                     self._hint(logical, "", system),
                     requires_root=system,
+                    # a system-wide link: no job file to copy and stop
+                    **({} if system else self._job_remedy(plist.stem)),
                 )
             try:
                 if os.readlink(plist) == "/dev/null":
@@ -139,12 +144,51 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
             return None
         if self._exists_or_unknown(program):
             return None
+        if system:
+            remedy = self._system_job_remedy(plist, data)
+        else:
+            remedy = self._job_remedy(label)
         return oc.Finding(
             plist,
             f"Background job for a missing program: {label} (runs {program})",
             self._hint(logical, label, system),
             requires_root=system,
+            **remedy,
         )
+
+    @staticmethod
+    def _job_remedy(label: str) -> dict:
+        """Finding kwargs for a LAUNCH_JOB remedy (only for a plain label)."""
+        if not oc.valid_ident(label):
+            return {}
+        return {
+            "remedy_kind": oc.RemedyKind.LAUNCH_JOB,
+            "remedy_extra": (("label", label),),
+        }
+
+    def _system_job_remedy(self, plist: Path, data: dict) -> dict:
+        """A system-wide LAUNCH_JOB remedy (Task 9b; the elevated helper),
+        only when every precondition holds: the plist lies DIRECTLY in
+        ``/Library/LaunchDaemons`` or ``/Library/LaunchAgents``; it declares
+        its own ``Label`` (launchd's name for it; never the file name) and
+        that label is plain and not Apple's (nor is the file name); the
+        file is a plain root-owned file only root can change, below folders
+        only system accounts can change (``oc.system_file_problem``)."""
+        parent = oc.logical_path(self.sysroot, plist.parent)
+        if parent not in SYSTEM_DIRS:
+            return {}
+        label = data.get("Label")
+        if not isinstance(label, str) or not oc.valid_ident(label):
+            return {}
+        from cleanix.core.remedy_exec import is_apple
+
+        if is_apple(label) or is_apple(plist.name):  # any case
+            return {}
+        if oc.bad_name(plist.name) or plist.suffix != ".plist":
+            return {}
+        if oc.system_file_problem(plist):
+            return {}
+        return self._job_remedy(label)
 
     def _load(self, plist: Path):
         """dict on success, None to skip silently, str reason when unreadable."""
@@ -173,6 +217,10 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
                 bundle = "/".join(parts[:i])
                 if _exists(oc.in_root(self.sysroot, bundle)) is not False:
                     return True
+        # Helper (root) scans: an absence an ordinary user could have caused
+        # (a folder on the way they can write, a link) is unknown.
+        if oc.evidence_problem(oc.in_root(self.sysroot, program)):
+            return True
         return False
 
     def _hint(self, logical: str, label: str, system: bool) -> str:
@@ -189,3 +237,31 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
         if label.startswith("homebrew.mxcl."):
             hint += " For Homebrew services, check brew services list first."
         return hint
+
+
+def reverify_system_item(item, config) -> Optional[str]:
+    """Act-time re-check of one system-wide LAUNCH_JOB finding (``reverify``
+    table; strict evidence): the plist lies directly in one of
+    ``SYSTEM_DIRS``, is not a link, and the detector's own check, re-run
+    on it, still reports a missing program with a system remedy naming the
+    SAME label (the plist's own ``Label`` key) -- so a reinstalled program,
+    a changed plist or an unjudgeable absence is a reason (fail closed)."""
+    path = item.path or ""
+    remedy = item.remedy
+    if remedy is None:
+        return "no remedy"
+    reporter = OrphanLaunchJobReporter(config)
+    reporter.budget.start()
+    real = Path(path)
+    if oc.logical_path(reporter.sysroot, real.parent) not in SYSTEM_DIRS:
+        return "it is not in a folder this scenario checks"
+    if os.path.islink(real):
+        return "it is a link, not a job file"
+    fresh = reporter._check(real, system=True)
+    if (fresh is None or fresh.note or not fresh.requires_root
+            or fresh.remedy_kind is not oc.RemedyKind.LAUNCH_JOB
+            or tuple(fresh.remedy_extra) != tuple(remedy.extra)
+            or os.path.abspath(str(fresh.path)) != os.path.abspath(path)):
+        return ("its program exists now, the job file changed, or this cannot "
+                "be confirmed; nothing was done")
+    return None

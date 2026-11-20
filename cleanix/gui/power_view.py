@@ -158,7 +158,10 @@ class PowerView(QWidget):
 
     # ----- UI -----
     def _build_scan_tab(self) -> None:
-        self.cleaner_model = _CleanerDelegateModel(self._config, self)
+        # The registry detectors live on their own (Windows-only) Registry
+        # tab: never listed, scanned or shown here.
+        self.cleaner_model = _CleanerDelegateModel(self._config, self,
+                                                   exclude=catalog.REGISTRY_IDS)
         self.item_model = ItemTableModel(self, allow_admin_items=self._allow_admin)
         self.proxy = _ItemFilterProxy(self)
         self.proxy.setSourceModel(self.item_model)
@@ -603,8 +606,18 @@ class PowerView(QWidget):
             self.cancel_button.setEnabled(False)
         self.status_label.setText(f"{name} ({done}/{total})" if total else name)
 
+    @staticmethod
+    def without_registry(result: ScanResult) -> ScanResult:
+        """``result`` without the registry detectors' reports (they belong
+        to the Registry tab, never to the Scan tab's tree or table)."""
+        reg = frozenset(catalog.REGISTRY_IDS)
+        if not any(r.cleaner_id in reg for r in result.reports):
+            return result
+        return ScanResult(reports=[r for r in result.reports if r.cleaner_id not in reg])
+
     def _on_scan_finished(self, result) -> None:
         self._worker = None
+        result = self.without_registry(result)
         self._result = result
         self._removed_keys = set()
         infos = self._infos()
