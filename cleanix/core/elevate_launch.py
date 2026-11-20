@@ -170,12 +170,28 @@ def run_findings_request(findings, invoking_user: str, *,
     A helper that refused or failed after writing its result (exit 1-3)
     still returns that result. Raises ElevationDeclined /
     ElevationUnavailable / ElevationFailed (no usable result) and
-    ValueError for a request that cannot be written. The request directory
-    is always removed. Nothing here touches the items themselves."""
+    ValueError, before any prompt, for a request the helper's lexical
+    checks would refuse (platform, scenario allowlist, paths, size) or
+    that cannot be written. A result naming an item that was not requested
+    is ElevationFailed. The request directory is always removed. Nothing
+    here touches the items themselves."""
     import shutil
 
+    from cleanix import elevated
     from cleanix.core import elevate
 
+    if not elevated._findings_supported():
+        raise ValueError(elevated.FINDINGS_NOT_SUPPORTED)
+    allowed = elevated.admin_finding_ids()
+    if not findings.only or any(c not in allowed for c in findings.only):
+        raise ValueError("the request names a scenario the administrator helper does not act on")
+    roots = elevated.finding_path_roots()
+    never = elevated.root_quarantine_never()
+    for sel in findings.items:
+        cid, path = elevate.finding_key_parts(sel.key)
+        problem = elevate.finding_path_problem(cid, path, roots, never)
+        if problem:
+            raise ValueError(f"the administrator helper never acts on this item ({problem})")
     selection = elevate.Selection(invoking_user=invoking_user, only=[], keys=[],
                                   use_quarantine=False, findings=findings)
     # Round-trip through the strict parser first: never prompt for a request
@@ -205,6 +221,9 @@ def run_findings_request(findings, invoking_user: str, *,
             raise ElevationFailed("the helper's result could not be read") from None
         if result.nonce != selection.nonce:
             raise ElevationFailed("the helper returned a stale or unexpected result")
+        requested = {s.key for s in findings.items}
+        if any(o.key not in requested for o in result.findings):
+            raise ElevationFailed("the helper's result names an item that was not requested")
         return result
     finally:
         shutil.rmtree(request_dir, ignore_errors=True)

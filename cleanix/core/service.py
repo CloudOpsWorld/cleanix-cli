@@ -110,6 +110,9 @@ def clean(
     precheck: PrecheckCB = None,
     delete_instead: DeleteCB = None,
     quarantine_root: Optional[Path] = None,
+    on_outcome: Optional[Callable[[CleanOutcome], None]] = None,
+    remove_path: Optional[Callable[[str], tuple]] = None,
+    on_quarantine_claim: Optional[Callable[[str], None]] = None,
 ) -> CleanSummary:
     """Clean ``items``. ``cancel`` must be thread-safe: it may be called from
     worker threads.
@@ -119,7 +122,10 @@ def clean(
     the user's quarantine root. Only then may ``record_history=False`` be
     combined with a quarantine: the run's own manifest (in that directory)
     is the restore index, and nothing is written under the user's home.
-    Registry items are refused in that mode.
+    Registry items are refused in that mode. ``on_quarantine_claim(run_id)``
+    (only with ``quarantine_root``) is called once that run's directory
+    exists. ``on_outcome`` and ``remove_path`` are passed to
+    :meth:`Engine.clean` (default None changes nothing).
 
     ``record_history=False`` skips history and the manifest (the elevated
     helper must write nothing under the user's home; the GUI records history
@@ -181,7 +187,7 @@ def clean(
         from cleanix.core import quarantine as qmod
 
         run = (qmod.new_run() if quarantine_root is None
-               else qmod.new_run(root=quarantine_root))
+               else qmod.new_run(root=quarantine_root, on_claim=on_quarantine_claim))
     quarantine = run if use_quarantine else None
     registry_backup = None
     if not dry_run:
@@ -205,6 +211,8 @@ def clean(
         items, dry_run=dry_run, quarantine=quarantine,
         progress=on_progress, cancel=cancel, registry_backup=registry_backup,
         precheck=precheck, delete_instead=delete_instead,
+        **{k: v for k, v in (("on_outcome", on_outcome), ("remove_path", remove_path))
+           if v is not None},
     )
 
     manifest: Optional[str] = None

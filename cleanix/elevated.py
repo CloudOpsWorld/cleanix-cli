@@ -1072,6 +1072,8 @@ NO_ACTION = "the administrator scan offers no action for this item; nothing was 
 NOT_SYSTEM_WIDE = ("not a system-wide finding (it is acted on without administrator "
                    "rights); nothing was done")
 NO_DUPLICATES = "duplicates are not handled by the administrator helper; nothing was done"
+STOPPED_WHILE_ACTING = ("the helper stopped while acting on it; it may have been "
+                        "removed or moved")
 # Remedy kinds (RemedyKind values) the helper acts on. Every other kind is
 # refused per item; Task 9 registers the others with their own checks.
 _HELPER_FINDING_KINDS = frozenset({"path"})
@@ -1167,7 +1169,10 @@ def _prepare_findings(req: elevate.FindingsRequest) -> _FindingsPlan:
             refused[sel.key] = KIND_NOT_SUPPORTED
     if not _is_elevated():
         raise Refused("the helper is not running as root; nothing was removed")
-    return _FindingsPlan(list(req.only), list(req.items), refused, bool(req.permanent))
+    # Scan only the scenarios that still have an item to act on.
+    only = [c for c in req.only
+            if any(s.key.split("|", 1)[0] == c and s.key not in refused for s in req.items)]
+    return _FindingsPlan(only, list(req.items), refused, bool(req.permanent))
 
 
 def _finding_problem(item, sel: elevate.FindingSelection, allowed, roots, never):
@@ -1356,34 +1361,49 @@ def _execute_findings(session: _Session, plan: _FindingsPlan, config, cancel,
             problem = _path_chain_problem(item.path or "", expected_uid, group_ids)
             return f"untrusted parent directory ({problem})" if problem else None
 
+        # Until an item's fate is known it is reported as possibly acted on:
+        # if the watchdog ends the process mid-batch, the result it writes
+        # never claims "not removed" for something already moved/deleted.
+        for item in candidates:
+            put(item_key(item), "not_removed", STOPPED_WHILE_ACTING)
+        done = set()
+
+        def on_item(item, outcome, reason) -> None:
+            key = item_key(item)
+            with session.lock:
+                done.add(key)
+                session.processed += 1
+                if outcome is None or (reason is not None and not outcome.removed):
+                    put(key, "skipped", reason or "skipped")
+                    session.errors.append(f"{item.description}: skipped: {reason}")
+                elif outcome.removed:
+                    put(key, "removed", "", outcome.freed)
+                    session.freed += max(0, int(outcome.freed))
+                    session.removed += 1
+                else:
+                    # e.g. "partially removed": the bytes really freed count.
+                    put(key, "not_removed", outcome.error or "not removed", outcome.freed)
+                    session.freed += max(0, int(outcome.freed or 0))
+                    session.errors.append(f"{item.description}: {outcome.error}")
+                session.findings = [out[k] for k in order if k in out]
+
+        def on_claim(run_id: str) -> None:
+            with session.lock:
+                session.quarantine_run = str(run_id)
+
+        flush()
         old_mask = os.umask(0o077)
         try:
             summary = actions.act(candidates, config, dry_run=False,
                                   permanent=plan.permanent, cancel=cancel,
                                   record_history=False, allow_root=True,
-                                  quarantine_root=qroot, extra_check=chain)
+                                  quarantine_root=qroot, extra_check=chain,
+                                  on_item=on_item, on_quarantine_claim=on_claim)
         finally:
             os.umask(old_mask)
-        done = set()
         with session.lock:
-            session.freed += summary.freed
-            session.removed += summary.removed
-            session.processed += len(summary.result.outcomes) + len(summary.skipped)
-            session.errors.extend(f"{o.item.description}: {o.error}" for o in summary.errors)
-            if summary.quarantine_run:
-                session.quarantine_run = str(summary.quarantine_run)
-        for o in summary.result.outcomes:
-            key = item_key(o.item)
-            done.add(key)
-            if o.removed:
-                put(key, "removed", "", o.freed)
-            else:
-                put(key, "not_removed", o.error or "not removed")
-        for item, reason in summary.skipped:
-            key = item_key(item)
-            done.add(key)
-            put(key, "skipped", reason)
-            session.note(error=f"{item.description}: skipped: {reason}")
+            # A claimed run that ended up empty was discarded ("").
+            session.quarantine_run = str(summary.quarantine_run or "")
         if summary.undo_record_error:
             session.note(error=summary.undo_record_error)
         hit = False

@@ -714,7 +714,7 @@ def parse_request(data: bytes) -> Selection:
     findings = None
     if FINDINGS_FIELD in obj:
         # Exclusive: never combined with ordinary admin items.
-        if only or keys:
+        if only or keys or obj["use_quarantine"]:
             raise ValueError("request combines findings with other items")
         findings = _parse_findings(obj[FINDINGS_FIELD])
     return Selection(
@@ -820,7 +820,8 @@ def _result_payload(result: HelperResult) -> dict:
         "deadline_hit": bool(result.deadline_hit),
         "errors": [plain_text(e) for e in list(result.errors)[:MAX_ERRORS]],
         "findings": [
-            {"key": str(o.key), "status": str(o.status), "freed": max(0, int(o.freed)),
+            {"key": _CONTROL_RE.sub(" ", str(o.key)), "status": str(o.status),
+             "freed": max(0, int(o.freed)),
              "reason": plain_text(o.reason)}
             for o in list(result.findings)[:MAX_FINDING_ITEMS]
         ],
@@ -844,6 +845,10 @@ def _parse_finding_outcomes(value) -> List[FindingOutcome]:
                 or status not in FINDING_STATUSES or not isinstance(reason, str)
                 or type(freed) is not int or freed < 0):
             raise ValueError("result field 'findings' is invalid")
+        try:
+            finding_key_parts(key)
+        except ValueError:
+            raise ValueError("result field 'findings' is invalid") from None
         out.append(FindingOutcome(key=key, status=status, freed=freed,
                                   reason=plain_text(reason)))
     return out

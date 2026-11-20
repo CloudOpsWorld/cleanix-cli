@@ -369,6 +369,7 @@ def _mut(fn):
     lambda o: o["findings"]["items"].append(dict(GOOD_ITEM)),  # listed twice
     lambda o: o.update(only=["logs"]),  # mixed with ordinary admin items
     lambda o: o.update(keys=["logs|path|/var/log/x"]),
+    lambda o: o.update(use_quarantine=True),
     lambda o: o.update(registry={"only": ["win_reg_startup"], "keys": [],
                                  "backup_run": "r1", "quarantine_root": "C:\\q"}),
     lambda o: o.update(findings=[]),
@@ -549,7 +550,7 @@ def test_helper_mode_skips_user_findings(tmp_path):
 # --------------------------------------------------------------------------
 # launcher (non-GUI): one request, one prompt, the matching result
 # --------------------------------------------------------------------------
-def _fake_launcher(write=True, nonce=None, rc_exc=None):
+def _fake_launcher(write=True, nonce=None, rc_exc=None, key=None):
     calls = []
 
     def launch(argv):
@@ -561,8 +562,8 @@ def _fake_launcher(write=True, nonce=None, rc_exc=None):
             elevate.write_result(res, elevate.HelperResult(
                 freed=0, removed=0, errors=[], unmatched=1,
                 nonce=nonce if nonce is not None else sel.nonce,
-                findings=[elevate.FindingOutcome(sel.findings.items[0].key, "not_found",
-                                                 reason=elevated.NOT_FOUND)]))
+                findings=[elevate.FindingOutcome(key or sel.findings.items[0].key,
+                                                 "not_found", reason=elevated.NOT_FOUND)]))
         if rc_exc is not None:
             raise rc_exc
         return 0
@@ -578,7 +579,7 @@ def _req():
                                         "path")])
 
 
-def test_run_findings_request_returns_matching_result():
+def test_run_findings_request_returns_matching_result(lexical):
     launch = _fake_launcher()
     result = elevate_launch.run_findings_request(_req(), "alice", launcher=launch)
     assert len(launch.calls) == 1
@@ -587,13 +588,13 @@ def test_run_findings_request_returns_matching_result():
     assert not req_dir.exists()  # always removed
 
 
-def test_run_findings_request_refused_exit_still_returns_result():
+def test_run_findings_request_refused_exit_still_returns_result(lexical):
     launch = _fake_launcher(rc_exc=elevate_launch.ElevationFailed("x", exit_code=1))
     result = elevate_launch.run_findings_request(_req(), "alice", launcher=launch)
     assert result.unmatched == 1
 
 
-def test_run_findings_request_rejects_stale_result():
+def test_run_findings_request_rejects_stale_result(lexical):
     with pytest.raises(elevate_launch.ElevationFailed):
         elevate_launch.run_findings_request(_req(), "alice",
                                             launcher=_fake_launcher(nonce="0" * 32))
@@ -602,7 +603,7 @@ def test_run_findings_request_rejects_stale_result():
                                             launcher=_fake_launcher(write=False))
 
 
-def test_run_findings_request_never_prompts_for_an_invalid_request():
+def test_run_findings_request_never_prompts_for_an_invalid_request(lexical):
     launch = _fake_launcher()
     bad = elevate.FindingsRequest(only=["orphan_files"], items=[
         elevate.FindingSelection("orphan_files|path|/var/lib/../etc", (1, 2, 3, 4), "path")])
@@ -611,7 +612,61 @@ def test_run_findings_request_never_prompts_for_an_invalid_request():
     assert launch.calls == []
 
 
-def test_run_findings_request_never_prompts_for_an_oversized_request():
+def test_run_findings_request_rejects_a_result_for_unrequested_items(lexical):
+    launch = _fake_launcher(key="orphan_files|path|/var/lib/other")
+    with pytest.raises(elevate_launch.ElevationFailed, match="not requested"):
+        elevate_launch.run_findings_request(_req(), "alice", launcher=launch)
+
+
+@pytest.mark.parametrize("bad", [
+    elevate.FindingsRequest(only=["big_files"], items=[elevate.FindingSelection(
+        "big_files|path|/var/lib/gone", (1, 2, 3, 4), "path")]),
+    elevate.FindingsRequest(only=["orphan_files"], items=[elevate.FindingSelection(
+        "orphan_files|path|/etc/passwd", (1, 2, 3, 4), "path")]),
+    elevate.FindingsRequest(only=["orphan_files"], items=[elevate.FindingSelection(
+        "orphan_files|path|/var/lib/cleanix", (1, 2, 3, 4), "path")]),
+])
+def test_run_findings_request_checks_allowlist_and_paths_before_prompting(lexical, bad):
+    launch = _fake_launcher()
+    with pytest.raises(ValueError):
+        elevate_launch.run_findings_request(bad, "alice", launcher=launch)
+    assert launch.calls == []
+
+
+def test_run_findings_request_refused_on_windows(lexical, monkeypatch):
+    monkeypatch.setattr(elevated, "_findings_supported", lambda: False)
+    launch = _fake_launcher()
+    with pytest.raises(ValueError, match="Windows"):
+        elevate_launch.run_findings_request(_req(), "alice", launcher=launch)
+    assert launch.calls == []
+
+
+def test_result_key_must_be_a_finding_key(tmp_path):
+    res = elevate.HelperResult(freed=0, removed=0, errors=[], unmatched=0, findings=[
+        elevate.FindingOutcome("orphan_files|path|/var/lib/../etc", "removed")])
+    elevate.write_result(tmp_path / elevate.RESULT_NAME, res)
+    with pytest.raises(ValueError):
+        elevate.read_result(tmp_path / elevate.RESULT_NAME)
+    long_key = "orphan_files|path|/var/lib/" + "a" * 250 + "/" + "b" * 250 + "/" + "c" * 200
+    res.findings = [elevate.FindingOutcome(long_key, "removed")]
+    elevate.write_result(tmp_path / elevate.RESULT_NAME, res)
+    assert elevate.read_result(tmp_path / elevate.RESULT_NAME).findings[0].key == long_key
+
+
+def test_findings_plan_scans_only_scenarios_left(lexical, monkeypatch):
+    monkeypatch.setattr(elevated, "admin_finding_ids",
+                        lambda: frozenset({"orphan_files", "stale_services"}))
+    monkeypatch.setattr(elevated, "finding_path_roots", lambda: dict(
+        LINUX_ROOTS, stale_services=("/etc/systemd/system",)))
+    sel = parse(payload([dict(GOOD_ITEM),
+                         {"key": "stale_services|path|/etc/systemd/system/x.service",
+                          "fingerprint": [1, 2, 3, 4], "kind": "systemd_unit"}],
+                        only=("orphan_files", "stale_services")))
+    plan = elevated._prepare_findings(sel.findings)
+    assert plan.only == ["orphan_files"]
+
+
+def test_run_findings_request_never_prompts_for_an_oversized_request(lexical):
     launch = _fake_launcher()
     long_dir = "/var/lib/" + "/".join(["d" * 250] * 4)  # 1012 chars, still valid
     big = elevate.FindingsRequest(only=["orphan_files"], items=[
@@ -845,3 +900,261 @@ def test_unowned_root_quarantine_dir_refused(fx, monkeypatch, case):
     out = result.findings[0]
     assert out.status == "not_removed" and "quarantine is not usable" in out.reason
     assert result.removed == 0 and result.quarantine_run == ""
+
+
+# --------------------------------------------------------------------------
+# fix round 1: watchdog mid-batch, mounts and honest root removal,
+# real parent-chain ownership and the per-item re-check
+# --------------------------------------------------------------------------
+REAL_TRUSTED_OWNER = elevated._trusted_owner
+
+
+class Killed(BaseException):
+    """Stands in for os._exit in the watchdog (the process ends)."""
+
+
+@posix_only
+def test_watchdog_mid_batch_result_is_honest_and_manifest_records_moves(fx, monkeypatch):
+    a = make(fx, "a", "aaaa")
+    b = make(fx, "b", "bbbb")
+    fx.cleaners.append(FakeCleaner("orphan_files", lambda: [finding(a), finding(b)]))
+    sessions = []
+    real_init = elevated._Session.__init__
+
+    def init(self, rdir):
+        real_init(self, rdir)
+        sessions.append(self)
+
+    monkeypatch.setattr(elevated._Session, "__init__", init)
+
+    def hard_exit(code):
+        raise Killed(code)
+
+    monkeypatch.setattr(elevated.os, "_exit", hard_exit)
+    real_rename = quarantine._rename
+    calls = []
+
+    def rename(src, dst):
+        calls.append(src)
+        if len(calls) == 2:  # the watchdog fires while item 2 is being moved
+            sessions[0].abort_after_deadline()
+        real_rename(src, dst)
+
+    monkeypatch.setattr(quarantine, "_rename", rename)
+    req = elevate.write_request(fx.reqdir, request([finding(a), finding(b)]))
+    with pytest.raises(Killed):
+        elevated.run(req, fx.result, None, expected_uid=UID)
+    result = elevate.read_result(fx.result)
+    assert result.deadline_hit
+    assert not a.exists() and b.exists()
+    st = {o.key: o for o in result.findings}
+    assert st[f"orphan_files|path|{a}"].status == "removed"
+    assert st[f"orphan_files|path|{b}"].status == "not_removed"
+    assert st[f"orphan_files|path|{b}"].reason == elevated.STOPPED_WHILE_ACTING
+    assert result.removed == 1 and result.freed > 0
+    assert result.quarantine_run
+    manifest = json.loads((fx.qbase / result.quarantine_run / "manifest.json").read_text())
+    assert [i["original"] for i in manifest["items"]] == [str(a)]
+    assert Path(manifest["items"][0]["stored"]).read_text() == "aaaa"
+
+
+@posix_only
+def test_root_quarantine_records_origin_before_moving(fx, monkeypatch):
+    a = make(fx, "a")
+    seen = []
+    real_rename = quarantine._rename
+
+    def rename(src, dst):
+        # Already recorded on disk when the move happens.
+        mf = Path(dst).parent.parent / "manifest.json"
+        seen.append([i["original"] for i in json.loads(mf.read_text())["items"]])
+        real_rename(src, dst)
+
+    monkeypatch.setattr(quarantine, "_rename", rename)
+    fx.cleaners.append(FakeCleaner("orphan_files", lambda: [finding(a)]))
+    rc, result = run_helper(fx, request([finding(a)]))
+    assert rc == elevated.EXIT_OK and result.removed == 1
+    assert seen == [[str(a)]]
+
+
+def test_mountinfo_parsing_unescapes_mount_points():
+    from cleanix.core import root_delete
+
+    text = ("36 35 98:0 /mnt1 /mnt/with\\040space rw,noatime master:1 - ext3 /dev/root rw\n"
+            "37 35 98:0 / /var/lib/kubelet/pods/x/volumes rw - tmpfs tmpfs rw\n"
+            "38 35 98:0 / /odd\\134name\\011tab rw - tmpfs tmpfs rw\n")
+    assert root_delete.parse_mountinfo(text) == [
+        "/mnt/with space", "/var/lib/kubelet/pods/x/volumes", "/odd\\name\ttab"]
+    assert root_delete.parse_mountinfo("garbage\n") is None
+
+
+@pytest.fixture
+def mounts(monkeypatch):
+    from cleanix.core import root_delete
+
+    table = {"text": ""}
+    monkeypatch.setattr(root_delete, "_linux", lambda: True)
+    monkeypatch.setattr(root_delete, "_read_mountinfo", lambda: table["text"])
+    return table
+
+
+def _mount_line(path):
+    return "40 35 98:0 / " + str(path).replace(" ", "\\040") + " rw - tmpfs tmpfs rw\n"
+
+
+@posix_only
+def test_item_with_a_mount_below_is_refused(tmp_path, mounts):
+    from cleanix.core import root_delete
+
+    d = tmp_path / "pod"
+    (d / "vol").mkdir(parents=True)
+    mounts["text"] = _mount_line(d / "vol")
+    for permanent in (True, False):
+        assert root_delete.mount_problem(str(d), permanent=permanent) == \
+            "a filesystem is mounted inside it"
+    mounts["text"] = _mount_line(d)
+    assert root_delete.mount_problem(str(d), permanent=True) == "it is a mount point"
+    mounts["text"] = _mount_line(tmp_path / "podx")  # a sibling with the same prefix
+    assert root_delete.mount_problem(str(d), permanent=True) is None
+    mounts["text"] = None
+    assert root_delete.mount_problem(str(d), permanent=True) == \
+        "the mount table could not be read"
+
+
+def test_without_a_mount_table_permanent_folders_are_refused(tmp_path, monkeypatch):
+    from cleanix.core import root_delete
+
+    monkeypatch.setattr(root_delete, "_linux", lambda: False)
+    d = tmp_path / "dir"
+    d.mkdir()
+    f = tmp_path / "file"
+    f.write_text("x")
+    assert "quarantine instead" in root_delete.mount_problem(str(d), permanent=True)
+    assert root_delete.mount_problem(str(d), permanent=False) is None
+    assert root_delete.mount_problem(str(f), permanent=True) is None
+
+
+@posix_only
+def test_helper_skips_an_item_with_a_mount_below(fx, mounts):
+    d = fx.sys / "pod"
+    (d / "vol").mkdir(parents=True)
+    (d / "vol" / "data").write_text("other filesystem")
+    mounts["text"] = _mount_line(d / "vol")
+    fx.cleaners.append(FakeCleaner("orphan_files", lambda: [finding(d)]))
+    for permanent in (True, False):
+        rc, result = run_helper(fx, request([finding(d)], permanent=permanent))
+        assert rc == elevated.EXIT_OK and (d / "vol" / "data").exists()
+        out = result.findings[0]
+        assert out.status == "skipped" and "mounted inside it" in out.reason
+
+
+@posix_only
+def test_root_permanent_partial_failure_is_reported_honestly(fx, monkeypatch):
+    d = fx.sys / "tree"
+    (d / "sub").mkdir(parents=True)
+    (d / "gone.bin").write_bytes(b"g" * 100)
+    (d / "sub" / "locked").write_bytes(b"l" * 10)
+    real_unlink = os.unlink
+
+    def unlink(p, *a, **k):
+        if os.fsdecode(p).endswith("locked"):
+            raise PermissionError(13, "Permission denied")
+        return real_unlink(p, *a, **k)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    fx.cleaners.append(FakeCleaner("orphan_files", lambda: [finding(d)]))
+    rc, result = run_helper(fx, request([finding(d)], permanent=True))
+    assert rc == elevated.EXIT_OK
+    out = result.findings[0]
+    assert out.status == "not_removed" and out.reason.startswith("partially removed:")
+    assert (d / "sub" / "locked").exists() and not (d / "gone.bin").exists()
+    assert result.removed == 0
+    assert out.freed >= 100 and result.freed == out.freed
+
+
+@posix_only
+def test_root_permanent_refused_without_symlink_safe_rmtree(tmp_path, monkeypatch):
+    import shutil
+
+    from cleanix.core import root_delete
+
+    d = tmp_path / "t"
+    d.mkdir()
+    (d / "f").write_text("x")
+    monkeypatch.setattr(shutil.rmtree, "avoids_symlink_attacks", False, raising=False)
+    removed, freed, error = root_delete.remove(str(d))
+    assert not removed and freed == 0 and "symbolic-link" in error
+    assert (d / "f").exists()
+
+
+@posix_only
+def test_root_remove_refuses_a_tree_on_another_device(tmp_path):
+    from cleanix.core import root_delete
+
+    d = tmp_path / "t"
+    d.mkdir()
+    (d / "f").write_text("x")
+    _size, why = root_delete._tree_size_and_devs(str(d), dev=-1)
+    assert "another filesystem" in why
+
+
+def test_normal_act_never_uses_root_removal(tmp_path, monkeypatch):
+    from cleanix.core import root_delete
+
+    def forbidden(*a, **k):
+        pytest.fail("the normal path used the root-only removal or mount check")
+
+    monkeypatch.setattr(root_delete, "remove", forbidden)
+    monkeypatch.setattr(root_delete, "mount_problem", forbidden)
+    d = tmp_path / "userdir"
+    d.mkdir()
+    (d / "f").write_text("x")
+    summary = actions.act([finding(d, requires_root=False)], Config(), dry_run=False,
+                          permanent=True, record_history=False)
+    assert summary.removed == 1 and not d.exists()
+
+
+@posix_only
+def test_real_ownership_rule_refuses_parent_owned_by_the_user(fx, monkeypatch):
+    if UID == 0:
+        pytest.skip("needs a non-root test user")
+    monkeypatch.setattr(elevated, "_trusted_owner", REAL_TRUSTED_OWNER)
+    a = make(fx, "a")
+    fx.cleaners.append(FakeCleaner("orphan_files", lambda: [finding(a)]))
+    rc, result = run_helper(fx, request([finding(a)], permanent=True))
+    assert rc == elevated.EXIT_OK and a.exists()
+    out = result.findings[0]
+    assert out.status == "skipped" and "non-system user" in out.reason
+
+
+@posix_only
+def test_parent_swapped_for_a_link_mid_batch_is_caught_before_removal(fx, monkeypatch):
+    (fx.sys / "d1").mkdir()
+    (fx.sys / "d2").mkdir()
+    f1 = fx.sys / "d1" / "f1"
+    f1.write_text("one")
+    f2 = fx.sys / "d2" / "f2"
+    f2.write_text("two")
+    elsewhere = fx.tmp / "elsewhere"
+    real_rename = quarantine._rename
+    calls = []
+
+    def rename(src, dst):
+        calls.append(src)
+        real_rename(src, dst)
+        if len(calls) == 1:  # while item 1 is moved, d2 becomes a link
+            os.rename(fx.sys / "d2", elsewhere)
+            (fx.sys / "d2").symlink_to(elsewhere, target_is_directory=True)
+
+    monkeypatch.setattr(quarantine, "_rename", rename)
+    items = [finding(f1), finding(f2)]
+    fx.cleaners.append(FakeCleaner("orphan_files", lambda: items))
+    rc, result = run_helper(fx, request(items))
+    assert rc == elevated.EXIT_OK
+    assert not f1.exists()
+    assert (elsewhere / "f2").read_text() == "two"
+    st = {o.key: o for o in result.findings}
+    assert st[f"orphan_files|path|{f1}"].status == "removed"
+    late = st[f"orphan_files|path|{f2}"]
+    assert late.status == "skipped" and "symbolic link" in late.reason
+    assert calls == [str(f1)]

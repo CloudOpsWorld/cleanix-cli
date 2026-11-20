@@ -217,6 +217,9 @@ def act(
     allow_root: bool = False,
     quarantine_root: Optional[Path] = None,
     extra_check: Optional[Callable[[CleanableItem], Optional[str]]] = None,
+    on_item: Optional[Callable[[CleanableItem, Optional[CleanOutcome], Optional[str]],
+                               None]] = None,
+    on_quarantine_claim: Optional[Callable[[str], None]] = None,
 ) -> ActSummary:
     """Act on findings: quarantine (or, with ``permanent``, delete) each
     verified PATH finding through :func:`service.clean`, as one batch (one
@@ -249,15 +252,35 @@ def act(
     every built-in check) up front and again right before each removal,
     a non-None return skipping the item. With ``allow_root`` or
     ``quarantine_root`` only plain PATH findings are handled (no
-    duplicates, launch jobs or units).
+    duplicates, launch jobs or units). With ``allow_root`` an item that is a
+    mount point or has a mount below it is skipped, and a permanent removal
+    goes through :func:`root_delete.remove` (never ignores errors, never
+    crosses filesystems, reports a partial removal as not removed).
+
+    ``on_item(finding, outcome, skip_reason)`` (default None) reports each
+    finding as soon as its fate is known: skipped up front (outcome None),
+    or processed by the Engine (``skip_reason`` set when the re-check right
+    before its removal refused it). ``on_quarantine_claim(run_id)`` (with
+    ``quarantine_root`` only) is called once the quarantine run exists.
     """
+    from cleanix.core import root_delete
+
     items = list(items)
     if not record_history and not permanent and not dry_run and quarantine_root is None:
         raise ValueError("record_history=False cannot be combined with quarantine")
     root_mode = allow_root or quarantine_root is not None
 
-    def extra(item: CleanableItem) -> Optional[str]:
+    def run_extra_check(item: CleanableItem) -> Optional[str]:
+        if allow_root and item.path:
+            why = root_delete.mount_problem(item.path, permanent=permanent)
+            if why is not None:
+                return f"not removed: {why}"
         return extra_check(item) if extra_check is not None else None
+
+    def report(item: CleanableItem, outcome: Optional[CleanOutcome],
+               reason: Optional[str]) -> None:
+        if on_item is not None:
+            on_item(item, outcome, reason)
     # The guard below must see the user's protected globs (service.clean
     # sets them again; same value).
     safety.set_protected_globs(config.protected_globs)
@@ -289,13 +312,14 @@ def act(
                 reason = _verify(item, batch, hashed, config, cancel,
                                  allow_root=allow_root, root_mode=root_mode)
                 if reason is None:
-                    reason = extra(item)
+                    reason = run_extra_check(item)
             except Exception as exc:  # noqa: BLE001 - fail closed, never abort the batch
                 reason = f"could not be verified ({str(exc) or type(exc).__name__})"
         if key is not None:
             seen.add(key)
         if reason is not None:
             skipped[idx] = reason
+            report(item, None, reason)
         else:
             todo.append((idx, _activate(item)))
 
@@ -347,7 +371,7 @@ def act(
                     else:
                         why = _recheck(finding, config)
                         if why is None:
-                            why = extra(finding)
+                            why = run_extra_check(finding)
                 except Exception as exc:  # noqa: BLE001 - fail closed
                     why = f"could not be verified ({str(exc) or type(exc).__name__})"
             if why is not None:
@@ -357,14 +381,30 @@ def act(
         # Only PATH findings are quarantined (restorable); a batch of jobs
         # alone opens no quarantine run at all.
         quarantine_paths = not permanent and len(jobs) < len(todo)
+
+        def engine_outcome(outcome: CleanOutcome) -> None:
+            finding = original.get(id(outcome.item))
+            if finding is None:
+                return
+            why = late.get(id(outcome.item)) if not outcome.removed else None
+            report(finding, outcome, why)
+
+        root_kwargs: Dict[str, object] = {}
+        if quarantine_root is not None:
+            root_kwargs["quarantine_root"] = quarantine_root
+            if on_quarantine_claim is not None:
+                root_kwargs["on_quarantine_claim"] = on_quarantine_claim
+        if allow_root and not dry_run:
+            root_kwargs["remove_path"] = root_delete.remove
+        if on_item is not None:
+            root_kwargs["on_outcome"] = engine_outcome
         try:
             inner = service.clean(
                 [a for _i, a in todo], config, dry_run=dry_run,
                 use_quarantine=quarantine_paths, progress=progress, cancel=cancel,
                 record_history=record_history, precheck=precheck,
                 delete_instead=lambda a: id(a) in jobs,
-                **({} if quarantine_root is None
-                   else {"quarantine_root": quarantine_root}),
+                **root_kwargs,  # type: ignore[arg-type]
             )
         finally:
             if backup[0] is not None:
@@ -381,13 +421,13 @@ def act(
             info = prepared.get(id(activated))
             if info is not None:
                 kind, stop, where = info
-                extra = reload_warnings if kind is RemedyKind.SYSTEMD_UNIT else []
+                reload_extra = reload_warnings if kind is RemedyKind.SYSTEMD_UNIT else []
                 if outcome.removed:
-                    note = remedy_exec.permanent_note(where, stop, extra)
+                    note = remedy_exec.permanent_note(where, stop, reload_extra)
                 else:
                     note = ("the job was stopped, but its file was not removed"
                             if stop.stopped else "its file was not removed")
-                    warnings = stop.warnings + list(extra)
+                    warnings = stop.warnings + list(reload_extra)
                     if warnings:
                         note += "; warning: " + "; ".join(warnings)
                 outcome = dataclasses.replace(outcome, note=note)

@@ -31,6 +31,10 @@ CancelCB = Optional[Callable[[], bool]]
 PrecheckCB = Optional[Callable[[CleanableItem], Optional[str]]]
 # True for a PATH item that is deleted even in a quarantine run (see Engine.clean).
 DeleteCB = Optional[Callable[[CleanableItem], bool]]
+# Called with each outcome right after it is produced (see Engine.clean).
+OutcomeCB = Optional[Callable[[CleanOutcome], None]]
+# Replaces the permanent removal of a PATH: (removed, freed bytes, error).
+RemovePathCB = Optional[Callable[[str], "tuple"]]
 
 
 class Engine:
@@ -113,8 +117,16 @@ class Engine:
         registry_backup: Optional[RegistryBackupSink] = None,
         precheck: PrecheckCB = None,
         delete_instead: DeleteCB = None,
+        on_outcome: OutcomeCB = None,
+        remove_path: RemovePathCB = None,
     ) -> CleanResult:
         """Remove (or simulate removing) the given items.
+
+        ``on_outcome`` (default None) is called with each outcome as soon
+        as it exists (an exception from it propagates). ``remove_path``
+        (default None: ``safety.safe_rmtree``) replaces the permanent
+        removal of PATH items; it returns ``(removed, freed, error)`` and
+        runs only after the guard and ``precheck`` passed.
 
         ``precheck`` (PATH items only; default None = no extra check) is
         called right before each path is moved or deleted, after the safety
@@ -145,13 +157,15 @@ class Engine:
                 break
             if progress:
                 progress(item.description)
-            result.outcomes.append(
-                self._clean_one(
-                    item, dry_run=dry_run, allow_root=allow_root_items,
-                    quarantine=quarantine, registry_backup=registry_backup,
-                    precheck=precheck, delete_instead=delete_instead,
-                )
+            outcome = self._clean_one(
+                item, dry_run=dry_run, allow_root=allow_root_items,
+                quarantine=quarantine, registry_backup=registry_backup,
+                precheck=precheck, delete_instead=delete_instead,
+                remove_path=remove_path,
             )
+            result.outcomes.append(outcome)
+            if on_outcome is not None:
+                on_outcome(outcome)
         return result
 
     def _clean_one(
@@ -159,6 +173,7 @@ class Engine:
         registry_backup: Optional[RegistryBackupSink] = None,
         precheck: PrecheckCB = None,
         delete_instead: DeleteCB = None,
+        remove_path: RemovePathCB = None,
     ) -> CleanOutcome:
         # Report-only items are never deleted, even if one slips into a clean set.
         if item.report_only:
@@ -182,7 +197,7 @@ class Engine:
             if quarantine is not None and delete_instead is not None and delete_instead(item):
                 quarantine = None
             return self._clean_path(item, dry_run=dry_run, quarantine=quarantine,
-                                    precheck=precheck)
+                                    precheck=precheck, remove_path=remove_path)
         if item.kind is ItemKind.COMMAND:
             return self._clean_command(item, dry_run=dry_run)
         if item.kind is ItemKind.REGISTRY:
@@ -204,6 +219,7 @@ class Engine:
     def _clean_path(
         self, item: CleanableItem, *, dry_run: bool, quarantine=None,
         precheck: PrecheckCB = None,
+        remove_path: RemovePathCB = None,
     ) -> CleanOutcome:
         path = item.path or ""
         if not safety.is_safe_to_delete(path):
@@ -238,6 +254,15 @@ class Engine:
             except Exception as exc:  # noqa: BLE001
                 return CleanOutcome(item=item, removed=False, error=f"quarantine: {exc}")
             return CleanOutcome(item=item, removed=True, freed=freed)
+
+        if remove_path is not None:
+            try:
+                removed, really_freed, error = remove_path(path)
+            except Exception as exc:  # noqa: BLE001 - fail closed, one item only
+                return CleanOutcome(item=item, removed=False,
+                                    error=str(exc) or type(exc).__name__)
+            return CleanOutcome(item=item, removed=bool(removed),
+                                freed=max(0, int(really_freed)), error=error)
 
         try:
             safety.safe_rmtree(p)

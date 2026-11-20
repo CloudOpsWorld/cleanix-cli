@@ -125,11 +125,15 @@ class Quarantine:
     anything was written. :meth:`save` refuses to replace a manifest this
     object did not write."""
 
-    def __init__(self, run_id: str, root: Optional[Path] = None):
+    def __init__(self, run_id: str, root: Optional[Path] = None,
+                 on_claim=None):
         # ``root`` (the elevated helper only): a quarantine root the caller
         # created and validated itself; it is used instead of
-        # ``quarantine_root()`` and never created here.
+        # ``quarantine_root()`` and never created here. In that mode each
+        # item's origin is saved in the manifest BEFORE it is moved, and
+        # ``on_claim(run_id)`` is called once the run directory exists.
         self._root: Optional[Path] = Path(root) if root is not None else None
+        self._on_claim = on_claim
         self._set_id(run_id)
         self.items: List[Dict] = []
         # item_key -> index of its registry entry in ``items`` (this process only)
@@ -162,6 +166,8 @@ class Quarantine:
                 self._set_id(_make_run_id())
                 continue
             self._claimed = True
+            if self._on_claim is not None:
+                self._on_claim(self.run_id)
             return
         raise FileExistsError(f"could not create a unique quarantine run under {self._base()}")
 
@@ -176,24 +182,36 @@ class Quarantine:
         self.files_dir.mkdir(parents=True, exist_ok=True)
         idx = len(self.items)
         dest = self.files_dir / f"{idx}__{src.name}"
+        entry = {"original": str(src), "stored": str(dest), "size": size}
         if self._root is not None:
-            # The elevated helper's root quarantine: a rename only. Never the
-            # copy fallback, which as root could fill the system volume and
-            # leave a partial copy outside the manifest.
+            # The elevated helper's root quarantine. The origin is recorded
+            # (manifest saved) BEFORE the move, so a process killed right
+            # after it never leaves an unrecorded item; then a rename only.
+            # Never the copy fallback, which as root could fill the system
+            # volume and leave a partial copy outside the manifest.
+            self.items.append(entry)
+            try:
+                self.save()
+            except BaseException:
+                self.items.pop()
+                raise
             try:
                 _rename(str(src), str(dest))
-            except OSError as exc:
-                if _is_cross_volume(exc):
+            except BaseException as exc:
+                self.items.pop()
+                try:
+                    self.save()
+                except Exception:  # noqa: BLE001 - the final save retries
+                    pass
+                if isinstance(exc, OSError) and _is_cross_volume(exc):
                     raise OSError(
                         "it is on another filesystem than the administrator "
                         "quarantine; nothing was moved (delete it permanently instead)"
                     ) from None
                 raise
-        else:
-            shutil.move(str(src), str(dest))
-        self.items.append(
-            {"original": str(src), "stored": str(dest), "size": size}
-        )
+            return
+        shutil.move(str(src), str(dest))
+        self.items.append(entry)
 
     def _store_windows(self, path: os.PathLike | str) -> None:
         """Windows store: check and act on the same canonical path.
@@ -424,6 +442,15 @@ class Quarantine:
         (only empty directories are removed; nothing else is touched)."""
         if not self._claimed or self.items:
             return
+        if self._written is not None:
+            # An empty manifest this run wrote itself (root mode records an
+            # item before moving it and drops it again if the move fails).
+            target = self.dir / "manifest.json"
+            try:
+                if hashlib.sha256(target.read_bytes()).hexdigest() == self._written:
+                    os.unlink(str(target))
+            except OSError:
+                pass
         for d in (self.dir / "registry", self.files_dir, self.dir):
             try:
                 os.rmdir(str(d))
@@ -435,10 +462,10 @@ class Quarantine:
         return describe_registry_entries(run_id)
 
 
-def new_run(root: Optional[Path] = None) -> Quarantine:
+def new_run(root: Optional[Path] = None, on_claim=None) -> Quarantine:
     """A new run. Nothing is created on disk until the first write.
-    ``root``: see :class:`Quarantine` (elevated helper only)."""
-    return Quarantine(_make_run_id(), root=root)
+    ``root``/``on_claim``: see :class:`Quarantine` (elevated helper only)."""
+    return Quarantine(_make_run_id(), root=root, on_claim=on_claim)
 
 
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
