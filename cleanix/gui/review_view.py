@@ -653,6 +653,7 @@ class ReviewView(QWidget):
         if not isinstance(scan, ScanResult):
             scan = ScanResult(reports=list(scan or []))
         self.model.load(findings.group_findings(scan))
+        self._reset_permanent()
         self._rebuild()
         self.message.setText("" if self.model.scenarios else EMPTY_SCAN)
         self.message.setVisible(not self.model.scenarios)
@@ -660,10 +661,19 @@ class ReviewView(QWidget):
 
     def clear(self) -> None:
         self.model.load([])
+        self._reset_permanent()
         self._rebuild()
         self.message.setText(EMPTY_BEFORE_SCAN)
         self.message.setVisible(True)
         self._changed()
+
+    def _reset_permanent(self) -> None:
+        """A new scan starts with "Delete permanently" off again."""
+        self.model.permanent = False
+        if self.permanent_box.isChecked():
+            self.permanent_box.blockSignals(True)
+            self.permanent_box.setChecked(False)
+            self.permanent_box.blockSignals(False)
 
     def selected_items(self) -> List[CleanableItem]:
         return self.model.selected_items()
@@ -963,6 +973,17 @@ class ReviewView(QWidget):
         row = self._sc_rows[sc.index]
         row.parent().setExpanded(True)
         row.setExpanded(True)
+        self._reveal_ticked(sc)
+
+    def _reveal_ticked(self, sc: Scenario) -> None:
+        """Expand every duplicate-group row of ``sc`` holding a ticked copy
+        (a bulk tick never leaves ticked items under a collapsed row)."""
+        for unit in sc.units[:sc.realised]:
+            group = sc.unit_group(unit)
+            if group is not None and any(self.model.is_selected(i) for i in unit):
+                dup = self._dup_rows.get(group)
+                if dup is not None:
+                    dup.setExpanded(True)
 
     def _on_expanded(self, row: QTreeWidgetItem) -> None:
         p = self._payload(row)
@@ -1003,6 +1024,8 @@ class ReviewView(QWidget):
             m.set_checked(p.item, on)
         elif p.kind == "dup":
             m.set_unit(p.unit, on)
+            if on:
+                self._reveal_ticked(m.scenarios[p.si])
         elif p.kind == "sc":
             sc = m.scenarios[p.si]
             if on:

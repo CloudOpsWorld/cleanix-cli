@@ -274,6 +274,35 @@ def test_dup_copy_rows_show_what_stays(qtbot):
     assert "keeps" in w.item_row(g[1]).text(3)
 
 
+def _shown(row):
+    """The row is on screen: every parent is expanded."""
+    parent = row.parent()
+    while parent is not None:
+        if not parent.isExpanded():
+            return False
+        parent = parent.parent()
+    return True
+
+
+@pytest.mark.parametrize("via", ["scenario", "category", "group"])
+def test_bulk_tick_reexpands_collapsed_duplicate_rows(qtbot, via):
+    g1, g2 = dup_group("1" * 64), dup_group("2" * 64)
+    w = make(qtbot, scan(report("duplicates", g1 + g2)))
+    w.scenario_row("duplicates").setExpanded(True)
+    dup_row = w.item_row(g1[1]).parent()
+    dup_row.setExpanded(False)
+    if via == "scenario":
+        tick(w, w.scenario_row("duplicates"))
+    elif via == "category":
+        tick(w, w.category_row(findings.YOUR_FILES))
+    else:
+        tick(w, dup_row)
+    assert dup_row.isExpanded()
+    assert w.selected_items()
+    for item in w.selected_items():
+        assert _shown(w.item_row(item))
+
+
 OPS = ("tick", "untick", "keep", "bulk", "unbulk", "elev_on", "elev_off")
 
 
@@ -520,6 +549,12 @@ def test_footer_in_view_follows_permanent(qtbot):
     assert "Deleted permanently" in w.item_row(a).text(3)
     w.set_permanent(False)
     assert not w.permanent_box.isChecked() and "Undo available" in w.lines.text()
+    w.set_permanent(True)
+    w.set_scan(scan(report("big_files", [a])))  # a new scan: permanent is off again
+    assert not w.permanent_box.isChecked() and not w.model.permanent
+    w.set_permanent(True)
+    w.clear()
+    assert not w.permanent_box.isChecked() and not w.model.permanent
 
 
 # --------------------------------------------------------------------- act
