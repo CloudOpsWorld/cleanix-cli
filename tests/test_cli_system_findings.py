@@ -172,15 +172,22 @@ def _run(capsys, *argv):
 
 
 def _phrase(monkeypatch, answer):
+    """Answer the typed-phrase prompt through the REAL reading path
+    (console.input -> builtins.input); Rich's Prompt.ask must not be used
+    (it strips the answer)."""
     asked = []
 
-    def ask(prompt, **kw):
+    def fake_input(prompt=""):
         asked.append(prompt)
         if isinstance(answer, type) and issubclass(answer, BaseException):
             raise answer
         return answer
 
-    monkeypatch.setattr(cli.Prompt, "ask", ask)
+    def no_prompt(*a, **k):
+        raise AssertionError("the typed phrase must not be read with Prompt.ask")
+
+    monkeypatch.setattr(builtins, "input", fake_input)
+    monkeypatch.setattr(cli.Prompt, "ask", no_prompt)
     return asked
 
 
@@ -218,7 +225,8 @@ def test_typed_confirmation_wrong_text_aborts(tmp_path, monkeypatch, capsys):
                   "DELETE SYSTEM FILES ", "Delete System Files", "DELETE  SYSTEM FILES"):
         asked = _phrase(monkeypatch, wrong)
         code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
-        assert code == 1 and len(asked) == 1 and PHRASE in asked[0]
+        assert code == 1 and len(asked) == 1
+        assert f"Type {PHRASE} to act on these 1 system-wide item(s)" in out
         assert launch.calls == [] and "Aborted" in out
     # EOF at the phrase prompt is an abort too.
     _phrase(monkeypatch, EOFError)
@@ -838,3 +846,45 @@ def test_preview_and_non_tty_wording(tmp_path, monkeypatch, capsys):
     _install(monkeypatch, Launcher())
     code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
     assert out.count("root-only quarantine you cannot restore from yet") == 1
+
+
+# --------------------------------------------------------------------------
+# fix round 2: the real prompt keeps the answer exactly as typed
+# --------------------------------------------------------------------------
+WRONG_SPACING = (" DELETE SYSTEM FILES", "DELETE SYSTEM FILES ", "\tDELETE SYSTEM FILES",
+                 "Delete System Files", "delete system files", "DELETE  SYSTEM FILES",
+                 "DELETE SYSTEM")
+
+
+def test_real_prompt_phrase_is_exact_in_act_on(tmp_path, monkeypatch, capsys):
+    _patch_scan(monkeypatch, [_sys()])
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
+    launch = _install(monkeypatch, Launcher())
+    for wrong in WRONG_SPACING:
+        # only builtins.input is replaced: console.input and the comparison
+        # in _system_part are the real code
+        monkeypatch.setattr(builtins, "input", lambda prompt="", w=wrong: w)
+        code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
+        assert code == 1 and launch.calls == [] and "Aborted" in out, repr(wrong)
+    monkeypatch.setattr(builtins, "input", lambda prompt="": PHRASE)
+    code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
+    assert code == 0 and len(launch.calls) == 1
+
+
+def test_real_prompt_phrase_is_exact_in_review(tmp_path, monkeypatch, capsys):
+    _patch_scan(monkeypatch, [_sys()])
+    launch = _install(monkeypatch, Launcher())
+    for wrong in WRONG_SPACING:
+        code, out, asked = _review(monkeypatch, capsys, ["d", wrong], "orphan_files")
+        assert code == 1 and launch.calls == [] and "Aborted" in out, repr(wrong)
+    code, out, asked = _review(monkeypatch, capsys, ["d", PHRASE], "orphan_files")
+    assert code == 0 and len(launch.calls) == 1
+
+
+def test_console_input_does_not_strip():
+    import io
+
+    from rich.console import Console
+
+    c = Console(file=io.StringIO())
+    assert c.input("x: ", markup=False, stream=io.StringIO(" A \n")) == " A \n"

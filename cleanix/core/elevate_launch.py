@@ -41,9 +41,10 @@ class ElevationFailed(Exception):
 
 class ElevationNotStarted(ElevationFailed):
     """The elevation prompt or the helper could not be started at all (the
-    program could not be executed, pkexec could not run the helper, UAC
-    could not launch it): the helper did not run, nothing was done. A
-    subclass, so callers that catch ElevationFailed behave as before."""
+    prompt program could not be executed, or pkexec could not run the
+    helper): the helper did not run, nothing was done. A subclass, so
+    callers that catch ElevationFailed behave as before. Other launch
+    failures (osascript, Windows) still raise plain ElevationFailed."""
 
 
 def _invoker_uid() -> int:

@@ -909,7 +909,9 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
             return 1
 
     def ask_phrase(prompt: str) -> str:
-        return Prompt.ask(prompt.rstrip(": "))
+        # console.input (builtin input underneath) returns the line as typed:
+        # Rich's Prompt.ask would strip() it and accept " DELETE SYSTEM FILES".
+        return console.input(prompt, markup=False, emoji=False)
 
     if not eligible:
         code = _system_part(console, sys_items, permanent=permanent,
