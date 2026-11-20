@@ -293,7 +293,9 @@ def test_orphan_app_data_reverify_requires_mdfind_and_rechecks_the_id(orphan_env
 def test_admin_finding_scenarios_have_re_verifiers():
     # Scenarios whose system-wide findings may carry a PATH remedy (9a)
     path_scenarios = {"orphan_files", "orphan_app_data", "stale_launchers", "stale_services"}
-    assert path_scenarios <= set(elevate.SYSTEM_FINDING_IDS)
+    # A new system scenario fails here until someone decides its re-verifier.
+    assert set(elevate.SYSTEM_FINDING_IDS) == path_scenarios | {"orphan_launch_jobs",
+                                                                "stale_receipts"}
     for cid in path_scenarios:
         assert reverify.has_reverifier(cid), cid
     # kinds not supported in 9a stay refused: no re-verifier, kind not handled
@@ -313,9 +315,8 @@ def test_admin_finding_scenarios_have_re_verifiers():
             assert why is None, cid
         else:
             assert why == ("refused", reverify.NO_REVERIFIER), cid
-    # and admin_finding_ids() on this platform has nothing uncovered
-    for cid in elevate.admin_finding_ids():
-        assert cid in path_scenarios or not reverify.has_reverifier(cid)
+    # admin_finding_ids() (any platform) is a subset of the decided set
+    assert set(elevate.admin_finding_ids()) <= set(elevate.SYSTEM_FINDING_IDS)
 
 
 def test_root_mode_act_refuses_a_scenario_without_re_verifier(tmp_path, monkeypatch):
@@ -381,6 +382,46 @@ def test_system_wants_link_has_link_remedy(orphan_env):
     (item,) = [i for i in items if i.path == str(wants / "gone.service")]
     assert item.requires_root
     assert link_target(item.remedy) == "/usr/lib/systemd/system/gone.service"
+    with scanmode.evidence_rule(lambda p: None):
+        assert reverify.reverify(item, Config()) is None
+
+
+@posix_only
+def test_broken_wants_link_to_a_unit_known_by_name_gets_no_remedy(orphan_env):
+    """systemd adds a .wants dependency by the LINK's name: a dangling link
+    still enables a unit of that name (or its template) found anywhere on
+    the load path, so it is never offered for removal; nor is any link for
+    user units (/etc/systemd/user)."""
+    env = orphan_env
+    etc = env.root / "etc/systemd/system"
+    wants = etc / "multi-user.target.wants"
+    wants.mkdir(parents=True)
+    (env.root / "usr/lib/systemd/system").mkdir(parents=True)
+    os.symlink("/usr/lib/systemd/system/copied.service", str(wants / "copied.service"))
+    put(etc, "copied.service", "[Service]\nExecStart=/usr/bin/true\n")  # admin's copy
+    os.symlink("/usr/lib/systemd/system/getty@tty9.service", str(wants / "getty@tty9.service"))
+    put(env.root, "run/systemd/transient/getty@.service", "[Service]\n")
+    user_wants = env.root / "etc/systemd/user/default.target.wants"
+    user_wants.mkdir(parents=True)
+    os.symlink("/usr/lib/systemd/user/gone.service", str(user_wants / "gone.service"))
+    items = {i.path: i for i in stale_services.StaleSystemdUnitReporter(Config()).scan().items}
+    for path in (wants / "copied.service", wants / "getty@tty9.service",
+                 user_wants / "gone.service"):
+        item = items[str(path)]  # still reported (the link is dangling) ...
+        assert item.requires_root and item.remedy is None  # ... but never removed
+    # the act-time re-check refuses too (e.g. the unit appeared after the scan)
+    forged = CleanableItem(
+        cleaner_id="stale_services", description="d", size=0, kind=ItemKind.PATH,
+        path=str(wants / "copied.service"), requires_root=True, report_only=True,
+        remedy=Remedy(RemedyKind.PATH, fingerprint_of(str(wants / "copied.service")),
+                      extra=((LINK_TARGET, "/usr/lib/systemd/system/copied.service"),)))
+    with scanmode.evidence_rule(lambda p: None):
+        assert "may still enable it" in reverify.reverify(forged, Config())
+        user_item = CleanableItem(
+            cleaner_id="stale_services", description="d", size=0, kind=ItemKind.PATH,
+            path=str(user_wants / "gone.service"), requires_root=True, report_only=True,
+            remedy=forged.remedy)
+        assert reverify.reverify(user_item, Config()) == "links for user units are never removed"
 
 
 # --------------------------------------------------------------------------

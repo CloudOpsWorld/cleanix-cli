@@ -32,15 +32,21 @@ _SYSTEM_SCAN = (
     "/etc/systemd/user",
 )
 _SYSTEM_USER_DIR = "/etc/systemd/user"
+# The system unit search path (systemd.unit(5)), plus Debian's /lib.
 _SYSTEM_LOOKUP = (
-    "/etc/systemd/system",
-    "/run/systemd/system",
-    "/run/systemd/generator",
+    "/etc/systemd/system.control",
+    "/run/systemd/system.control",
+    "/run/systemd/transient",
     "/run/systemd/generator.early",
-    "/run/systemd/generator.late",
+    "/etc/systemd/system",
+    "/etc/systemd/system.attached",
+    "/run/systemd/system",
+    "/run/systemd/system.attached",
+    "/run/systemd/generator",
     "/usr/local/lib/systemd/system",
     "/usr/lib/systemd/system",
     "/lib/systemd/system",
+    "/run/systemd/generator.late",
 )
 _USER_LOOKUP_SYSTEM_PART = (
     "/etc/systemd/user",
@@ -116,16 +122,16 @@ class StaleSystemdUnitReporter(OrphanReporter):
             if mode is None:
                 continue
             if stat.S_ISLNK(mode):
-                yield from self._check_link(entry, user)
+                yield from self._check_link(entry, user, lookup)
             elif stat.S_ISREG(mode) and name.endswith(".service"):
                 yield from self._check_unit(entry, lookup, user)
             elif stat.S_ISDIR(mode):
                 if name.endswith(_LINK_SUBDIRS):
-                    yield from self._scan_links_dir(entry, user)
+                    yield from self._scan_links_dir(entry, user, lookup)
                 elif name.endswith(".d"):
                     yield from self._check_dropin(entry, lookup, user)
 
-    def _scan_links_dir(self, d: Path, user: bool) -> Iterator[Finding]:
+    def _scan_links_dir(self, d: Path, user: bool, lookup: list) -> Iterator[Finding]:
         children = oc.list_dir(d)
         if children is None:
             yield self._unreadable(d, user)
@@ -137,10 +143,11 @@ class StaleSystemdUnitReporter(OrphanReporter):
                 continue
             mode = _lmode(child)
             if mode is not None and stat.S_ISLNK(mode):
-                yield from self._check_link(child, user)
+                yield from self._check_link(child, user, lookup, in_link_dir=True)
 
     # ------------------------------------------------------ (b) broken link
-    def _check_link(self, link: Path, user: bool) -> Iterator[Finding]:
+    def _check_link(self, link: Path, user: bool, lookup: Optional[list] = None,
+                    in_link_dir: bool = False) -> Iterator[Finding]:
         try:
             target = os.readlink(link)
         except OSError:
@@ -161,10 +168,35 @@ class StaleSystemdUnitReporter(OrphanReporter):
             f"Broken unit link: {logical} -> {target}",
             self._hint(link.name, logical, user),
             requires_root=not user,
-            remedy_kind=RemedyKind.PATH,
-            # system-wide: the remedy removes the link itself (helper only)
-            remedy_extra=() if user else oc.LINK_REMEDY,
+            **self._link_remedy(link, logical, user, lookup, in_link_dir),
         )
+
+    def _link_remedy(self, link: Path, logical: str, user: bool,
+                     lookup: Optional[list], in_link_dir: bool) -> dict:
+        """Finding kwargs for the remedy of a broken unit link.
+
+        User links: a plain PATH remedy (unchanged). System-wide links: the
+        LINK remedy (the link itself, elevated helper only) -- but none when
+        it may still be live. systemd adds a ``*.wants``/``*.requires``/
+        ``*.upholds`` dependency by the LINK's name, whatever its target, so
+        such a link still enables its unit when a unit of that name (or its
+        ``prefix@.type`` template) exists anywhere on the load path; links
+        under /etc/systemd/user are resolved by each user's manager against
+        units this scan cannot see (their homes). Unknown is "maybe live"."""
+        if user:
+            return {"remedy_kind": RemedyKind.PATH}
+        if logical == _SYSTEM_USER_DIR or logical.startswith(_SYSTEM_USER_DIR + "/"):
+            return {}
+        if in_link_dir:
+            if lookup is None:
+                return {}
+            name = link.name
+            stem, dot, typ = name.rpartition(".")
+            if not dot or _unit_known(name, lookup):
+                return {}
+            if "@" in stem and _unit_known(f"{stem.split('@', 1)[0]}@.{typ}", lookup):
+                return {}
+        return {"remedy_kind": RemedyKind.PATH, "remedy_extra": oc.LINK_REMEDY}
 
     # ------------------------------------------------------ (c) drop-in
     def _check_dropin(self, d: Path, lookup: list, user: bool) -> Iterator[Finding]:
@@ -421,8 +453,15 @@ def reverify_system_item(path: str, config) -> Optional[str]:
     if mode is None:
         return "it cannot be inspected"
     if stat.S_ISLNK(mode):
-        if not list(reporter._check_link(real, user=False)):
+        if root == _SYSTEM_USER_DIR:
+            return "links for user units are never removed"
+        dirs = [oc.in_root(reporter.sysroot, d) for d in _SYSTEM_LOOKUP]
+        in_link_dir = logical.rsplit("/", 1)[0] != root
+        found = list(reporter._check_link(real, False, dirs, in_link_dir))
+        if not found:
             return "its target exists now, or cannot be confirmed missing"
+        if found[0].remedy_kind is not RemedyKind.PATH:
+            return "a unit of that name exists now (the link may still enable it)"
         return None
     directly_in_root = logical.rsplit("/", 1)[0] == root
     if stat.S_ISDIR(mode) and real.name.endswith(".d") and directly_in_root:
