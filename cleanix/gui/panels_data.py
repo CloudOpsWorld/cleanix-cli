@@ -78,6 +78,7 @@ class QuarantinePanel(QWidget):
         self._copies_only: set = set()
 
         self.summary_label = QLabel("")
+        self.summary_label.setTextFormat(Qt.TextFormat.PlainText)
         self.table = _make_table(["Run", "Time", "Items", "Size"], "Quarantine runs")
         self.restore_btn = QPushButton("Restore")
         self.restore_btn.setAccessibleName("Restore selected quarantine run")
@@ -86,6 +87,8 @@ class QuarantinePanel(QWidget):
         self.empty_btn = QPushButton("Empty all")
         self.empty_btn.setAccessibleName("Empty all quarantine runs")
         self.status_label = QLabel("")
+        # Paths and reasons come from manifests: never rendered as rich text.
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.status_label.setWordWrap(True)
         self.status_label.setAccessibleName("Quarantine status")
 
@@ -285,6 +288,7 @@ class HistoryPanel(QWidget):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.totals_label = QLabel("")
+        self.totals_label.setTextFormat(Qt.TextFormat.PlainText)
         self.totals_label.setAccessibleName("Lifetime totals")
         self.sparkline = SparklineWidget()
         self.table = _make_table(["Time", "Mode", "Items", "Reclaimed"], "Recent runs")

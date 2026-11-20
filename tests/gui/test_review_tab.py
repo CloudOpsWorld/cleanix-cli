@@ -760,3 +760,98 @@ def test_act_flow_through_real_worker_threads(qtbot, tmp_path, monkeypatch):
     assert seen and seen[0] != main  # the prompt ran off the GUI thread
     assert not p.exists() and len(launcher.calls) == 1
     assert "System-wide items (administrator helper):" in body(results[-1])
+
+
+# ============================================================ fix round 1
+def test_dialog_accept_with_wrong_phrase_is_rejected(qtbot, tmp_path):
+    from cleanix.gui.dialogs import TextDialog
+
+    p, user = user_file(tmp_path)
+    plan = findings_act.ActPlan(permanent=False, user_items=[user],
+                                system_offered=[sys_item()])
+    tab = make_tab(qtbot)
+    d = tab.confirm_dialog(plan)
+    d.phrase_edit.setText("DELETE SYSTEM FILES ")
+    _later(d.accept)  # bypasses the button entirely
+    assert d.exec() == TextDialog.DialogCode.Rejected
+    d2 = tab.confirm_dialog(plan)
+    d2.phrase_edit.setText(PHRASE)
+    _later(d2.accept)
+    assert d2.exec() == TextDialog.DialogCode.Accepted
+
+
+def test_enter_on_focused_act_button_neither_acts_nor_cancels(qtbot, tmp_path):
+    from PySide6.QtTest import QTest
+
+    p, user = user_file(tmp_path)
+    plan = findings_act.ActPlan(permanent=False, user_items=[user],
+                                system_offered=[sys_item()])
+    tab = make_tab(qtbot)
+    seen = []
+    d = tab.confirm_dialog(plan)
+
+    def drive():
+        d.phrase_edit.setText(PHRASE)
+        d.accept_button.setFocus()
+        for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            QTest.keyClick(d.accept_button, key)
+            seen.append(d.isVisible())
+        QTest.keyClick(d.accept_button, Qt.Key.Key_Space)  # Space acts
+
+    _later(drive)
+    assert ReviewTab._default_confirm(d) is True
+    assert seen == [True, True]
+    # Escape still cancels; Cancel stays the default button.
+    d2 = tab.confirm_dialog(plan)
+    assert d2.cancel_button.isDefault()
+    _later(lambda: QTest.keyClick(d2, Qt.Key.Key_Escape))
+    assert ReviewTab._default_confirm(d2) is False
+    # Keyboard order: details, phrase, Act, Cancel.
+    assert QWidget_order(d2) == [d2.body, d2.phrase_edit, d2.accept_button,
+                                 d2.cancel_button]
+
+
+def QWidget_order(d):
+    order, w = [], d.body
+    for _ in range(4):
+        order.append(w)
+        w = w.nextInFocusChain()
+        while w not in (d.body, d.phrase_edit, d.accept_button, d.cancel_button):
+            w = w.nextInFocusChain()
+    return order
+
+
+def test_pre_confirmation_note_says_no_prompt_without_user_part(qtbot, tmp_path):
+    p, user = user_file(tmp_path)
+    plan = findings_act.ActPlan(permanent=False, user_items=[user],
+                                system_offered=[sys_item()])
+    tab = make_tab(qtbot)
+    d = tab.confirm_dialog(plan)
+    assert ("If your files cannot be processed, or you cancel, no administrator "
+            "prompt appears and no system-wide item is touched.") in d.note.text()
+
+
+def test_progress_text_is_sanitised(qtbot):
+    tab = make_tab(qtbot)
+    tab._on_progress("evil\u202ename\x07", 1, 2)
+    text = tab.status_label.text()
+    assert "\u202e" not in text and "\x07" not in text and "(1/2)" in text
+
+
+def test_build_plan_lists_root_items_passed_as_user_items(tmp_path):
+    p, user = user_file(tmp_path)
+    s = sys_item()
+    plan = findings_act.build_plan([user, s], [], {}, False, Config())
+    assert plan.user_items == [user]
+    assert [(i, why) for i, why in plan.user_skipped] == [(s, findings_act.NOT_USER_ITEM)]
+
+
+def test_late_cancel_wording(qtbot, tmp_path):
+    s = sys_item()
+    launcher = Launcher()
+    tab = make_tab(qtbot, [s], launcher=launcher)
+    launcher.on_call = tab.cancel_current
+    tick(tab, s)
+    act(tab)
+    assert ("Cancel arrived too late to stop the administrator step."
+            in body(tab.results[-1]))

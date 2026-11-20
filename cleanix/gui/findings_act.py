@@ -43,12 +43,15 @@ from cleanix.core.utils import human_size
 CONFIRM_PHRASE = system_findings.CONFIRM_PHRASE
 
 NONE_REMOVED = "none of the system-wide items was removed"
+NOT_USER_ITEM = ("a system-wide item is only acted on by the administrator helper; "
+                 "it was not part of the administrator batch")
 SYSTEM_NOT_UNDONE = (
     "None of the system-wide items can be undone from Cleanix. The administrator "
     "helper scans again itself and acts only on items its own scan still reports.")
 PROMPT_FOLLOWS = ("After you click Act, your files are acted on first; then the "
                   "administrator prompt follows (one prompt for all system-wide "
-                  "items).")
+                  "items). If your files cannot be processed, or you cancel, no "
+                  "administrator prompt appears and no system-wide item is touched.")
 ADMIN_WAIT = ("Waiting for administrator permission... (it cannot be stopped from "
               "here: decline the prompt to leave the system-wide items alone)")
 
@@ -126,6 +129,11 @@ def build_plan(user_items: Sequence[CleanableItem],
                cancel: Optional[Callable[[], bool]] = None) -> ActPlan:
     """Plan an act without changing anything (see the module docstring)."""
     plan = ActPlan(permanent=bool(permanent))
+    # A system-wide item never goes through the in-process executor: one
+    # passed as a user item is listed as skipped (never silently dropped).
+    for i in user_items:
+        if i.requires_root:
+            plan.user_skipped.append((i, NOT_USER_ITEM))
     user_items = [i for i in user_items if not i.requires_root]
     dups = [i for i in user_items if i.remedy is not None and i.remedy.group]
     dup_ids = {id(i) for i in dups}
@@ -480,8 +488,7 @@ def _system_lines(out: ActOutcome) -> List[str]:
     if system_findings.nothing_removed(res):
         lines.append("Nothing was removed by the administrator helper.")
     if out.late_cancel:
-        lines.append("Cancel arrived after administrator permission was given; that "
-                     "step could not be stopped.")
+        lines.append("Cancel arrived too late to stop the administrator step.")
     return lines
 
 

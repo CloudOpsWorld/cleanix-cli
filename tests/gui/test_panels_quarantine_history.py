@@ -219,3 +219,22 @@ def test_history_keeps_last_30_for_sparkline(qtbot, monkeypatch):
     qtbot.addWidget(p)
     p.refresh()
     assert p.sparkline.values() == list(range(10, 40))
+
+
+def test_restore_status_shows_manifest_paths_literally(qtbot, monkeypatch):
+    from PySide6.QtCore import Qt
+    from cleanix.core import quarantine
+    from cleanix.gui.panels_data import QuarantinePanel
+
+    monkeypatch.setattr(quarantine, "list_runs", lambda: [
+        {"run_id": "r1", "created": 1700000000, "count": 1, "size": 1}])
+    monkeypatch.setattr(quarantine, "restore", lambda rid: {
+        "restored": [], "failed": [("<img src=x>/a", "<b>nope</b>")]})
+    p = QuarantinePanel(confirm=lambda m: True)
+    qtbot.addWidget(p)
+    p.refresh()
+    p.table.selectRow(0)
+    p._on_restore()
+    assert "<img src=x>/a (<b>nope</b>)" in p.status_label.text()
+    for label in (p.status_label, p.summary_label):
+        assert label.textFormat() == Qt.TextFormat.PlainText

@@ -162,6 +162,7 @@ class ReviewTab(QWidget):
     def _on_progress(self, name: str, done: int, total: int) -> None:
         if name == findings_act.ADMIN_WAIT:
             self.cancel_button.setEnabled(False)  # cannot be stopped from here
+        name = findings_act.shown(name)
         self.status_label.setText(f"{name} ({done}/{total})" if total else name)
 
     def _idle(self, text: str) -> None:

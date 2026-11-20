@@ -114,6 +114,12 @@ class TextDialog(QDialog):
             self.close_button.clicked.connect(self.accept)
         layout.addLayout(bar)
 
+        # Keyboard order: the details first, then the phrase, then buttons.
+        chain = [w for w in (self.body, self.phrase_edit, self.accept_button,
+                             self.cancel_button, self.close_button) if w is not None]
+        for a, b in zip(chain, chain[1:]):
+            QWidget.setTabOrder(a, b)
+
         if self.phrase_edit is not None:
             self.phrase_edit.textChanged.connect(self._update)
             self.phrase_edit.setFocus()
@@ -136,11 +142,21 @@ class TextDialog(QDialog):
         if self.phrase_ok():
             self.accept()
 
+    def done(self, r) -> None:  # noqa: D401 - Qt API
+        """Defence in depth: whatever path accepts the dialog, it is
+        Rejected unless the required phrase is typed exactly."""
+        accepted = int(QDialog.DialogCode.Accepted)
+        if int(r) == accepted and not self.phrase_ok():
+            r = QDialog.DialogCode.Rejected
+        super().done(int(r))
+
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
-        # Enter in the phrase field neither acts nor cancels: the user moves
-        # to the Act button (Tab) and presses it on purpose.
-        if (self.phrase_edit is not None and self.focusWidget() is self.phrase_edit
-                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)):
+        # Enter/Return neither acts nor cancels while the phrase field or the
+        # Act button has focus: Act is pressed on purpose (click or Space),
+        # and the default Cancel button only answers Escape / Enter elsewhere.
+        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and self.focusWidget() is not None
+                and self.focusWidget() in (self.phrase_edit, self.accept_button)):
             event.accept()
             return
         super().keyPressEvent(event)

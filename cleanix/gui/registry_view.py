@@ -13,6 +13,7 @@ Undo is promised only once ``UNDO_SHIPPED`` is True.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -200,8 +201,8 @@ class RegistryView(QWidget):
         result = self._result or ScanResult()
         if self._removed:
             result = ScanResult(reports=[
-                type(r)(r.cleaner_id, r.name, r.description,
-                        items=[i for i in r.items if item_key(i) not in self._removed])
+                dataclasses.replace(
+                    r, items=[i for i in r.items if item_key(i) not in self._removed])
                 for r in result.reports])
         infos = {i.id: i for i in catalog.list_cleaners(self._config)}
         order = list(catalog.REGISTRY_IDS)
@@ -251,9 +252,27 @@ class RegistryView(QWidget):
         # entries (service.clean / the GUI's HKLM backup before the helper).
         worker = self._clean_factory(items, dry_run=False, use_quarantine=True)
         worker.finished.connect(self._on_clean_finished)
-        worker.cancelled.connect(self._on_cancelled)
-        worker.failed.connect(self._on_failed)
+        worker.cancelled.connect(self._on_clean_cancelled)
+        worker.failed.connect(self._on_clean_failed)
         self._run(worker)
+
+    def _stale(self, text: str) -> None:
+        """After a removal whose outcome is not fully known: the shown
+        entries may be stale, so they are cleared (scan again) and can never
+        be acted on twice; the Quarantine tab refreshes (cleaned(None))."""
+        self._result = None
+        self._removed = set()
+        self._render()
+        self._idle(text)
+        self.cleaned.emit(None)
+
+    def _on_clean_failed(self, message: str) -> None:
+        self._stale(f"Failed: {shown(message)}. Some entries may already be removed; "
+                    "scan again.")
+
+    def _on_clean_cancelled(self) -> None:
+        self._stale("Cancelled. Entries handled before the cancel may already be "
+                    "removed (each one backed up first); scan again to see what is left.")
 
     def result_text(self, summary) -> str:
         lines = [f"Removed {_entries(int(getattr(summary, 'removed', 0) or 0))}."]

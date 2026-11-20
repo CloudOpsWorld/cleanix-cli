@@ -284,3 +284,75 @@ def test_quarantine_panel_copy_only_run_is_not_an_undo(qtbot, monkeypatch):
     p.table.selectRow(0)
     p._on_restore()
     assert p.status_label.text() == COPIES_ONLY_RESTORE and asked == []
+
+
+class _Failing(QObject):
+    progress = Signal(str, int, int)
+    finished = Signal(object)
+    cancelled = Signal()
+    failed = Signal(str)
+
+    def __init__(self, how):
+        super().__init__()
+        self.how = how
+
+    def cancel(self):
+        pass
+
+    @Slot()
+    def run(self):
+        if self.how == "fail":
+            self.failed.emit("boom <b>x</b>")
+        else:
+            self.cancelled.emit()
+
+
+@pytest.mark.parametrize("how,expect", [
+    ("fail", "Failed: boom <b>x</b>. Some entries may already be removed; scan again."),
+    ("cancel", "Cancelled. Entries handled before the cancel may already be removed"),
+])
+def test_registry_clean_failure_or_cancel_clears_and_refreshes(qtbot, how, expect):
+    emitted = []
+    v = make(qtbot, clean_worker_factory=lambda items, **kw: _Failing(how),
+             confirm=lambda d: True)
+    v.cleaned.connect(lambda s: emitted.append(s))
+    v.scan_button.click()
+    v.tree.topLevelItem(0).setCheckState(0, Qt.CheckState.Checked)
+    v.remove_button.click()
+    assert v.status_label.text().startswith(expect)
+    assert v.status_label.textFormat() == Qt.TextFormat.PlainText
+    assert v.tree.group_count() == 0 and v.selected_items() == []  # stale: gone
+    assert emitted == [None]
+    assert v.scan_button.isEnabled()
+
+
+def test_registry_render_keeps_report_fields(qtbot):
+    import dataclasses as dc
+
+    v = make(qtbot)
+    rep = CleanerReport("win_reg_uninstall", "u", "d", items=[reg_item(name="A"),
+                                                               reg_item(name="B")])
+    fields = {f.name for f in dc.fields(CleanerReport)}
+    extra = {}
+    if "skipped_reason" in fields:
+        extra["skipped_reason"] = "partly skipped"
+    rep = dc.replace(rep, **extra)
+    v.set_result(ScanResult(reports=[rep]))
+    v._removed = {__import__("cleanix.core.models", fromlist=["item_key"]).item_key(
+        rep.items[0])}
+    v._render()
+    shown_rep = v.tree._groups[0]
+    assert [i.description for i in shown_rep.items] == ["Entry B"]
+    if extra:
+        # the filtered report kept its other fields
+        seen = []
+        orig = rv.curation.build_groups
+        def spy(result, infos, **k):
+            seen.extend(result.reports)
+            return orig(result, infos, **k)
+        rv.curation.build_groups = spy
+        try:
+            v._render()
+        finally:
+            rv.curation.build_groups = orig
+        assert seen[0].skipped_reason == "partly skipped"
