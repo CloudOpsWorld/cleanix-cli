@@ -1381,7 +1381,8 @@ NOT_SYSTEM_WIDE = ("not a system-wide finding (it is acted on without administra
                    "rights); nothing was done")
 NO_DUPLICATES = "duplicates are not handled by the administrator helper; nothing was done"
 STOPPED_WHILE_ACTING = ("the helper stopped while acting on it; it may have been "
-                        "removed or moved")
+                        "removed or moved (a background job or service may already "
+                        "have been stopped)")
 # Remedy kinds (RemedyKind values) the helper acts on on every POSIX system
 # (PATH, Task 9a), plus per platform the system-wide job kinds (Task 9b; see
 # ``helper_finding_kinds``). Every other kind is refused per item.

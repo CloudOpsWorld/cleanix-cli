@@ -497,6 +497,29 @@ def test_result_note_and_backup_run_roundtrip(tmp_path):
     assert back.findings[0].note == "permanent: x warning: y"  # control chars flattened
 
 
+def test_worst_case_result_with_notes_still_fits(tmp_path):
+    """1000 items with the longest keys, reasons and notes (and the maximum
+    errors) are written truncated and still read back: the caller never
+    loses the result of a batch that stopped and removed things."""
+    comp = "a" * 250
+    base = "/var/lib/" + "/".join([comp] * 4)
+    outcomes = []
+    for i in range(elevate.MAX_FINDING_ITEMS):
+        path = (base + f"/{i:04d}")[:elevate.MAX_FINDING_PATH_LEN]
+        path = path[:-5] + f"{i:05d}"
+        outcomes.append(elevate.FindingOutcome(
+            f"orphan_launch_jobs|path|{path}", "removed", 1, "r" * 5000, note="n" * 5000))
+    res = elevate.HelperResult(freed=0, removed=1000, errors=["e" * 5000] * 1000,
+                               unmatched=0, findings=outcomes, backup_run="run-1",
+                               quarantine_run="run-2")
+    target = tmp_path / elevate.RESULT_NAME
+    elevate.write_result(target, res)
+    assert target.stat().st_size < elevate.MAX_RESULT_BYTES
+    back = elevate.read_result(target)
+    assert len(back.findings) == 1000
+    assert all(len(o.note) == elevate.MAX_NOTE_LEN for o in back.findings)
+
+
 def test_older_results_still_parse(tmp_path):
     back = _read(tmp_path, _result_obj())
     assert back.backup_run == "" and back.findings[0].note == ""

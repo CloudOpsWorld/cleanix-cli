@@ -923,7 +923,9 @@ def _result_payload(result: HelperResult) -> dict:
 
 
 _RESULT_RUN_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z._-]{0,127}")
-MAX_NOTE_LEN = 2000
+# Real notes are ~250 characters; 1000 keeps a worst-case 1000-item result
+# (keys, reasons, notes) well inside MAX_RESULT_BYTES.
+MAX_NOTE_LEN = 1000
 _OUTCOME_FIELDS = {"key", "status", "freed", "reason"}
 
 

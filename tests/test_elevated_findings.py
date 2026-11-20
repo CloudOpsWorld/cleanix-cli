@@ -2022,3 +2022,49 @@ def test_helper_job_changed_while_the_batch_runs_is_skipped(fx, monkeypatch):
     assert "program exists now" in st["com.gone.b.plist"].reason
     assert runner.calls == [["launchctl", "bootout", "system/com.gone.a"]]
     assert _idx(events, "copy", str(b)) == []
+
+
+@posix_only
+def test_helper_mixed_batch_keeps_quarantine_and_copies_apart(fx, monkeypatch):
+    """One stale_services batch, not permanent: the broken wants link (PATH)
+    is MOVED into the restorable quarantine run; the unit file (always
+    permanent) is copied into a separate copy-only run and deleted. Two
+    distinct runs under the root quarantine, one daemon-reload."""
+    from cleanix.cleaners.stale_services import StaleSystemdUnitReporter
+
+    sysroot, events, runner, tools = _sys_env(
+        fx, monkeypatch, plat.LINUX, "stale_services", "systemd_unit", ("/etc/systemd/system",))
+    monkeypatch.setattr(StaleSystemdUnitReporter, "pkg_backend", lambda self: "dpkg")
+    etc = sysroot / "etc" / "systemd" / "system"
+    (sysroot / "usr" / "lib" / "systemd" / "system").mkdir(parents=True)
+    wants = etc / "multi-user.target.wants"
+    wants.mkdir()
+    link = wants / "other.service"
+    os.symlink("/usr/lib/systemd/system/other.service", str(link))
+    u = etc / "gone.service"
+    u.write_text("[Service]\nExecStart=/opt/gone/bin/x\n")
+    _plain(u)
+    items = _own_items(StaleSystemdUnitReporter, etc)
+    kinds = {Path(i.path).name: i.remedy.kind for i in items}
+    assert kinds == {"other.service": RemedyKind.PATH, "gone.service": RemedyKind.SYSTEMD_UNIT}
+    fx.cleaners.append(StaleSystemdUnitReporter(Config()))
+    rc, result = run_helper(fx, request(items))
+    assert rc == elevated.EXIT_OK, result.errors
+    st = {o.key.split("|", 2)[2]: o for o in result.findings}
+    assert st[str(link)].status == "removed" and st[str(u)].status == "removed"
+    assert not os.path.lexists(str(link)) and not u.exists()
+    assert st[str(link)].note == ""  # an ordinary (restorable) quarantine move
+    assert st[str(u)].note.startswith("permanent: ")
+    assert result.quarantine_run and result.backup_run
+    assert result.quarantine_run != result.backup_run
+    assert sorted(d.name for d in fx.qbase.iterdir()) == sorted(
+        [result.quarantine_run, result.backup_run])
+    moved = json.loads((fx.qbase / result.quarantine_run / "manifest.json").read_text())
+    (entry,) = moved["items"]
+    assert entry.get("type") is None and entry["original"] == str(link)
+    assert os.readlink(entry["stored"]) == "/usr/lib/systemd/system/other.service"
+    kept = json.loads((fx.qbase / result.backup_run / "manifest.json").read_text())
+    (copy,) = kept["items"]
+    assert copy["type"] == "copy" and copy["original"] == str(u)
+    assert runner.calls == [["systemctl", "disable", "--now", "gone.service"],
+                            ["systemctl", "daemon-reload"]]
