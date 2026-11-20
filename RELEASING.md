@@ -57,7 +57,7 @@ Put these in the GitHub Release notes:
   `--all-users` / `--current-user` / `--min-uid`.
 - **New GUI tabs:** Review (opt-in findings scan; tick findings, one
   confirmation, user files first, then one administrator prompt) and Registry
-  (Windows; the `win_reg_*` cleaners moved out of the Cleanup tab).
+  (Windows; the `win_reg_*` cleaners moved out of the Scan tab).
 - **Beta gate:** acting on system-wide findings (through the administrator
   helper) is OFF unless `CLEANIX_BETA_SYSTEM_ACTIONS=1`; it is never offered to
   a process running as root or to the standalone (PyInstaller) binary, which
