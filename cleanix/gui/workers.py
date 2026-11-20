@@ -249,6 +249,83 @@ class ElevatedCleanWorker(_BaseWorker):
         self._emit(self.finished, combined)
 
 
+class FindingsPlanWorker(_BaseWorker):
+    """Plan a Review act without changing anything
+    (:func:`findings_act.build_plan`: duplicate planning, a dry run of the
+    user-space items, the system-wide plan). ``finished(ActPlan)``;
+    ``cancelled`` when stopped; ``failed`` on an error."""
+
+    def __init__(self, user_items, system_items, survivors, permanent: bool,
+                 config: Config) -> None:
+        super().__init__()
+        self._user = list(user_items)
+        self._system = list(system_items)
+        self._survivors = dict(survivors or {})
+        self._permanent = bool(permanent)
+        self._config = config
+
+    @Slot()
+    def run(self) -> None:
+        self._guarded()
+
+    def _run(self) -> None:
+        from cleanix.gui import findings_act
+
+        self.progress.emit("Checking the selected items...", 0, 0)
+        try:
+            plan = findings_act.build_plan(
+                self._user, self._system, self._survivors, self._permanent,
+                self._config, cancel=self._cancel.is_set)
+        except service.Cancelled:
+            self._emit(self.cancelled)
+            return
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+            self._emit(self.failed, str(exc) or exc.__class__.__name__)
+            return
+        if plan.cancelled or self._cancel.is_set():
+            self._emit(self.cancelled)
+        else:
+            self._emit(self.finished, plan)
+
+
+class FindingsActWorker(_BaseWorker):
+    """Act on a confirmed Review plan (:func:`findings_act.run_act`): the
+    user-space items in-process first, then the system-wide batch through
+    the elevated helper (one prompt). A cancel before the administrator
+    step leaves the system-wide items alone; once the prompt is shown it
+    cannot be stopped (``findings_act.ADMIN_WAIT`` is emitted first, and
+    views disable Cancel on it). Always ``finished(ActOutcome)`` (the user
+    part is never lost) unless ``run_act`` itself raised."""
+
+    def __init__(self, plan, config: Config, *, launcher=None) -> None:
+        super().__init__()
+        self._plan = plan
+        self._config = config
+        self._launcher = launcher
+
+    @Slot()
+    def run(self) -> None:
+        self._guarded()
+
+    def _admin_wait(self) -> None:
+        from cleanix.gui import findings_act
+
+        self.progress.emit(findings_act.ADMIN_WAIT, 0, 0)
+
+    def _run(self) -> None:
+        from cleanix.gui import findings_act
+
+        try:
+            outcome = findings_act.run_act(
+                self._plan, self._config, launcher=self._launcher,
+                cancel=self._cancel.is_set, progress=self._on_progress,
+                admin_wait=self._admin_wait)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+            self._emit(self.failed, str(exc) or exc.__class__.__name__)
+            return
+        self._emit(self.finished, outcome)
+
+
 def start_worker(worker: QObject) -> QThread:
     """Move ``worker`` to a new thread, start it, and clean up afterwards.
 

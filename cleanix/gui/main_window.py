@@ -12,10 +12,13 @@ from PySide6.QtWidgets import (
 )
 
 from cleanix.config import Config
+from cleanix.core.platform import WINDOWS, current_os
 from cleanix.gui import elevation, workers
 from cleanix.gui.panels_config import FindingsPanel, SchedulePanel, SettingsPanel
 from cleanix.gui.panels_data import HistoryPanel, QuarantinePanel
 from cleanix.gui.power_view import PowerView
+from cleanix.gui.registry_view import RegistryView
+from cleanix.gui.review_tab import ReviewTab
 from cleanix.gui import simple_view
 from cleanix.gui.simple_view import SimpleView
 
@@ -51,7 +54,12 @@ class MainWindow(QMainWindow):
     (``factory(config, only=None)``, default ``workers.ScanWorker``),
     ``clean_worker_factory`` (``factory(items, cfg=None, *, dry_run,
     use_quarantine)``, default ``elevation.make_clean_worker_factory``) and
-    ``elevation_available`` (default ``elevation.elevation_available()``).
+    ``elevation_available`` (default ``elevation.elevation_available()``)
+    and ``findings_launcher`` (the Review tab's elevation launcher; default
+    None = the platform prompt).
+
+    Power mode tabs: Scan | Review | Registry (Windows only) | Quarantine |
+    History | Schedule | Settings | Findings.
     """
 
     # Close: how long to wait for workers, then how often to check whether a
@@ -62,8 +70,10 @@ class MainWindow(QMainWindow):
     def __init__(self, parent=None, *, config: Optional[Config] = None,
                  scan_worker_factory: Optional[Callable] = None,
                  clean_worker_factory: Optional[Callable] = None,
-                 elevation_available: Optional[bool] = None) -> None:
+                 elevation_available: Optional[bool] = None,
+                 findings_launcher: Optional[Callable] = None) -> None:
         super().__init__(parent)
+        self._findings_launcher = findings_launcher
         self.setWindowTitle("Cleanix")
         self.resize(960, 640)
         self.stack = QStackedWidget()
@@ -128,6 +138,22 @@ class MainWindow(QMainWindow):
             allow_admin_items=self.elevation_allowed,
             admin_unavailable_reason=reason)
 
+        # Review: opt-in findings scan + act flow (never started by itself).
+        self.review_tab = ReviewTab(
+            config, scan_worker_factory=self._make_findings_scan_worker,
+            launcher=self._findings_launcher,
+            elevation_available=self.elevation_allowed, elevation_reason=reason)
+        self.power_view.add_panel("Review", self.review_tab)
+        # Registry: Windows only; the win_reg_* detectors moved out of Scan.
+        self.registry_view: Optional[RegistryView] = None
+        if current_os() == WINDOWS:
+            self.registry_view = RegistryView(
+                config, scan_worker_factory=self._make_findings_scan_worker,
+                clean_worker_factory=clean_factory,
+                allow_admin_items=self.elevation_allowed,
+                admin_unavailable_reason=reason)
+            self.power_view.add_panel("Registry", self.registry_view)
+
         self.quarantine_panel = QuarantinePanel()
         self.history_panel = HistoryPanel()
         self.schedule_panel = SchedulePanel()
@@ -146,6 +172,9 @@ class MainWindow(QMainWindow):
         self.power_view.clean_finished.connect(self._on_clean_finished)
         self.simple_view.clean_finished.connect(self._on_clean_finished)
         self.simple_view.undone.connect(self.refresh_data_panels)
+        self.review_tab.acted.connect(self._on_clean_finished)
+        if self.registry_view is not None:
+            self.registry_view.cleaned.connect(self._on_clean_finished)
         self.settings_panel.saved.connect(self._on_settings_saved)
 
         self.set_simple_page(self.simple_view)
@@ -167,6 +196,9 @@ class MainWindow(QMainWindow):
 
     def _make_power_scan_worker(self, only):
         return self._scan_factory(self.config, only=only)
+
+    def _make_findings_scan_worker(self, cfg, only):
+        return self._scan_factory(cfg, only=only)
 
     @Slot(object)
     def _on_clean_finished(self, _summary) -> None:
@@ -209,7 +241,10 @@ class MainWindow(QMainWindow):
             # Already hidden, waiting for a worker that cannot be stopped.
             event.ignore()
             return
-        for view in (self.power_view, self.simple_view):
+        for view in (self.power_view, self.simple_view, self.review_tab,
+                     self.registry_view):
+            if view is None:
+                continue
             try:
                 view.shutdown()
             except RuntimeError:  # view already deleted (swapped out)

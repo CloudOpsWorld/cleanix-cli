@@ -18,6 +18,7 @@ from cleanix.gui import power_view as pv  # noqa: E402
 from cleanix.gui import simple_view  # noqa: E402
 from cleanix.gui.grouped_results import GroupedResults  # noqa: E402
 from cleanix.gui.panels_data import QuarantinePanel  # noqa: E402
+from cleanix.gui.registry_view import RegistryView  # noqa: E402
 from cleanix.gui.simple_view import SimpleView  # noqa: E402
 
 CID = "win_reg_uninstall"
@@ -82,15 +83,18 @@ def pview(qtbot, monkeypatch):
     return v
 
 
-def test_power_registry_group_review_badge_and_opt_in(pview):
+def test_power_registry_group_review_badge_and_opt_in(pview, rview):
+    # Task 12: registry entries moved from the Scan tab to the Registry tab.
     info = _info()
     it = reg_item()
     assert curation.safety_of(it, info) is curation.Safety.REVIEW
     assert not catalog.preselect(it, info)
     pview._on_scan_finished(result(it, reg_item("HKLM", "B")))
-    m = pview.item_model
-    assert m.rowCount() == 2 and m.checked_items() == []
-    assert pview.cleaner_model.enabled_ids() == []  # opt-in
+    assert pview.item_model.rowCount() == 0  # never in the Scan tab
+    assert pview.cleaner_model.rowCount() == 0  # not even listed there
+    rview.set_result(result(it, reg_item("HKLM", "B")))
+    assert rview.tree.group_count() == 1
+    assert rview.selected_items() == []  # opt-in: nothing ticked
 
 
 def test_registry_items_never_selected_by_safe_only(pview):
@@ -262,36 +266,44 @@ def test_bulk_selection_never_ticks_registry(mixed_view, raw):
     assert ItemKind.REGISTRY not in _kinds(v)
 
 
-def test_select_none_clears_explicitly_ticked_registry(mixed_view):
-    v = mixed_view
-    m = v.item_model
-    row = next(r for r in range(m.rowCount()) if m.item_at(r).kind is ItemKind.REGISTRY)
-    assert m.set_checked(row, True)
-    assert ItemKind.REGISTRY in _kinds(v)
-    v.select_all_visible()  # does not remove an explicit tick, adds no other registry
-    v.select_none_visible()
-    assert m.checked_items() == []
+def test_scan_tab_drops_registry_reports_from_mixed_results(mixed_view):
+    # Task 12: the Scan tab shows only the other cleaners' items.
+    m = mixed_view.item_model
+    assert {m.item_at(r).cleaner_id for r in range(m.rowCount())} == {"temp"}
+    assert all("Dead" not in g.title for g in mixed_view.tree._groups)
 
 
-def test_tree_group_tick_of_registry_group_ticks_only_that_group(mixed_view):
-    v = mixed_view
-    tree = v.tree
-    top = next(tree.topLevelItem(i) for i in range(tree.topLevelItemCount())
-               if tree.topLevelItem(i).text(0) != "Temp"
-               and "Dead" in tree.topLevelItem(i).text(0))
-    v.select_none_visible()
+@pytest.fixture
+def rview(qtbot, monkeypatch):
+    monkeypatch.setattr(catalog, "list_cleaners", lambda cfg, **k: [_info()])
+    v = RegistryView(Config(), allow_admin_items=False)
+    qtbot.addWidget(v)
+    return v
+
+
+def test_registry_tab_group_tick_ticks_only_selectable_entries(rview):
+    # Ported from the Scan tab: a group tick never ticks the HKLM entry
+    # without administrator permission.
+    rview.set_result(_mixed_result())
+    tree = rview.tree
+    assert tree.group_count() == 1  # the temp report is not registry
+    top = tree.topLevelItem(0)
+    assert "Dead" in top.text(0)
     top.setCheckState(0, Qt.CheckState.Checked)
-    assert {i.cleaner_id for i in v.item_model.checked_items()} == {CID}
-    assert len(v.item_model.checked_items()) == 1  # HKLM needs admin: not selectable here
+    checked = rview.selected_items()
+    assert {i.cleaner_id for i in checked} == {CID}
+    assert len(checked) == 1 and checked[0].reg.hive == "HKCU"
+    top.setCheckState(0, Qt.CheckState.Unchecked)
+    assert rview.selected_items() == []
 
 
-def test_power_tree_registry_group_badge_category_and_size(mixed_view):
-    tree = mixed_view.tree
-    rows = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
-    reg = next(r for r in rows if "Dead" in r.text(0))
+def test_registry_tab_group_badge_category_and_size(rview):
+    rview.set_result(_mixed_result())
+    tree = rview.tree
+    reg = tree.topLevelItem(0)
     assert reg.text(2) == "Review"
     assert reg.text(4) == "-"
-    g = tree._groups[rows.index(reg)]
+    g = tree._groups[0]
     assert g.category == "registry" and g.safety is curation.Safety.REVIEW
     tree.expandItem(reg)
     assert reg.child(0).text(4) == "-"
