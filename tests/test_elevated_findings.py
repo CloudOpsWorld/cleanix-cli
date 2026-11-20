@@ -184,6 +184,8 @@ def fx(tmp_path, monkeypatch):
         return None
 
     monkeypatch.setitem(reverify.REVERIFIERS, "orphan_files", permissive)
+    # ... and no real package-manager query is batched up front for them
+    monkeypatch.setitem(reverify.PREFETCH, "orphan_files", lambda paths, config: None)
 
     def no_history(*a, **k):
         pytest.fail("the helper recorded history")
@@ -1228,6 +1230,7 @@ def test_helper_end_to_end_removes_unowned_item_and_refuses_owned_one(fx, monkey
     monkeypatch.setattr(UnownedSystemFilesReporter, "pkg_backend", lambda self: "dpkg")
     monkeypatch.setattr(elevated, "finding_path_roots", lambda: {"orphan_files": (str(varlib),)})
     monkeypatch.setitem(reverify.REVERIFIERS, "orphan_files", reverify._orphan_files)
+    monkeypatch.setitem(reverify.PREFETCH, "orphan_files", reverify._prefetch_orphan_files)
     dpkg = _FakeDpkg()
     monkeypatch.setattr(oc, "run", dpkg)
     gone = varlib / "zzgone"
@@ -1255,7 +1258,11 @@ def test_helper_end_to_end_removes_unowned_item_and_refuses_owned_one(fx, monkey
     late = st[f"orphan_files|path|{owned}"]
     assert late.status == "skipped" and "a package owns it now" in late.reason
     assert not gone.exists() and owned.read_text() == "about to be owned"
-    assert ["/var/lib/zzsoon"] in dpkg.queries  # the exact path, re-queried
+    # the helper's own scan queried both, then ONE batched up-front re-query
+    # (already answers "owned" for zzsoon), then a fresh query right before
+    # zzgone's removal
+    assert sorted(dpkg.queries[-2][:]) == ["/var/lib/zzgone", "/var/lib/zzsoon"]
+    assert dpkg.queries[-1] == ["/var/lib/zzgone"]
     run = fx.qbase / result.quarantine_run
     manifest = json.loads((run / "manifest.json").read_text())
     assert [i["original"] for i in manifest["items"]] == [str(gone)]
@@ -1381,3 +1388,32 @@ def test_helper_refuses_the_quarantine_under_another_spelling(fx, monkeypatch):
         (out,) = result.findings
         assert out.status == "skipped" and "administrator quarantine" in out.reason
         assert alias.exists()
+
+
+@posix_only
+def test_deadline_passing_mid_batch_reports_unprocessed_items_honestly(fx, monkeypatch):
+    """A slow act-time re-check pushes the (fake) clock past the helper's
+    deadline right before the first removal: that item is still processed,
+    the rest are reported "deadline reached; not processed" and kept."""
+    items = [finding(make(fx, name)) for name in ("a", "b", "c")]
+    fx.cleaners.append(FakeCleaner("orphan_files", lambda: items))
+    clock = [1000.0]
+    monkeypatch.setattr(elevated, "_monotonic", lambda: clock[0])
+    calls = []
+
+    def slow(item, config):
+        calls.append(item.path)
+        if len(calls) == len(items) + 1:  # the first removal-phase re-check
+            clock[0] += elevated.DEFAULT_DEADLINE + 1
+        return None
+
+    monkeypatch.setitem(reverify.REVERIFIERS, "orphan_files", slow)
+    rc, result = run_helper(fx, request(items))
+    assert rc == elevated.EXIT_DEADLINE and result.deadline_hit
+    st = {o.key.rsplit("/", 1)[1]: o for o in result.findings}
+    assert st["a"].status == "removed" and not (fx.sys / "a").exists()
+    for name in ("b", "c"):
+        assert st[name].status == "not_removed"
+        assert st[name].reason == "deadline reached; not processed"
+        assert (fx.sys / name).exists()
+    assert result.removed == 1

@@ -175,7 +175,9 @@ class StaleSystemdUnitReporter(OrphanReporter):
                      lookup: Optional[list], in_link_dir: bool) -> dict:
         """Finding kwargs for the remedy of a broken unit link.
 
-        User links: a plain PATH remedy (unchanged). System-wide links: the
+        User links: no remedy (report only) -- act never removes a link
+        through a plain PATH remedy, and nothing would re-check that it is
+        still broken, so nothing is offered. System-wide links: the
         LINK remedy (the link itself, elevated helper only) -- but none when
         it may still be live. systemd adds a ``*.wants``/``*.requires``/
         ``*.upholds`` dependency by the LINK's name, whatever its target, so
@@ -184,7 +186,7 @@ class StaleSystemdUnitReporter(OrphanReporter):
         under /etc/systemd/user are resolved by each user's manager against
         units this scan cannot see (their homes). Unknown is "maybe live"."""
         if user:
-            return {"remedy_kind": RemedyKind.PATH}
+            return {}
         if logical == _SYSTEM_USER_DIR or logical.startswith(_SYSTEM_USER_DIR + "/"):
             return {}
         if in_link_dir:

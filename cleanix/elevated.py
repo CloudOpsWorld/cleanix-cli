@@ -143,8 +143,10 @@ Known residuals, accepted for now:
 (c) POSIX ACLs are not inspected by the ordinary admin-cleaner path; only
     owner, group and mode bits are. The findings action (point 11) refuses
     any folder on the chain that carries one (Linux: POSIX/NFSv4 ACL
-    xattrs; macOS: an extended ACL via ``acl_get_link_np``; undeterminable
-    = refused).
+    xattrs; macOS: an extended ACL with an ``allow`` entry granting more
+    than reading, via ``acl_get_link_np``/``acl_to_text`` -- deny-only ACLs
+    such as ``everyone deny delete`` pass; unparsable or undeterminable =
+    refused).
 (d) Windows: the result file is written by path, as administrator, into the
     requesting user's directory; a junction swap after validation could
     redirect that fixed-name file write. Handle-based writing is future work.
@@ -980,7 +982,6 @@ _ACL_XATTRS = frozenset({
     "system.posix_acl_access", "system.posix_acl_default", "system.nfs4_acl",
 })
 _ACL_TYPE_EXTENDED = 0x00000100  # macOS <sys/acl.h>
-_ACL_FIRST_ENTRY = 0
 
 
 def _acl_os() -> str:
@@ -995,12 +996,12 @@ def _list_xattrs(path: str) -> List[str]:
     return os.listxattr(path, follow_symlinks=False)  # type: ignore[attr-defined]
 
 
-def _macos_has_acl(path: str) -> Optional[bool]:
-    """Whether ``path`` (not followed) carries an extended ACL with at least
-    one entry; None when this cannot be determined. CPython has no ACL API
-    and ``os.listxattr`` is Linux-only, so this calls libSystem's
-    ``acl_get_link_np(path, ACL_TYPE_EXTENDED)``: NULL with ENOENT means no
-    ACL; any other failure is "cannot tell"."""
+def _macos_acl_text(path: str) -> Optional[str]:
+    """The extended ACL of ``path`` (not followed) as ``acl_to_text`` prints
+    it, "" when it has none, None when this cannot be determined. CPython
+    has no ACL API and ``os.listxattr`` is Linux-only, so this calls
+    libSystem: ``acl_get_link_np(path, ACL_TYPE_EXTENDED)`` (NULL with
+    ENOENT: no ACL; any other failure: cannot tell), then ``acl_to_text``."""
     import ctypes
     import ctypes.util
     import errno as _errno
@@ -1010,9 +1011,9 @@ def _macos_has_acl(path: str) -> Optional[bool]:
         get = libc.acl_get_link_np
         get.restype = ctypes.c_void_p
         get.argtypes = [ctypes.c_char_p, ctypes.c_int]
-        entry = libc.acl_get_entry
-        entry.restype = ctypes.c_int
-        entry.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+        to_text = libc.acl_to_text
+        to_text.restype = ctypes.c_void_p
+        to_text.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ssize_t)]
         free = libc.acl_free
         free.restype = ctypes.c_int
         free.argtypes = [ctypes.c_void_p]
@@ -1021,12 +1022,58 @@ def _macos_has_acl(path: str) -> Optional[bool]:
     ctypes.set_errno(0)
     acl = get(os.fsencode(path), _ACL_TYPE_EXTENDED)
     if not acl:
-        return False if ctypes.get_errno() == _errno.ENOENT else None
+        return "" if ctypes.get_errno() == _errno.ENOENT else None
     try:
-        first = ctypes.c_void_p()
-        return entry(acl, _ACL_FIRST_ENTRY, ctypes.byref(first)) == 0
+        length = ctypes.c_ssize_t(0)
+        text = to_text(acl, ctypes.byref(length))
+        if not text:
+            return None
+        try:
+            return ctypes.string_at(text).decode("utf-8", "replace")
+        finally:
+            free(text)
     finally:
         free(acl)
+
+
+# macOS ACL permissions an "allow" entry may grant without letting anyone
+# change the folder's entries (everything else, known or not, refuses).
+_MACOS_SAFE_ALLOW = frozenset({
+    "read", "list", "search", "execute", "readattr", "readextattr",
+    "readsecurity", "synchronize",
+})
+_MACOS_ACL_FLAGS = frozenset({
+    "file_inherit", "directory_inherit", "limit_inherit", "only_inherit",
+    "inherited",
+})
+
+
+def _macos_acl_entries_problem(text: str) -> Optional[str]:
+    """Why the ``acl_to_text`` output ``text`` makes a folder untrusted, or
+    None. Deny entries never do (stock folders carry ``group:everyone deny
+    delete``). An ``allow`` entry is accepted only when every permission it
+    grants is read-only (:data:`_MACOS_SAFE_ALLOW`); write, delete,
+    add_file, add_subdirectory, delete_child, append, writeattr,
+    writeextattr, writesecurity, chown or anything unknown refuses. Text
+    that cannot be parsed refuses."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    if lines[0] != "!#acl 1":
+        return "has an access control list that cannot be read"
+    for line in lines[1:]:
+        fields = line.split(":")
+        if len(fields) < 5 or fields[0] not in ("user", "group"):
+            return "has an access control list that cannot be read"
+        kind = [k.strip() for k in fields[-2].split(",") if k.strip()]
+        perms = [x.strip() for x in fields[-1].split(",") if x.strip()]
+        if not kind or kind[0] not in ("allow", "deny") or not perms:
+            return "has an access control list that cannot be read"
+        if any(k not in _MACOS_ACL_FLAGS for k in kind[1:]):
+            return "has an access control list that cannot be read"
+        if kind[0] == "allow" and any(x not in _MACOS_SAFE_ALLOW for x in perms):
+            return "has an access control list that lets others change it"
+    return None
 
 
 def _acl_problem(path: str) -> Optional[str]:
@@ -1035,9 +1082,13 @@ def _acl_problem(path: str) -> Optional[str]:
 
     Linux: any of :data:`_ACL_XATTRS` present is a refusal; a filesystem
     that supports no extended attributes at all (ENOTSUP/EOPNOTSUPP) cannot
-    hold such an ACL (accepted); any other error refuses. macOS: any
-    extended ACL entry refuses, as does not being able to tell. Other
-    systems: refused (cannot tell)."""
+    hold such an ACL (accepted); any other error refuses. The kernel stores
+    these xattrs only for ACLs with entries beyond the base mode bits, so
+    their presence means extended entries. macOS: an ``allow`` entry that
+    grants anything beyond reading refuses, as does an unparsable ACL or
+    not being able to tell; deny-only ACLs pass
+    (:func:`_macos_acl_entries_problem`). Other systems: refused (cannot
+    tell)."""
     import errno as _errno
 
     system = _acl_os()
@@ -1056,12 +1107,12 @@ def _acl_problem(path: str) -> Optional[str]:
         return None
     if system == "darwin":
         try:
-            has = _macos_has_acl(path)
+            text = _macos_acl_text(path)
         except Exception:  # noqa: BLE001 - fail closed
-            has = None
-        if has is None:
+            text = None
+        if text is None:
             return "cannot be checked for an access control list"
-        return "carries an access control list" if has else None
+        return _macos_acl_entries_problem(text)
     return "cannot be checked for an access control list on this system"
 
 
@@ -1127,6 +1178,11 @@ def _path_chain_problem(path: str, expected_uid: Optional[int],
 # trustworthy absence (M1: detectors must not judge "missing" from a path
 # an ordinary user controls)
 # --------------------------------------------------------------------------
+# Root-level usr-merge links the absence rule may resolve (see below).
+_USR_MERGE_ALIASES = frozenset({"bin", "sbin", "lib", "lib32", "lib64", "libx32"})
+_readlink = os.readlink
+
+
 def _evidence_component_problem(st, expected_uid: Optional[int],
                                 group_ids: Optional[FrozenSet[int]]) -> Optional[str]:
     """The parent-chain rule (:func:`_component_problem`) WITHOUT its sticky
@@ -1155,9 +1211,15 @@ def _evidence_problem(path: str, expected_uid: Optional[int],
     is trusted, so only a system account could have created it): None. A
     symbolic link anywhere on the way -- including the final component, a
     dangling link whose target is what decides -- is NOT followed: not
-    trustworthy (the literal parent-chain rule; usr-merge links such as
-    ``/lib -> usr/lib`` are links too). A component that exists but is not
-    a folder (nothing can exist below it) ends the walk: None."""
+    trustworthy. One narrow exception (controller ruling, Task 9a round 1):
+    when the FIRST component is a fixed usr-merge alias (``bin``, ``sbin``,
+    ``lib``, ``lib32``, ``lib64``, ``libx32``) and ``/<alias>`` is a
+    symlink owned by root whose text is exactly ``usr/<alias>`` or
+    ``/usr/<alias>``, the path is rewritten to ``/usr/<alias>/...`` and the
+    rewritten path is judged by the normal rules. Any other link (another
+    target, another owner, deeper in the path) stays untrusted. A component
+    that exists but is not a folder (nothing can exist below it) ends the
+    walk: None."""
     import posixpath
 
     from cleanix.core.utils import canonical_system_path
@@ -1169,6 +1231,23 @@ def _evidence_problem(path: str, expected_uid: Optional[int],
     parts = [p for p in path.split("/") if p not in ("", ".")]
     if len(parts) > 256:
         return "is too deep to judge"
+    if parts and parts[0] in _USR_MERGE_ALIASES:
+        alias = parts[0]
+        top = "/" + alias
+        try:
+            st = _lstat(top)
+        except (FileNotFoundError, NotADirectoryError):
+            st = None  # judged by the walk below (a trusted absence)
+        except OSError:
+            return f"{top} cannot be inspected"
+        if st is not None and _stat_mod.S_ISLNK(st.st_mode):
+            try:
+                text = _readlink(top)
+            except OSError:
+                return f"{top} cannot be inspected"
+            if st.st_uid != _ROOT_UID or text not in ("usr/" + alias, "/usr/" + alias):
+                return f"{top} is a symbolic link"
+            parts = ["usr", alias] + parts[1:]
     current = "/"
     try:
         st = _lstat(current)

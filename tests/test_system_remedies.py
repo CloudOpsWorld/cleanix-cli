@@ -497,10 +497,15 @@ REAL_ACL_PROBLEM = elevated._acl_problem
 LNK = stat.S_IFLNK | 0o777
 
 
+class _Table(dict):
+    """path -> stat (or an OSError to raise); ``.links``: path -> link text."""
+
+
 @pytest.fixture
 def fake_fs(monkeypatch):
     """A fake filesystem for the helper's lstat-based rules (any OS)."""
-    table = {}
+    table = _Table()
+    table.links = {}
 
     def lstat(path):
         p = str(path).replace("\\", "/")
@@ -511,7 +516,14 @@ def fake_fs(monkeypatch):
             raise v
         return v
 
+    def readlink(path):
+        p = str(path).replace("\\", "/")
+        if p not in table.links:
+            raise OSError(errno.EINVAL, "not a link", p)
+        return table.links[p]
+
     monkeypatch.setattr(elevated, "_lstat", lstat)
+    monkeypatch.setattr(elevated, "_readlink", readlink)
     monkeypatch.setattr(elevated, "_acl_problem", lambda path: None)
     monkeypatch.setattr(elevated, "_human_uid_min", lambda: 1000)
     return table
@@ -528,6 +540,7 @@ def test_evidence_rule_judges_the_whole_chain(fake_fs):
     assert ev("/home/linuxbrew/.linuxbrew/bin/x", 1000, frozenset()) is None  # trusted absence
     assert "non-system user" in ev("/home/u/bin/tool", 1000, frozenset())
     assert "writable by everyone" in ev("/tmp/x", 1000, frozenset())  # sticky is not enough
+    fake_fs.links["/lib"] = "elsewhere/lib"  # not the usr-merge link: untrusted
     assert "symbolic link" in ev("/lib/systemd/system/x.service", 1000, frozenset())
     assert "symbolic link" in ev("/usr/bin/dangling", 1000, frozenset())
     assert "non-system group" in ev("/opt/x", 1000, frozenset())
@@ -637,13 +650,13 @@ def test_acl_component_refused(monkeypatch):
     monkeypatch.setattr(elevated, "_list_xattrs", no_api)
     assert "cannot be checked" in elevated._acl_problem("/a/plain")
 
-    # macOS: extended ACL entries refuse, and so does not being able to tell
+    # macOS: judged per entry (see test_macos_acl_entries_judged_per_entry);
+    # not being able to read the ACL refuses, no ACL passes
     monkeypatch.setattr(elevated, "_acl_os", lambda: "darwin")
-    for answer, expected in ((True, "carries an access control list"),
-                             (None, "cannot be checked for an access control list"),
-                             (False, None)):
-        monkeypatch.setattr(elevated, "_macos_has_acl", lambda p, a=answer: a)
-        assert elevated._acl_problem("/Library") == expected
+    monkeypatch.setattr(elevated, "_macos_acl_text", lambda p: None)
+    assert "cannot be checked" in elevated._acl_problem("/Library")
+    monkeypatch.setattr(elevated, "_macos_acl_text", lambda p: "")
+    assert elevated._acl_problem("/Library") is None
     # anything else: refused (cannot tell)
     monkeypatch.setattr(elevated, "_acl_os", lambda: "freebsd13")
     assert "cannot be checked" in elevated._acl_problem("/usr")
@@ -781,3 +794,138 @@ def test_mountinfo_truncated_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(root_delete, "_linux", lambda: True)
     assert root_delete.mount_problem(str(item), permanent=False) == \
         "the mount table could not be read"
+
+
+# --------------------------------------------------------------------------
+# Task 9a round 1: macOS ACL entries, usr-merge links, batch cost
+# --------------------------------------------------------------------------
+EVERYONE = "group:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12"
+STAFF = "group:ABCDEFAB-CDEF-ABCD-EFAB-CDEF00000014:staff:20"
+
+
+@pytest.mark.parametrize("text, refused", [
+    ("", False),  # no ACL
+    ("!#acl 1\n" + EVERYONE + ":deny:delete\n", False),  # stock /Library, homes
+    ("!#acl 1\n" + EVERYONE + ":deny,file_inherit,directory_inherit:delete,"
+     "delete_child,writeattr\n", False),
+    ("!#acl 1\n" + STAFF + ":allow:list,search,readattr\n", False),  # read-only
+    ("!#acl 1\n" + STAFF + ":allow:readextattr,readsecurity,execute\n", False),
+    ("!#acl 1\n" + STAFF + ":allow:write\n", True),
+    ("!#acl 1\n" + EVERYONE + ":deny:delete\n" + STAFF + ":allow:add_file\n", True),
+    ("!#acl 1\n" + STAFF + ":allow,directory_inherit:add_subdirectory\n", True),
+    ("!#acl 1\n" + STAFF + ":allow:delete\n", True),
+    ("!#acl 1\n" + STAFF + ":allow:delete_child\n", True),
+    ("!#acl 1\n" + STAFF + ":allow:writeattr\n", True),
+    ("!#acl 1\n" + STAFF + ":allow:writeextattr\n", True),
+    ("!#acl 1\n" + STAFF + ":allow:writesecurity\n", True),
+    ("!#acl 1\n" + STAFF + ":allow:chown\n", True),
+    ("!#acl 1\n" + STAFF + ":allow:list,frobnicate\n", True),  # unknown permission
+    ("garbage", True),
+    ("!#acl 1\nnot an entry\n", True),
+    ("!#acl 1\n" + STAFF + ":maybe:read\n", True),
+    ("!#acl 1\n" + STAFF + ":allow,weird_flag:read\n", True),
+    ("!#acl 2\n" + EVERYONE + ":deny:delete\n", True),
+])
+def test_macos_acl_entries_judged_per_entry(monkeypatch, text, refused):
+    monkeypatch.setattr(elevated, "_acl_os", lambda: "darwin")
+    monkeypatch.setattr(elevated, "_macos_acl_text", lambda p: text)
+    got = elevated._acl_problem("/Library")
+    assert (got is not None) is refused, got
+
+
+def test_usr_merge_root_links_resolved_narrowly(fake_fs, monkeypatch):
+    fake_fs.update({"/": _st(DIR), "/usr": _st(DIR), "/usr/lib": _st(DIR),
+                    "/usr/lib/systemd": _st(DIR), "/usr/lib/systemd/system": _st(DIR),
+                    "/usr/bin": _st(DIR), "/lib": _st(LNK), "/bin": _st(LNK),
+                    "/sbin": _st(LNK, uid=1000), "/lib64": _st(LNK),
+                    "/home": _st(DIR), "/home/lib": _st(LNK)})
+    fake_fs.links.update({"/lib": "usr/lib", "/bin": "/usr/bin", "/sbin": "usr/sbin",
+                          "/lib64": "usr/lib", "/home/lib": "usr/lib"})
+    ev = elevated._evidence_problem
+    # merged layout: root-owned /lib -> usr/lib and /bin -> /usr/bin resolve
+    assert ev("/lib/systemd/system/gone.service", 1000, frozenset()) is None
+    assert ev("/bin/gone", 1000, frozenset()) is None
+    # owned by a non-root uid, or pointing anywhere else: unknown
+    assert "/sbin is a symbolic link" in ev("/sbin/gone", 1000, frozenset())
+    assert "/lib64 is a symbolic link" in ev("/lib64/ld.so", 1000, frozenset())
+    # the rewritten path is judged by the normal rules
+    fake_fs["/usr/lib/systemd"] = _st(DIR, uid=1000, gid=1000)
+    assert "non-system user" in ev("/lib/systemd/system/x", 1000, frozenset())
+    fake_fs["/usr/lib/systemd"] = _st(DIR)
+    # a link deeper in the path stays unknown
+    fake_fs["/usr/lib/systemd/system"] = _st(LNK)
+    fake_fs.links["/usr/lib/systemd/system"] = "/usr/lib/systemd/system2"
+    assert "symbolic link" in ev("/lib/systemd/system/x", 1000, frozenset())
+    # only the FIRST component may be a usr-merge alias
+    assert "/home/lib is a symbolic link" in ev("/home/lib/x", 1000, frozenset())
+    # a real /lib folder is judged as a folder; a missing /lib is a trusted absence
+    fake_fs["/lib"] = _st(DIR)
+    assert ev("/lib/gone", 1000, frozenset()) is None
+    del fake_fs["/lib"]
+    assert ev("/lib/gone", 1000, frozenset()) is None
+    # the owner must be the helper's root uid (seam)
+    monkeypatch.setattr(elevated, "_ROOT_UID", 1000)
+    assert ev("/sbin/gone", 1000, frozenset()) is None  # /usr/sbin: trusted absence
+    assert "/bin is a symbolic link" in ev("/bin/gone", 1000, frozenset())
+
+
+def test_inventory_cached_per_phase_of_a_batch(orphan_env, monkeypatch):
+    from cleanix.cleaners import orphan_app_data as oad
+
+    env = orphan_env
+    calls = []
+    real = oad._inventory
+
+    def counting(*a, **k):
+        calls.append(k.get("require_mdfind"))
+        return real(*a, **k)
+
+    monkeypatch.setattr(oad, "_inventory", counting)
+    _mac_inventory(env)
+    env.cmds.on(("mdfind", "kMDItemContentType == 'com.apple.application-bundle'"), 0, "")
+    items = []
+    for n in range(3):
+        d = env.root / "Library" / "Application Support" / f"com.gone{n}.Thing"
+        put(d, "data.bin")
+        age(d / "data.bin")
+        age(d)
+        items.append(CleanableItem(cleaner_id="orphan_app_data", description="d", size=0,
+                                   kind=ItemKind.PATH, path=str(d), requires_root=True,
+                                   report_only=True,
+                                   remedy=Remedy(RemedyKind.PATH, (1, 2, 3, 4))))
+    store = {}
+    for item in items:
+        assert reverify.reverify(item, Config(), phase=reverify.VERIFY, store=store) is None
+    assert calls == [True]  # once up front for the whole batch
+    for item in items:
+        assert reverify.reverify(item, Config(), phase=reverify.REMOVAL, store=store) is None
+    assert calls == [True, True]  # once more, before the first removal
+    reverify.reverify(items[0], Config())  # outside a batch: always fresh
+    assert len(calls) == 3
+
+
+def test_ownership_batched_up_front_and_fresh_before_each_removal(orphan_env, monkeypatch):
+    dpkg = Dpkg(monkeypatch, orphan_env)
+    a = age(put(orphan_env.root, "/opt/zza"))
+    b = age(put(orphan_env.root, "/opt/zzb"))
+    items = sorted((i for i in orphan_file_items(orphan_env) if i.path in (str(a), str(b))),
+                   key=lambda i: i.path)
+    assert len(items) == 2
+    dpkg.queries.clear()
+    monkeypatch.setattr(root_delete, "mount_problem", lambda path, permanent: None)
+
+    def owning_b_once_a_is_rechecked(argv, timeout=120):
+        out = dpkg(argv, timeout)
+        if list(argv)[2:] == ["dpkg-query", "-S", "/opt/zza"]:
+            dpkg.owned.add("/opt/zzb")  # a package installed it mid-batch
+        return out
+
+    monkeypatch.setattr(oc, "run_command", owning_b_once_a_is_rechecked)
+    monkeypatch.setattr(engine, "is_root", lambda: True)  # as in the helper
+    s = actions.act(items, Config(), dry_run=True, permanent=True, allow_root=True)
+    # up front: ONE batched query for both; then a fresh query before each removal
+    assert dpkg.queries == [["/opt/zza", "/opt/zzb"], ["/opt/zza"], ["/opt/zzb"]]
+    by_path = {o.item.path: o for o in s.result.outcomes}
+    assert by_path[str(a)].error is None and by_path[str(a)].dry_run
+    assert dict((i.path, r) for i, r in s.skipped)[str(b)].endswith(
+        "a package owns it now, or its ownership could not be confirmed")

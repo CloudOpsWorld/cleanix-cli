@@ -277,7 +277,11 @@ def act(
         raise ValueError("record_history=False cannot be combined with quarantine")
     root_mode = allow_root or quarantine_root is not None
 
-    def run_extra_check(item: CleanableItem) -> Optional[str]:
+    # Root mode: the per-batch store of the re-verifiers (reverify.cached /
+    # prefetch); "verify" = the up-front pass, "removal" = right before each.
+    reverify_store: Dict[object, object] = {}
+
+    def run_extra_check(item: CleanableItem, phase: str) -> Optional[str]:
         if allow_root and item.path:
             why = root_delete.mount_problem(item.path, permanent=permanent)
             if why is not None:
@@ -286,7 +290,7 @@ def act(
         if why is None and root_mode:
             # The finding's own evidence, re-checked right before removal;
             # a scenario without a re-verifier is refused (reverify.py).
-            why = reverify.reverify(item, config)
+            why = reverify.reverify(item, config, phase=phase, store=reverify_store)
         return why
 
     def report(item: CleanableItem, outcome: Optional[CleanOutcome],
@@ -309,6 +313,9 @@ def act(
             kept |= _spellings(stamp.path)
             kept_ids.add(tuple(stamp.fingerprint)[2:])
 
+    if root_mode:
+        # One batched ownership query for the up-front pass (best effort).
+        reverify.prefetch(items, config, reverify_store, reverify.VERIFY)
     hashed: Dict[Tuple[str, Tuple[int, ...]], Optional[str]] = {}
     skipped: Dict[int, str] = {}
     todo: List[Tuple[int, CleanableItem]] = []
@@ -324,7 +331,7 @@ def act(
                 reason = _verify(item, batch, hashed, config, cancel,
                                  allow_root=allow_root, root_mode=root_mode)
                 if reason is None:
-                    reason = run_extra_check(item)
+                    reason = run_extra_check(item, reverify.VERIFY)
             except Exception as exc:  # noqa: BLE001 - fail closed, never abort the batch
                 reason = f"could not be verified ({str(exc) or type(exc).__name__})"
         if key is not None:
@@ -383,7 +390,7 @@ def act(
                     else:
                         why = _recheck(finding, config)
                         if why is None:
-                            why = run_extra_check(finding)
+                            why = run_extra_check(finding, reverify.REMOVAL)
                 except Exception as exc:  # noqa: BLE001 - fail closed
                     why = f"could not be verified ({str(exc) or type(exc).__name__})"
             if why is not None:

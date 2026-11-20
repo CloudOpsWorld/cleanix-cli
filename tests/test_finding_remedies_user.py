@@ -150,6 +150,19 @@ def test_launch_job_with_odd_label_has_no_remedy(orphan_env):
     assert item.remedy is None and item.report_only
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX symlinks")
+def test_user_broken_unit_link_has_no_remedy(orphan_env):
+    # Task 9a round 1: act never removes a link through a plain PATH remedy,
+    # so a user's broken unit link is offered nothing (report only).
+    wants = orphan_env.home / ".config/systemd/user/default.target.wants"
+    wants.mkdir(parents=True)
+    (orphan_env.root / "usr/lib/systemd/system").mkdir(parents=True)  # systemd present
+    os.symlink("/opt/gone/gone.service", str(wants / "gone.service"))
+    items = stale_services.StaleSystemdUnitReporter(Config()).scan().items
+    (item,) = [i for i in items if i.path == str(wants / "gone.service")]
+    assert not item.requires_root and item.report_only and item.remedy is None
+
+
 def test_user_systemd_unit_remedy_kind(orphan_env):
     unit = orphan_env.home / ".config" / "systemd" / "user" / "mine.service"
     unit.parent.mkdir(parents=True)

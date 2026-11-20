@@ -421,15 +421,43 @@ class UnownedSystemFilesReporter(OrphanReporter):
         if status != "ok":
             return "its contents could not be checked for package ownership"
         queried = [logical] + list(probes)
-        budget = oc.ScanBudget(len(queried) + 1, _REVERIFY_SECONDS)
-        budget.start()
-        unowned = oc.query_unowned(backend, queried, budget)
+        from cleanix.core import reverify
+
+        unowned = reverify.prefetched(self.id)  # up front: one batched query
+        if unowned is None:  # right before the removal: always a fresh query
+            budget = oc.ScanBudget(len(queried) + 1, _REVERIFY_SECONDS)
+            budget.start()
+            unowned = oc.query_unowned(backend, queried, budget)
         if any(q not in unowned for q in queried):
             return "a package owns it now, or its ownership could not be confirmed"
         return None
 
 
 _REVERIFY_SECONDS = 120.0
+
+
+def prefetch_unowned(paths, config) -> Optional[set]:
+    """The up-front (whole batch) ownership answer: ONE ``query_unowned``
+    call (several paths per ``dpkg-query -S`` / ``rpm -qf`` / ``pacman -Qo``
+    argv, as the read-only allowlist permits) over every path and its
+    probed children; the set of positively unowned ones, or None (no
+    backend). The removal-phase re-check never uses it."""
+    reporter = UnownedSystemFilesReporter(config)
+    reporter.budget.start()
+    backend = reporter.pkg_backend()
+    if backend is None:
+        return None
+    queried = []
+    for path in paths:
+        real = Path(path)
+        queried.append(oc.logical_path(reporter.sysroot, real))
+        status, probes, _sampled = reporter._probes(real)
+        if status == "ok":
+            queried.extend(probes)
+    queried = list(dict.fromkeys(queried))
+    budget = oc.ScanBudget(len(queried) + 1, _REVERIFY_SECONDS)
+    budget.start()
+    return set(oc.query_unowned(backend, queried, budget))
 
 
 def reverify_system_item(path: str, config) -> Optional[str]:

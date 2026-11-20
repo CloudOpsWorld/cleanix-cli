@@ -11,6 +11,15 @@ least ``orphan_min_age_days`` old, is not Apple's, and nothing installed
 shares its id, an id prefix or its vendor. Human-named folders ("Slack",
 "Google") are never reported. If the list of installed apps cannot be built
 nothing is reported and one "Not checked" note is shown instead.
+
+The elevated helper's act-time re-check (``reverify_system_item``) rebuilds
+the inventory (Spotlight required) before removing a system-wide entry. The
+inventory deliberately includes user-writable places (``~/Applications``,
+home tool folders, admin-writable ``/Applications``) and is NOT subject to
+the helper's "absence an ordinary user could cause is unknown" rule
+(controller ruling, Task 9a round 1): a user who removes their own app
+turning its ``/Library`` data into a finding is correct -- the app is
+uninstalled. Those places can only add "still installed" evidence.
 """
 
 from __future__ import annotations
@@ -400,7 +409,14 @@ class OrphanAppDataReporter(oc.OrphanReporter):
             newest = max(newest, self._newest_child_mtime(real))
         if newest > cutoff:
             return "it changed recently (it may be in use)"
-        inv = _inventory(self.sysroot, self._homes(), self.budget, require_mdfind=True)
+        from cleanix.core import reverify
+
+        # Built at most once up front and once before the first removal of
+        # a helper batch (reverify.cached); afresh outside a batch.
+        inv = reverify.cached(
+            "orphan_app_data.inventory",
+            lambda: _inventory(self.sysroot, self._homes(), self.budget,
+                               require_mdfind=True))
         if inv is None:
             return "the installed apps could not be listed now"
         if is_excluded(bid, _Index(*inv)):
