@@ -26,6 +26,26 @@ push-to-`main`-triggers-release flow.
 If the tag already exists, the release is skipped — so pushing unrelated commits
 never re-releases.
 
+## Beta / pre-release procedure
+
+Used for the 1.4.0 betas and for 1.5.0b1:
+
+1. Give the version a PEP 440 pre-release suffix in **both** files, for example
+   `1.5.0b1` (`pyproject.toml` `version` and `cleanix/__init__.py`
+   `__version__`). The workflow tags it `v1.5.0b1` as usual.
+2. PyPI treats it as a pre-release, so users only get it with `--pre`:
+   `pip install --pre cleanix-cli` (GUI: `pip install --pre "cleanix-cli[gui]"`).
+   A plain `pip install cleanix-cli` keeps installing the last final release.
+3. After `release.yml` has created the GitHub Release, edit it by hand and mark
+   it as a **pre-release** (the workflow does not do this).
+4. The standalone binaries do not include the GUI; `cleanix gui` in a binary
+   says to install it with pip (with `--pre` while the version is a beta).
+
+Version 1.5.0b1 (acting on findings) must not become a non-beta release until
+the checklist in [docs/findings-verification.md](docs/findings-verification.md)
+has been run on real Linux and macOS machines (and Windows, where it says so)
+and every box is ticked. Then change the version to `1.5.0` in both files.
+
 ## The GUI
 
 The desktop GUI ships inside the same wheel: `pip install "cleanix-cli[gui]"`

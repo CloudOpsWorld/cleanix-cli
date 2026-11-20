@@ -148,11 +148,14 @@ directories and the generic `~/.cache` catch-all defers to them.
   `node_modules` / `.venv` / `target` / `.gradle` dirs in projects under
   `project_scan_dirs` you haven't touched in `project_stale_days` (default 120).
 - **Large files** (`big_files`, report-only). The biggest files in `$HOME`, so
-  you can see what filled the disk. Never deletes — just a sized list + `rm` hint.
+  you can see what filled the disk. A scan only lists them (sized, with an `rm` hint); you can
+  act on them explicitly, see [Findings and what you can do with them](#findings-and-what-you-can-do-with-them).
 - **Duplicate files** (`duplicates`, report-only). Identical large files (same
-  size + SHA-256) grouped with the space reclaimable by keeping one copy.
+  size + SHA-256) grouped with the space reclaimable by keeping one copy. Acting on
+  them always keeps one copy of each group (you choose which).
 - **Stale downloads** (`downloads`, report-only). Old, large installers/ISOs in
-  `~/Downloads` (which stays hard-protected from deletion).
+  `~/Downloads` (the folder itself stays hard-protected from deletion; individual
+  files can be acted on explicitly).
 - **Orphaned browser profiles** (`browser_profiles`, report-only). Secondary
   Chrome/Chromium/Firefox profiles idle for `browser_profile_stale_days`, with a
   clear warning that a profile holds bookmarks/passwords/history.
@@ -160,8 +163,10 @@ directories and the generic `~/.cache` catch-all defers to them.
 ## System-wide leftovers (report-only, Linux/macOS)
 
 Seven detectors look for things that were left behind when a program was
-removed. They only **report**: nothing is deleted, nothing is preselected, and
-there is no way to clean them from Cleanix. Each finding names the exact path;
+removed. A scan only **reports** them: nothing is deleted and nothing is
+preselected. You can act on them explicitly, one by one or by scenario (see
+[Findings and what you can do with them](#findings-and-what-you-can-do-with-them)),
+which is a beta feature. Each finding names the exact path;
 system-level findings also include a command that confirms ownership
 (`dpkg -S`, `rpm -qf`, `pacman -Qo`) where a package backend
 exists, while user-level ones may not, so you decide. They appear under "Needs your review"
@@ -189,8 +194,9 @@ Known limits, read these before acting on a finding:
   and pacman (Arch). On other distributions `orphan_files` reports nothing.
 - On macOS the app-data check understands only reverse-DNS names
   (`com.vendor.App`); folders named after the app ("Slack") are never reported.
-- The macOS detectors have only been tested against fake data, not on a real
-  Mac. Treat their findings with extra care.
+- The macOS detectors and the system-wide actions have only been tested against
+  fake data, not on a real Mac or as real root. Treat their findings with extra
+  care; see [docs/findings-verification.md](docs/findings-verification.md).
 - `orphan_files` skips folders that look like live service data (k3s,
   kubelet, container runtimes and similar) and anything changed within
   `orphan_min_age_days`, but a program that creates its own folders at runtime
@@ -215,6 +221,186 @@ one note says the results are incomplete) and `orphan_min_age_days` (default
 30; macOS app data and `orphan_files` entries touched more recently than this
 are not reported; 0 turns the check off).
 
+## Findings and what you can do with them
+
+> **Beta.** Acting on findings ships as a pre-release (1.5.0b1). The
+> system-wide part has not been run on a real Linux or macOS machine as root
+> yet; [docs/findings-verification.md](docs/findings-verification.md) lists
+> what is still unverified. Prefer previews, and try it on a machine you can
+> restore.
+
+A scan only reports **findings**: things that may be junk but need your
+judgment (big files, duplicates, leftovers of removed apps, system files no
+package owns, ...). Nothing is preselected and a scan removes nothing. You can
+act on a finding yourself, explicitly, from the CLI (`clean --act-on`,
+`review`) or the GUI (Review tab). Findings are sorted into six categories:
+
+| Category | What it holds |
+|---|---|
+| Your files | `big_files`, `downloads`, `duplicates`, `project_cruft`, `browser_profiles`, snapshots, Time Machine, device backups, libvirt saved states, WSL disks, `Windows.old`, Prefetch, the macOS sleep image. Some of these are yours, some are recovery data: judge them yourself |
+| Leftovers of removed apps | `orphan_app_data`, `stale_launchers` |
+| System files no package owns | `orphan_files`, `stale_alternatives` |
+| Services and background jobs | `stale_services`, `orphan_launch_jobs` |
+| Install records | `stale_receipts` |
+| Other findings | any report-only cleaner that has no category of its own |
+
+Only a finding that carries an action can be acted on. Today that means
+individual items of `big_files`, `downloads`, `duplicates`, `orphan_app_data`,
+`stale_launchers`, `stale_services`, `orphan_launch_jobs`, `orphan_files` and
+`stale_receipts` for which the scan found a safe action. Everything else (for
+example snapshots, `Windows.old`, Prefetch, WSL disks, `project_cruft`,
+`browser_profiles`, `stale_alternatives`) stays report-only.
+
+Right before an item is removed, Cleanix checks it again: it must be unchanged
+since the scan, still be a regular file or folder (never a link), and pass the
+protected-path guard. Anything that changed is skipped and listed, never
+removed.
+
+### `cleanix clean --act-on`
+
+```bash
+# Preview (the default): lists what would happen, changes nothing
+cleanix clean --act-on big_files,downloads
+cleanix clean --act-on "Leftovers of removed apps"
+
+# Do it: asks once; files go to the quarantine (undo with `cleanix restore`)
+cleanix clean --act-on big_files --execute
+
+# Duplicates: say which copy of each group stays
+cleanix clean --act-on duplicates --keep oldest --execute   # or newest, shortest-path
+
+# Delete instead of quarantine (no undo), without a prompt (scripts)
+cleanix clean --act-on big_files --permanent --execute --yes
+```
+
+- `--act-on` takes finding ids or category names, comma separated, in any
+  case. There is no "all": `all`, `*` and `everything` are refused, so you
+  always name what you mean. It cannot be combined with `--only`, `--exclude`,
+  `--registry`, `--profile`, `--simulate`, `--interactive`, `--quarantine` or
+  `--min-size`; it scans exactly the scenarios you name.
+- It is a **preview unless you add `--execute`**. Items are moved into the
+  quarantine unless you add `--permanent`.
+- `duplicates` needs `--keep oldest|newest|shortest-path` (also when a category
+  such as "Your files" would include it). One copy of every group always stays
+  and is never listed as removable. `--keep` without `duplicates` is an error.
+- Launch jobs and systemd units (`orphan_launch_jobs`, `stale_services`) are
+  always removed **permanently**: the job is stopped, a backup copy of its file
+  is kept for manual recovery (`cleanix restore` does not bring it back, and
+  `cleanix quarantine empty` deletes these copies too), then the file is
+  removed.
+- Exit codes: `0` preview or done (skipped items are listed, they are not an
+  error); `1` you declined or aborted; `2` an error, a refusal or invalid
+  options.
+
+### `cleanix review`
+
+```bash
+cleanix review                          # every findings scenario that applies here
+cleanix review big_files duplicates --keep newest
+```
+
+An interactive walk, one finding at a time: `d` delete (move to the
+quarantine, or delete with `--permanent`), `s` skip (or just Enter), `g` delete
+this one and the rest of the group, `n` skip the rest of the group, `q` quit,
+`?` help. Nothing is removed unless you answer `d` or `g`. Without arguments
+it reviews every scenario that applies to your system; duplicate groups are
+then skipped, with a note, unless you pass `--keep`. Naming `duplicates`
+without `--keep` is an error and nothing is scanned. Exit codes: `0` finished
+or `q`; `1` end of input or Ctrl-C; `2` errors, or no terminal (`review` needs
+one).
+
+### System-wide findings (Linux and macOS)
+
+Some findings sit outside your home and need administrator rights:
+
+| OS | Offered |
+|---|---|
+| Linux | `orphan_files` folders in `/opt`, `/usr/local`, `/var/lib` and `/var/cache` that no package owns; `stale_services` unit files and dangling enable links; system `.desktop` entries (`stale_launchers`) |
+| macOS | `orphan_app_data` left in `/Library/Application Support` and `/Library/Preferences`; `orphan_launch_jobs` in `/Library/LaunchDaemons` and `/Library/LaunchAgents`; `stale_receipts` |
+
+None of this runs in your own process. Cleanix starts the **administrator
+helper** (`python -m cleanix.elevated`, through `pkexec` on Linux or the macOS
+password prompt). The helper:
+
+- scans again by itself, with default settings plus your `protected_globs`, and
+  acts only on items its own scan still reports;
+- re-verifies every item by kind right before acting: the package manager is
+  asked again whether a package owns it, the installed apps are listed again,
+  a job's program must still be missing, a receipt's installed files must
+  still be gone;
+- refuses anything it cannot judge (unknown means skip), anything on a mount
+  point, with an ACL, immutable, or reachable only through links it cannot
+  trust;
+- **moves** items into a root-only quarantine by default
+  (`/var/lib/cleanix/quarantine` on Linux, `/Library/Application
+  Support/Cleanix/quarantine` on macOS). You cannot restore from it yet and
+  nothing purges it yet, so the space is **not** freed. With `--permanent` it
+  deletes with no copy. Jobs, units and receipts are always permanent, and a
+  copy of their files is kept in that folder for manual recovery. A Linux unit
+  is stopped with `systemctl disable --now` (`disable` for template units) and
+  one `daemon-reload` follows; a macOS daemon's plist is removed without
+  stopping it (its program is already missing; launchd forgets it at the next
+  restart); an agent already running in a user session keeps running until
+  that user logs out; a receipt is forgotten with `pkgutil --forget`.
+
+Confirmation: in a terminal you must type exactly `DELETE SYSTEM FILES` after
+the user-space part (anything else, end of input or Ctrl-C leaves the system
+items untouched). `review` collects the system items you chose and asks once,
+at the end. Without a terminal there is no prompt only with `--yes` **and** an
+already-root process; without a terminal, with `--yes` as a normal user, the
+user-space part runs and the system items are reported as not done.
+
+Honest limitations:
+
+- **No Undo for system items.** Cleanix cannot restore from, or purge, the
+  helper's quarantine; removing it means deleting it as root.
+- `sudo cleanix clean --act-on ... --yes` still starts the helper through
+  `pkexec` / `osascript`. On a host without `pkexec` (a server, a minimal
+  container) it ends with "not available; nothing was removed" and exit code
+  `2`. Under `sudo` the helper reads **root's** config, so your own
+  `protected_globs` are not applied to the system part.
+- On Linux a folder in the `orphan_files` roots with more than 5 entries is
+  report-only: a sample cannot prove that no package owns something deeper. A
+  folder is acted on only when every file below it (at most 200, on one
+  filesystem) is positively unowned.
+- On macOS Spotlight (`mdfind`) must list every app, including those in
+  `/System/Applications` and in users' `~/Applications`; otherwise
+  `orphan_app_data` items are not offered. Receipts of software installed into
+  user-writable places (for example Homebrew on Intel) are not offered.
+- An item on another filesystem than the quarantine cannot be moved there;
+  `--permanent` is then the only way, and it applies to the whole run.
+- Items with ACLs, mount points, immutable flags or unusual names are refused,
+  not removed. The helper has a time limit; when it is hit, the items not
+  processed are listed (and, when units were involved, run
+  `systemctl daemon-reload`).
+- A short window remains between the helper's last check and the removal. It is
+  path-based, and only root can change what the helper acts on in that window.
+- Windows has no system-wide findings, only user-space ones.
+
+### The GUI
+
+Power mode has the tabs **Scan | Review | Registry (Windows only) | Quarantine |
+History | Schedule | Settings | Findings**.
+
+- **Review** scans only when you click "Scan for findings" (opt-in; "Include
+  deep scan (slow)" adds the slow scenarios and is off by default). Tick files
+  one by one or by category. For duplicates each group keeps one copy (the
+  oldest by default; you can pick another), and a group can never be fully
+  ticked. System-wide items can be ticked only when administrator permission
+  is available; otherwise they are listed read-only with the reason.
+- One confirmation dialog (plain text) lists what happens to every item and
+  what is not acted on. With system-wide items it also asks you to type
+  `DELETE SYSTEM FILES` before Act is enabled. Your own files are acted on
+  **first**; only then comes the single administrator prompt for the
+  system-wide items. If the first part fails or is cancelled, the system part
+  is never launched.
+- Undo (Quarantine tab) covers only your own files that were moved to the
+  quarantine. System items, jobs, units and receipts are never offered an Undo.
+- **Registry** (Windows only) now holds the registry entries that used to sit in
+  the Scan tab. It is opt-in (nothing is scanned until you ask), a backup of
+  every entry is always written, and restoring registry entries is not shipped
+  yet (see [Windows registry cleaners](#windows-registry-cleaners-opt-in)).
+
 ## Working with what a scan finds
 
 - `cleanix explain <id>` — read-only, shows the **exact** paths/commands one
@@ -238,6 +424,8 @@ are not reported; 0 turns the check off).
 
 - **PyPI:** `pip install cleanix-cli` (or `pipx install cleanix-cli`); add the
   `gui` extra for the desktop GUI (see [Graphical interface](#graphical-interface)).
+  While the 1.5 line is in beta, pip needs `--pre` to pick it up:
+  `pip install --pre cleanix-cli` (GUI: `pip install --pre "cleanix-cli[gui]"`).
   Standalone GUI installers are planned (Plan 2B).
 - **Standalone binaries** are attached to each [GitHub Release] alongside a
   `SHA256SUMS` file and keyless **build-provenance attestations** — verify a
@@ -376,8 +564,13 @@ pip install "cleanix-cli[gui]"    # adds PySide6; the CLI never needs it
 cleanix gui                       # or: cleanix-gui
 ```
 
+While the 1.5 line is a pre-release, pip only installs it with `--pre`:
+`pip install --pre "cleanix-cli[gui]"` (needs Python 3.9+, because of
+PySide6; on macOS system Python 3.9 add `--no-compile` if pip crashes).
+
 Without the extra, `cleanix gui` prints the install hint and the CLI keeps
-working. Standalone GUI installers (Windows installer, macOS `.dmg`, Linux
+working. The standalone CLI binaries do not include the GUI: there `cleanix gui`
+says so and points to the pip install above. Standalone GUI installers (Windows installer, macOS `.dmg`, Linux
 AppImage) are coming in a later release (Plan 2B); for now install with pip.
 
 **Simple and Power.** A toolbar switch at the top picks the mode; the choice
@@ -387,10 +580,12 @@ the item count, the total size and a **safety badge**. The badge always spells
 the level out in words (colour is only a hint):
 
 - **Safe**: rebuilt automatically; can be cleaned from Simple mode.
-- **Review**: needs your judgment. Report-only findings are never deleted by
-  Cleanix (their row says why and, where there is one, how to remove them by
-  hand). Other Review items can be cleaned only from Power mode; in Simple
-  mode they are listed read-only.
+- **Review**: needs your judgment. Simple mode never acts on findings: they
+  are listed read-only (with, where there is one, how to remove them by hand).
+  In Power mode you can act on them from the Review tab, explicitly (see
+  [Findings and what you can do with them](#findings-and-what-you-can-do-with-them));
+  a scan never selects them. Other Review items can be cleaned only from Power
+  mode.
 - **Needs admin**: needs administrator permission and cannot be undone;
   tickable only when administrator cleaning is available and the helper would
   clean it, otherwise shown read-only with the reason.
@@ -421,9 +616,11 @@ into quarantine instead of deleted (they use disk space until you empty it).
 
 **Power mode** shows the same curated groups for every cleaner you choose to
 scan ("Choose what to scan"), with a detail pane, JSON export and tabs for
+Review (opt-in findings scan and the act flow), Registry (Windows only),
 Quarantine (restore, delete a run, empty all), History, Schedule, Settings
 (every config key, including `protected_globs`) and Findings (report-only
-items, with Reveal in the file manager; never deleted). Extra controls:
+items, with Reveal in the file manager; acting on them happens in the Review
+tab). Extra controls:
 
 - **Raw list** toggles between the curated groups and the full sortable,
   filterable table of every item.
@@ -442,7 +639,9 @@ prompt"). "Keep a copy (undo)" is also ticked by default.
 brings back *files* that were cleaned as your normal user with a copy kept.
 These are always permanent and cannot be undone:
 
-- items that need administrator permission (the helper never quarantines);
+- items that need administrator permission (the helper's quarantine is
+  root-only and cannot be restored from yet; jobs, units and receipts are
+  always permanent);
 - command items, such as emptying the Recycle Bin / Trash or pruning
   containers;
 - anything cleaned with "keep a copy" unticked.
@@ -863,7 +1062,8 @@ How it works:
 Some things are *leftovers* but also *recovery data* — filesystem snapshots,
 mobile-device backups, suspended-VM memory images. Cleanix surfaces these with
 their size and the **correct removal command**, but they are **never** eligible
-for deletion (`clean` skips them; even a forced attempt is refused):
+for deletion by Cleanix (`clean` skips them; even a forced attempt is refused;
+the finding actions of `--act-on` and `review` do not cover them either):
 
 ```
 Report-only — review and remove manually (never auto-deleted)
@@ -871,8 +1071,8 @@ Report-only — review and remove manually (never auto-deleted)
 ```
 
 Covered report-only: Timeshift/Snapper snapshots, libvirt saved VM states,
-macOS Time Machine local snapshots, iOS device backups, macOS sleep image,
-and the system-wide orphan reports (see above).
+macOS Time Machine local snapshots, iOS device backups and the macOS sleep
+image. (The system-wide orphan reports can be acted on explicitly; see above.)
 
 ## Extended coverage
 
@@ -898,12 +1098,20 @@ Beyond the core cleaners, cleanix also handles:
 ## Safety model
 
 1. **Two-phase**: `scan` is always read-only. `clean` defaults to dry-run.
+   Findings are acted on only when you name them (`clean --act-on`, `review`,
+   the GUI Review tab); `--act-on` is a preview unless `--execute`, never
+   accepts "all", and system-wide items need the typed phrase
+   `DELETE SYSTEM FILES` (or `--yes` in a root process).
 2. **Protected paths**: deletion of (or inside) critical paths is refused at the
    lowest level — see `cleanix/core/safety.py`.
 3. **Age thresholds**: temp/log cleaners only consider files older than a
    configurable age, so in-use files are left alone.
 4. **Scheduled = analyze only**: the timer runs `scan` and writes a report; it
    does not clean.
+5. **Findings are re-verified**: every item acted on is checked again right
+   before it is removed (unchanged, not a link, guard); system-wide items are
+   re-scanned and re-verified by the administrator helper. See the residual
+   risks in [docs/findings-verification.md](docs/findings-verification.md).
 
 ## Configuration
 
