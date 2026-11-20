@@ -26,9 +26,11 @@ and no stdin. A failing, missing or timed-out command never raises: it
 becomes a warning.
 
 System scope (Task 9b; the elevated helper's findings action only, see
-:mod:`cleanix.core.system_remedy`): ``launchctl bootout system/<label>``,
-``systemctl disable [--now] <unit>``, ``systemctl daemon-reload`` (no
-``--user``) and ``pkgutil --forget <id>``. These shapes are a scope of their
+:mod:`cleanix.core.system_remedy`): ``systemctl disable [--now] <unit>``,
+``systemctl daemon-reload`` (no ``--user``) and ``pkgutil --forget <id>``.
+There is deliberately NO system-domain ``launchctl bootout``: a stale
+system job's program is missing, so it cannot be running from that plist,
+and a bootout by label could stop a live job loaded from elsewhere. These shapes are a scope of their
 own (:data:`SYSTEM_MUTATING_COMMANDS`, :func:`system_argv_allowed`): they
 are run only by ``run_mutating(..., scope=SYSTEM)`` and only while
 :func:`system_scope` is active inside helper scan mode (``actions.act``
@@ -81,7 +83,6 @@ USER_MUTATING_COMMANDS: frozenset = frozenset(
 # :func:`system_argv_allowed`.
 SYSTEM_MUTATING_COMMANDS: frozenset = frozenset(
     {
-        ("launchctl", "bootout"),  # system/<label> only
         ("systemctl", "disable", "--now"),
         ("systemctl", "disable"),  # template units only (no --now)
         ("systemctl", "daemon-reload"),
@@ -105,11 +106,15 @@ Runner = Callable[[Sequence[str], int], Tuple[int, str, str]]
 _NO_FINGERPRINT = (0, 0, 0, 0)
 _REPARSE = 0x400
 _SERVICE_TARGET = re.compile(r"gui/(0|[1-9][0-9]{0,9})/(.+)")
-_SYSTEM_TARGET = re.compile(r"system/(.+)")
 # A package receipt id usable in ``pkgutil --forget`` (stricter than a label:
 # pkgutil ids are reverse-DNS names).
 _PKG_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,254}")
 APPLE_PREFIX = "com.apple."
+
+
+def is_apple(name: object) -> bool:
+    """``com.apple.*`` in any letter case (case-insensitive volumes)."""
+    return isinstance(name, str) and name.casefold().startswith(APPLE_PREFIX)
 # launchctl bootout exit codes taken to mean "no such process" / "could not
 # find service": the job simply was not loaded (a note, not a warning).
 # UNVERIFIED on a real Mac.
@@ -152,9 +157,9 @@ def is_template(unit: str) -> bool:
 
 
 def valid_system_label(label: object) -> bool:
-    """A launchd label usable in ``bootout system/<label>``: a plain label
-    that is never Apple's."""
-    return valid_label(label) and not str(label).startswith(APPLE_PREFIX)
+    """A plain launchd label of a system-wide job, never Apple's (in any
+    case). No command is ever built from it (no system-domain bootout)."""
+    return valid_label(label) and not is_apple(label)
 
 
 def valid_pkg_id(pkg_id: object) -> bool:
@@ -163,7 +168,7 @@ def valid_pkg_id(pkg_id: object) -> bool:
     ``..``, no separators, whitespace or control characters), never
     Apple's."""
     return (isinstance(pkg_id, str) and bool(_PKG_ID.fullmatch(pkg_id))
-            and _ident(pkg_id) and not pkg_id.startswith(APPLE_PREFIX))
+            and _ident(pkg_id) and not is_apple(pkg_id))
 
 
 # --------------------------------------------------------------- commands
@@ -189,13 +194,6 @@ def disable_argv(unit: str) -> List[str]:
 
 def daemon_reload_argv() -> List[str]:
     return ["systemctl", "--user", "daemon-reload"]
-
-
-def system_bootout_argv(label: str) -> List[str]:
-    """``launchctl bootout system/<label>`` (system domain; never Apple)."""
-    if not valid_system_label(label):
-        raise ValueError("invalid launchd label")
-    return ["launchctl", "bootout", f"system/{label}"]
 
 
 def system_disable_argv(unit: str) -> List[str]:
@@ -243,9 +241,6 @@ def system_argv_allowed(argv: object) -> bool:
         return valid_unit(a[3]) and not is_template(a[3])
     if len(a) == 3 and a[:2] == ("systemctl", "disable"):
         return valid_unit(a[2]) and is_template(a[2])
-    if len(a) == 3 and a[:2] == ("launchctl", "bootout"):
-        m = _SYSTEM_TARGET.fullmatch(a[2])
-        return bool(m) and valid_system_label(m.group(1))
     if len(a) == 3 and a[:2] == ("pkgutil", "--forget"):
         return valid_pkg_id(a[2])
     return False
@@ -404,20 +399,18 @@ def _same(a: object, b: object) -> bool:
     return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
 
 
-def _label_elsewhere(path: str, label: str, dirs: Optional[Sequence[Path]] = None) -> Optional[str]:
+def _label_elsewhere(path: str, label: str) -> Optional[str]:
     """Why ``bootout`` by ``label`` could hit another job: another plist in
-    ``dirs`` (default: the user's, the local and the system LaunchAgents)
-    declares the same Label (or a folder/plist there cannot be read). None
-    when clear."""
+    the user's, the local or the system LaunchAgents declares the same
+    Label (or a folder/plist there cannot be read). None when clear."""
     from cleanix.cleaners import orphan_common as oc
     from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
 
     load = OrphanLaunchJobReporter._load  # size-capped; uses no instance state
     root = OrphanLaunchJobReporter.sysroot
-    if dirs is None:
-        dirs = [expected_dir(RemedyKind.LAUNCH_JOB),
-                oc.in_root(root, "/Library/LaunchAgents"),
-                oc.in_root(root, "/System/Library/LaunchAgents")]
+    dirs = [expected_dir(RemedyKind.LAUNCH_JOB),
+            oc.in_root(root, "/Library/LaunchAgents"),
+            oc.in_root(root, "/System/Library/LaunchAgents")]
     seen = 0
     for d in dirs:
         children = oc.list_dir(d)

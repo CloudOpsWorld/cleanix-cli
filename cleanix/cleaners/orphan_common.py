@@ -18,6 +18,8 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import stat as _stat_mod
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,11 +58,61 @@ SYSTEM_JOB_KINDS = frozenset({RemedyKind.LAUNCH_JOB, RemedyKind.SYSTEMD_UNIT,
                               RemedyKind.PKG_RECEIPT})
 
 
+# BSD/macOS ``st_flags`` bits that keep even root from changing or removing
+# a file as expected (immutable / append-only, user or system level).
+_BSD_LOCK_FLAGS = (getattr(_stat_mod, "UF_IMMUTABLE", 0x2) | getattr(_stat_mod, "UF_APPEND", 0x4)
+                   | getattr(_stat_mod, "SF_IMMUTABLE", 0x20000)
+                   | getattr(_stat_mod, "SF_APPEND", 0x40000))
+# Linux inode flags (chattr +i / +a) read with FS_IOC_GETFLAGS.
+_FS_IOC_GETFLAGS = 0x80086601
+_FS_LOCK_FLAGS = 0x10 | 0x20  # FS_IMMUTABLE_FL | FS_APPEND_FL
+
+
+def _linux_fs_flags(path, st) -> Optional[int]:
+    """The Linux inode flags of ``path`` (the very file ``st`` describes),
+    or None when they cannot be read (then nothing is refused for them)."""
+    try:
+        import array
+        import fcntl
+    except ImportError:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except (OSError, ValueError):
+        return None
+    try:
+        fst = os.fstat(fd)
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+            return None
+        buf = array.array("i", [0])
+        fcntl.ioctl(fd, _FS_IOC_GETFLAGS, buf, True)
+        return int(buf[0])
+    except (OSError, ValueError, OverflowError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def lock_flags_problem(path, st) -> Optional[str]:
+    """Why ``path`` (lstat ``st``) carries an immutable or append-only flag,
+    else None. BSD/macOS: ``st_flags``; Linux: FS_IOC_GETFLAGS, refused only
+    when the flags can be read and are set."""
+    flags = getattr(st, "st_flags", None)
+    if flags is not None:
+        return "is immutable or append-only" if int(flags) & _BSD_LOCK_FLAGS else None
+    if sys.platform.startswith("linux"):
+        fs = _linux_fs_flags(path, st)
+        if fs is not None and fs & _FS_LOCK_FLAGS:
+            return "is immutable or append-only"
+    return None
+
+
 def system_file_problem(path) -> Optional[str]:
     """Why ``path`` is not a plain file only root can change (a precondition
     of every system-wide launch job / unit / receipt remedy), else None:
     a regular file (never a link), owned by root, not group/world
-    writable, one link only. In helper/strict mode its parent chain must
+    writable, one link only, not immutable or append-only. In helper/strict mode its parent chain must
     also pass the evidence rule (folders only system accounts can change,
     no links, no access control lists)."""
     import stat as _stat
@@ -77,6 +129,9 @@ def system_file_problem(path) -> Optional[str]:
         return "is writable by other users"
     if st.st_nlink != 1:
         return "has more than one link"
+    problem = lock_flags_problem(path, st)
+    if problem:
+        return problem
     return evidence_problem(path)
 
 READ_ONLY_COMMANDS: frozenset = frozenset(
@@ -691,6 +746,12 @@ def _system_job_remedy(f: Finding) -> Optional[Remedy]:
         return None
     path = str(f.path)
     if bad_name(os.path.basename(path)):
+        return None
+    from cleanix.core.remedy_exec import is_apple
+
+    # never Apple's, in any letter case: the helper refuses such a request
+    # outright, so one odd item must not carry a remedy into a batch
+    if is_apple(os.path.basename(path)) or is_apple(str(extra[0][1])):
         return None
     try:
         st = os.lstat(path)

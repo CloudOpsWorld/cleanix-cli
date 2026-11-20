@@ -344,8 +344,16 @@ class Quarantine:
         dest = self.files_dir / stored_name(idx, base)
         try:
             shutil.copy2(src, str(dest), follow_symlinks=False)
+            # The copy is readable by its owner only (a root-owned copy of a
+            # system file stays private); the original's mode, owner and
+            # (macOS) flags are recorded from the lstat taken before copying.
+            os.chmod(str(dest), 0o600)
             entry = _file_entry(src, dest, st.st_size, base)
-            entry = {"type": "copy", **entry}
+            entry = {"type": "copy", **entry, "mode": _stat.S_IMODE(st.st_mode),
+                     "uid": int(getattr(st, "st_uid", 0)),
+                     "gid": int(getattr(st, "st_gid", 0))}
+            if getattr(st, "st_flags", None) is not None:
+                entry["flags"] = int(st.st_flags)
             self.items.append(entry)
             try:
                 self.save()

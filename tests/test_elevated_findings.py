@@ -1613,11 +1613,12 @@ def _idx(events, kind, what):
 
 @posix_only
 def test_helper_system_launch_jobs_end_to_end(fx, monkeypatch):
-    """macOS: a LaunchDaemon is re-verified, copied into the root
-    quarantine's copy-only run, booted out (system domain) and deleted, in
-    that order; a LaunchAgent is copied and deleted but never booted out.
-    Permanent (no quarantine run), a note says where the copy is, and
-    nothing is written under the user's home."""
+    """macOS: a LaunchDaemon and a LaunchAgent are re-verified, copied into
+    the root quarantine's copy-only run and deleted, in that order -- and
+    NO command is run (fix round 1: never a system-domain bootout).
+    Permanent (no quarantine run), a note says where the copy is and that
+    launchd forgets the daemon at the next restart; nothing is written
+    under the user's home."""
     from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
 
     sysroot, events, runner, _t = _sys_env(
@@ -1631,14 +1632,6 @@ def test_helper_system_launch_jobs_end_to_end(fx, monkeypatch):
     items = _own_items(OrphanLaunchJobReporter, sysroot)
     assert {Path(i.path).name for i in items} == {"com.gone.d.plist", "com.gone.a.plist"}
     assert all(i.remedy.kind is RemedyKind.LAUNCH_JOB for i in items)
-    seen_at_stop = []
-
-    def at_bootout(argv):
-        kept = sorted(fx.qbase.glob("*/files/*"))
-        seen_at_stop.append((d.exists(), [k.read_bytes() for k in kept]))
-        return 0, "", ""
-
-    runner.answers[("launchctl", "bootout", "system/com.gone.d")] = at_bootout
     fx.cleaners.append(OrphanLaunchJobReporter(Config()))
     home_before = tree(fx.home)
     rc, result = run_helper(fx, request(items))
@@ -1647,16 +1640,13 @@ def test_helper_system_launch_jobs_end_to_end(fx, monkeypatch):
     assert st["com.gone.d.plist"].status == "removed"
     assert st["com.gone.a.plist"].status == "removed"
     assert not d.exists() and not a.exists()
-    # exactly one command, the system-domain bootout of the daemon
-    assert runner.calls == [["launchctl", "bootout", "system/com.gone.d"]]
-    # the copy existed (and the plist was still there) when it was stopped
-    ((present, kept),) = seen_at_stop
-    assert present and originals[str(d)] in kept
-    # order: re-verified -> copied -> stopped -> deleted
+    # no command at all (no system-domain bootout)
+    assert runner.calls == [] and _idx(events, "cmd", "") == []
+    # order: re-verified -> copied -> deleted
     v, c = _idx(events, "verify", str(d)), _idx(events, "copy", str(d))
-    s, x = _idx(events, "cmd", "system/com.gone.d"), _idx(events, "delete", str(d))
-    assert len(v) == 2 and len(c) == 1 and len(s) == 1 and len(x) == 1
-    assert v[-1] < c[0] < s[0] < x[0]
+    x = _idx(events, "delete", str(d))
+    assert len(v) == 2 and len(c) == 1 and len(x) == 1
+    assert v[-1] < c[0] < x[0]
     ca, xa = _idx(events, "copy", str(a)), _idx(events, "delete", str(a))
     assert len(ca) == 1 and len(xa) == 1 and ca[0] < xa[0]
     # the copies: one copy-only run in the ROOT quarantine, no restorable run
@@ -1669,9 +1659,10 @@ def test_helper_system_launch_jobs_end_to_end(fx, monkeypatch):
         assert Path(m["stored"]).read_bytes() == originals[m["original"]]
     # honest notes: permanent, where the copy is; the agent was not stopped
     where = str(run / "files")
-    assert st["com.gone.d.plist"].note.startswith(
-        "permanent: the job is stopped and its file removed (a copy of the file is kept in "
-        + where)
+    assert st["com.gone.d.plist"].note == (
+        "permanent: the job's file was removed; launchd forgets it at the next restart "
+        f"(it cannot run: its program is missing) (a copy of the file is kept in {where} "
+        "for manual recovery)")
     assert st["com.gone.a.plist"].note.startswith("permanent: its file was removed")
     assert "not stopped here" in st["com.gone.a.plist"].note
     assert tree(fx.home) == home_before
@@ -1679,10 +1670,11 @@ def test_helper_system_launch_jobs_end_to_end(fx, monkeypatch):
 
 
 @posix_only
-def test_helper_launch_job_command_failure_and_shared_label(fx, monkeypatch):
-    """A failing bootout does not block the removal (a warning in the note);
-    a label another plist declares (here a /System daemon) is never booted
-    out, but the stale file is still removed, with a warning."""
+def test_helper_never_boots_out_a_label_loaded_elsewhere(fx, monkeypatch):
+    """Fix round 1: a stale legacy daemon plist whose Label is also used by a
+    live job (here a /System daemon; in practice e.g. an SMAppService helper
+    loaded from elsewhere) is removed without ANY command, so the live job
+    is never stopped."""
     from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
 
     sysroot, _events, runner, _t = _sys_env(
@@ -1691,23 +1683,18 @@ def test_helper_launch_job_command_failure_and_shared_label(fx, monkeypatch):
     daemons = sysroot / "Library" / "LaunchDaemons"
     sysd = sysroot / "System" / "Library" / "LaunchDaemons"
     sysd.mkdir(parents=True)
-    f = _plist_job(daemons, "com.gone.fail")
-    s = _plist_job(daemons, "com.gone.shared")
-    _plist_job(sysd, "com.vendor.real", label="com.gone.shared", program="/usr/libexec/x")
-    runner.answers[("launchctl", "bootout", "system/com.gone.fail")] = (
-        5, "", "Boot-out failed: 5: Input/output error")
+    s = _plist_job(daemons, "com.vendor.edr.legacy", label="com.vendor.edr")
+    live = _plist_job(sysd, "com.vendor.edr.live", label="com.vendor.edr",
+                      program="/usr/libexec/x")
     items = _own_items(OrphanLaunchJobReporter, daemons)
-    assert len(items) == 2
+    assert len(items) == 1
     fx.cleaners.append(OrphanLaunchJobReporter(Config()))
     rc, result = run_helper(fx, request(items, permanent=True))
     assert rc == elevated.EXIT_OK
-    st = _by_name(result)
-    assert st["com.gone.fail.plist"].status == "removed" and not f.exists()
-    assert "warning: launchctl bootout system/com.gone.fail failed (exit 5" in \
-        st["com.gone.fail.plist"].note
-    assert st["com.gone.shared.plist"].status == "removed" and not s.exists()
-    assert "another job uses this label" in st["com.gone.shared.plist"].note
-    assert runner.calls == [["launchctl", "bootout", "system/com.gone.fail"]]
+    (out,) = result.findings
+    assert out.status == "removed" and not s.exists() and live.exists()
+    assert "launchd forgets it at the next restart" in out.note
+    assert runner.calls == []
     assert result.backup_run and result.quarantine_run == ""
 
 
@@ -1945,8 +1932,8 @@ def test_helper_job_deadline_mid_batch_is_honest(fx, monkeypatch):
     assert st["com.gone.a.plist"].status == "removed" and not a.exists()
     assert st["com.gone.b.plist"].status == "not_removed"
     assert st["com.gone.b.plist"].reason == actions.STOPPED_AT_DEADLINE and b.exists()
-    assert runner.calls == [["launchctl", "bootout", "system/com.gone.a"]]
-    assert _idx(events, "copy", str(b)) == []
+    assert runner.calls == []
+    assert _idx(events, "copy", str(b)) == [] and _idx(events, "delete", str(b)) == []
 
 
 @posix_only
@@ -1995,8 +1982,7 @@ def test_helper_refuses_job_kinds_on_the_wrong_platform(fx, monkeypatch):
 @posix_only
 def test_helper_job_changed_while_the_batch_runs_is_skipped(fx, monkeypatch):
     """The re-check right before acting on EACH job: b's program comes back
-    while a is being stopped; b is then neither copied, stopped nor
-    removed."""
+    while a is being removed; b is then neither copied nor removed."""
     from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
 
     sysroot, events, runner, _t = _sys_env(
@@ -2007,21 +1993,27 @@ def test_helper_job_changed_while_the_batch_runs_is_skipped(fx, monkeypatch):
     b = _plist_job(daemons, "com.gone.b")
     items = sorted(_own_items(OrphanLaunchJobReporter, daemons), key=lambda i: i.path)
 
-    def reinstall_b(argv):
-        prog = sysroot / "opt" / "gone" / "com.gone.b"
-        prog.parent.mkdir(parents=True, exist_ok=True)
-        prog.write_text("#!/bin/sh\n")
-        return 0, "", ""
+    from cleanix.core import root_delete
 
-    runner.answers[("launchctl", "bootout", "system/com.gone.a")] = reinstall_b
+    logged_remove = root_delete.remove
+
+    def remove_a_then_reinstall_b(path):
+        result = logged_remove(path)
+        if path == str(a):
+            prog = sysroot / "opt" / "gone" / "com.gone.b"
+            prog.parent.mkdir(parents=True, exist_ok=True)
+            prog.write_text("#!/bin/sh\n")
+        return result
+
+    monkeypatch.setattr(root_delete, "remove", remove_a_then_reinstall_b)
     fx.cleaners.append(OrphanLaunchJobReporter(Config()))
     rc, result = run_helper(fx, request(items))
     st = _by_name(result)
     assert st["com.gone.a.plist"].status == "removed" and not a.exists()
     assert st["com.gone.b.plist"].status == "skipped" and b.exists()
     assert "program exists now" in st["com.gone.b.plist"].reason
-    assert runner.calls == [["launchctl", "bootout", "system/com.gone.a"]]
-    assert _idx(events, "copy", str(b)) == []
+    assert runner.calls == []
+    assert _idx(events, "copy", str(b)) == [] and _idx(events, "delete", str(b)) == []
 
 
 @posix_only

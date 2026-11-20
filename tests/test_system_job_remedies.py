@@ -206,8 +206,6 @@ def opened():
 # D. the mutating system-scope allowlist
 # --------------------------------------------------------------------------
 def test_system_argv_shapes_exact():
-    assert remedy_exec.system_bootout_argv("com.gone.d") == [
-        "launchctl", "bootout", "system/com.gone.d"]
     assert remedy_exec.system_disable_argv("gone.service") == [
         "systemctl", "disable", "--now", "gone.service"]
     assert remedy_exec.system_disable_argv("tpl@.service") == [
@@ -215,8 +213,7 @@ def test_system_argv_shapes_exact():
     assert remedy_exec.system_daemon_reload_argv() == ["systemctl", "daemon-reload"]
     assert remedy_exec.forget_argv("com.vendor.gone") == [
         "pkgutil", "--forget", "com.vendor.gone"]
-    for argv in (remedy_exec.system_bootout_argv("com.gone.d"),
-                 remedy_exec.system_disable_argv("gone.service"),
+    for argv in (remedy_exec.system_disable_argv("gone.service"),
                  remedy_exec.system_disable_argv("tpl@.service"),
                  remedy_exec.system_daemon_reload_argv(),
                  remedy_exec.forget_argv("com.vendor.gone")):
@@ -282,6 +279,23 @@ def test_system_argv_near_misses_refused(argv):
     assert rec == []
 
 
+def test_system_domain_bootout_is_never_allowed():
+    # Fix round 1 (ruling): no system-domain launchctl at all; a stale
+    # system job's program is missing, and a bootout by label could stop a
+    # live job of that label loaded from elsewhere.
+    for argv in (["launchctl", "bootout", "system/com.gone.d"],
+                 ["launchctl", "bootout", "system/com.vendor.edr.helper"]):
+        assert not remedy_exec.system_argv_allowed(argv)
+        assert not remedy_exec.argv_allowed(argv)
+        with opened():
+            assert remedy_exec.run_mutating(argv, scope=remedy_exec.SYSTEM)[0] == 126
+    assert not any(s[0] == "launchctl" for s in remedy_exec.SYSTEM_MUTATING_COMMANDS)
+    assert not hasattr(remedy_exec, "system_bootout_argv")
+    # the user-level (Task 7) bootout is untouched
+    assert remedy_exec.argv_allowed(remedy_exec.bootout_argv(501, "com.gone.job"))
+    assert ("launchctl", "bootout") in remedy_exec.USER_MUTATING_COMMANDS
+
+
 def test_non_list_argv_refused():
     for argv in ("pkgutil --forget com.x", b"pkgutil", ("pkgutil", "--forget", 3), None, 7):
         assert not remedy_exec.system_argv_allowed(argv)
@@ -290,8 +304,7 @@ def test_non_list_argv_refused():
 @pytest.mark.parametrize("bad", ["-x", "a b", "a/b", "a\nb", "com.apple.x", "", "x" * 300,
                                  "café", "a..b", "--user"])
 def test_system_argv_builders_refuse_hostile_names(bad):
-    with pytest.raises(ValueError):
-        remedy_exec.system_bootout_argv(bad)
+    assert not remedy_exec.valid_system_label(bad)
     with pytest.raises(ValueError):
         remedy_exec.forget_argv(bad)
     if bad != "com.apple.x":  # an ordinary unit name on Linux
@@ -302,7 +315,7 @@ def test_system_argv_builders_refuse_hostile_names(bad):
 def test_system_scope_unreachable_from_an_unprivileged_call_path(monkeypatch):
     rec = Recorder()
     monkeypatch.setattr(remedy_exec, "runner", rec)
-    argv = remedy_exec.system_bootout_argv("com.gone.d")
+    argv = remedy_exec.system_disable_argv("gone.service")
     forget = remedy_exec.forget_argv("com.vendor.gone")
     # the default (user) scope refuses every system shape
     assert remedy_exec.run_mutating(argv)[0] == 126
@@ -850,41 +863,32 @@ def test_agent_is_never_booted_out(env, monkeypatch):
     assert stop.warnings == [system_remedy.AGENT_NOT_STOPPED]
 
 
-def test_daemon_bootout_and_label_sharing(env, monkeypatch):
+def test_daemon_is_never_booted_out(env, monkeypatch):
+    """Fix round 1: no command for a system daemon either -- even when a live
+    job of the same label is loaded from elsewhere (an SMAppService /
+    BundleProgram helper, a /System daemon). The note says launchd forgets
+    it at the next restart."""
     mac(monkeypatch)
     d = daemon(env)
-    with opened():
-        assert system_remedy.unload(LJ, "com.gone.d", str(d)).stopped
-    assert env.rec.calls == [["launchctl", "bootout", "system/com.gone.d"]]
-    env.rec.calls.clear()
-    # not loaded: soft
-    env.rec.result = (113, "", "Could not find service")
-    with opened():
-        stop = system_remedy.unload(LJ, "com.gone.d", str(d))
-    assert stop.info == ["the job was not loaded"] and stop.warnings == []
-    env.rec.result = (5, "", "Boot-out failed: 5: Input/output error")
-    with opened():
-        stop = system_remedy.unload(LJ, "com.gone.d", str(d))
-    assert stop.warnings and "failed (exit 5" in stop.warnings[0]
-    env.rec.result = (0, "", "")
-    env.rec.calls.clear()
-    # another plist in any of the four folders declares the label: not stopped
-    for where in ("Library/LaunchDaemons", "System/Library/LaunchDaemons",
-                  "Library/LaunchAgents", "System/Library/LaunchAgents"):
-        twin = daemon(env, "com.other.twin", label="com.gone.d", where=where)
+    for where in (None, "System/Library/LaunchDaemons", "Library/LaunchAgents"):
+        twin = (daemon(env, "com.vendor.live", label="com.gone.d", where=where)
+                if where else None)
         with opened():
             stop = system_remedy.unload(LJ, "com.gone.d", str(d))
-        assert not stop.stopped and "another job uses this label" in stop.warnings[0], where
-        twin.unlink()
+        assert not stop.stopped and stop.warnings == []
+        assert stop.info == [system_remedy.DAEMON_FORGOTTEN]
+        if twin is not None:
+            twin.unlink()
     assert env.rec.calls == []
-    # a folder that cannot be read: not stopped
-    real = oc.list_dir
-    sysd = env.root / "System/Library/LaunchDaemons"
-    monkeypatch.setattr(oc, "list_dir", lambda p: None if Path(p) == sysd else real(p))
-    with opened():
-        stop = system_remedy.unload(LJ, "com.gone.d", str(d))
-    assert not stop.stopped and "could not read" in stop.warnings[0]
-    assert env.rec.calls == []
+    note = system_remedy.note(LJ, "/q/run/files", stop, True)
+    assert note == ("permanent: the job's file was removed; launchd forgets it at the next "
+                    "restart (it cannot run: its program is missing) (a copy of the file is "
+                    "kept in /q/run/files for manual recovery)")
+    assert system_remedy.note(LJ, "/q", stop, False).startswith("its file was not removed")
+    # the agent note is unchanged
+    agent = system_remedy.note(LJ, "/q", remedy_exec.Stop(
+        warnings=[system_remedy.AGENT_NOT_STOPPED]), True)
+    assert agent.startswith("permanent: its file was removed") and "not stopped here" in agent
 
 
 def test_unit_disable_and_name_elsewhere(env, monkeypatch):
@@ -991,3 +995,136 @@ def test_strict_inventory_needs_min_apps_real_bundles(env):
     empty = env.root / "empty"
     (empty / "Applications").mkdir(parents=True)
     assert orphan_app_data._inventory(empty, [], require_mdfind=True) is None
+
+
+# --------------------------------------------------------------------------
+# Fix round 1
+# --------------------------------------------------------------------------
+def test_receipts_are_never_unlinked(env, monkeypatch):
+    """Minor 2: root removal refuses anything in the receipts folder (any
+    spelling or case) unless it is a prepared receipt being forgotten."""
+    from cleanix.core import root_delete
+
+    rd = env.root / "private/var/db/receipts"
+    for p in (rd / "x.plist", rd / "sub" / "y", env.root / "var/db/receipts/z.bom",
+              env.root / "PRIVATE/var/DB/receipts/x.plist"):
+        assert system_remedy.in_receipts_dir(str(p)), p
+    for p in (env.root / "private/var/db/receiptsX/a", env.root / "var/lib/a"):
+        assert not system_remedy.in_receipts_dir(str(p)), p
+    victim = rd / "com.vendor.x.plist"
+    rd.mkdir(parents=True)
+    victim.write_text("x")
+    item = CleanableItem(cleaner_id="orphan_files", description="d", size=0,
+                         kind=ItemKind.PATH, path=str(victim), requires_root=True,
+                         report_only=True,
+                         remedy=Remedy(RemedyKind.PATH, fingerprint_of(str(victim))))
+    monkeypatch.setattr(engine, "is_root", lambda: True)
+    monkeypatch.setattr(reverify, "reverify", lambda *a, **k: None)
+    monkeypatch.setattr(root_delete, "mount_problem", lambda p, permanent: None)
+    removed = []
+    monkeypatch.setattr(root_delete, "remove", lambda p: removed.append(p) or (True, 1, None))
+    s = actions.act([item], Config(), dry_run=False, permanent=True, allow_root=True,
+                    record_history=False)
+    (out,) = s.result.outcomes
+    assert not out.removed and out.error == system_remedy.RECEIPT_NOT_UNLINKED
+    assert victim.exists() and removed == [] and env.rec.calls == []
+
+
+def test_backup_copy_is_private_and_records_metadata(tmp_path):
+    """Minor 3: the copy is 0600; the original's mode/owner/(flags) are in
+    the manifest entry, taken from the lstat before copying."""
+    from cleanix.core import quarantine
+
+    src = tmp_path / "com.gone.d.plist"
+    src.write_text("job")
+    if POSIX:
+        os.chmod(str(src), 0o644)
+    st = os.lstat(str(src))
+    qroot = tmp_path / "q"
+    qroot.mkdir()
+    run = quarantine.new_run(root=qroot)
+    stored = run.store_copy(str(src))
+    (entry,) = json.loads((run.dir / "manifest.json").read_text())["items"]
+    assert entry["type"] == "copy" and entry["mode"] == (st.st_mode & 0o7777)
+    assert entry["uid"] == st.st_uid and entry["gid"] == st.st_gid
+    assert ("flags" in entry) == (getattr(st, "st_flags", None) is not None)
+    assert Path(stored).read_text() == "job"
+    if POSIX:
+        assert (os.lstat(stored).st_mode & 0o777) == 0o600
+        assert (os.lstat(str(src)).st_mode & 0o777) == 0o644  # the original untouched
+
+
+class _St:
+    def __init__(self, flags=None, mode=0o100644, uid=0, nlink=1):
+        self.st_mode, self.st_uid, self.st_nlink = mode, uid, nlink
+        self.st_dev, self.st_ino, self.st_gid = 1, 2, 0
+        if flags is not None:
+            self.st_flags = flags
+
+
+@pytest.mark.parametrize("flags,locked", [
+    (0, False), (0x2, True), (0x4, True), (0x20000, True), (0x40000, True),
+    (0x8000, False),  # UF_HIDDEN: harmless
+])
+def test_lock_flags_from_st_flags(flags, locked):
+    """Minor 4 (BSD/macOS st_flags): immutable / append-only is refused."""
+    assert bool(oc.lock_flags_problem("/x", _St(flags))) is locked
+
+
+def test_lock_flags_linux_ioctl_seam(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    for value, locked in ((0x10, True), (0x20, True), (0x80000, False), (None, False)):
+        monkeypatch.setattr(oc, "_linux_fs_flags", lambda p, st, v=value: v)
+        assert bool(oc.lock_flags_problem("/x", _St())) is locked, value
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(oc, "_linux_fs_flags", lambda p, st: pytest.fail("not on macOS"))
+    assert oc.lock_flags_problem("/x", _St()) is None  # no st_flags: nothing to read
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux ioctl")
+def test_lock_flags_real_linux_file_reads_or_skips(tmp_path):
+    p = tmp_path / "f"
+    p.write_text("x")
+    flags = oc._linux_fs_flags(str(p), os.lstat(str(p)))
+    assert flags is None or not flags & 0x30  # readable or not: never locked here
+    assert oc.lock_flags_problem(str(p), os.lstat(str(p))) is None
+
+
+def test_helper_refuses_an_immutable_job_file(monkeypatch):
+    st = _St(flags=0x20000, uid=elevated._ROOT_UID)
+    monkeypatch.setattr(elevated, "_lstat", lambda p: st)
+    monkeypatch.setattr(elevated, "_acl_problem", lambda p: None)
+    assert "immutable" in elevated._system_file_problem("/Library/LaunchDaemons/x.plist")
+    st.st_flags = 0
+    assert elevated._system_file_problem("/Library/LaunchDaemons/x.plist") is None
+
+
+@posix_only
+def test_scan_gives_no_remedy_to_an_immutable_job(env, monkeypatch):
+    d = daemon(env)
+    if sys.platform.startswith("linux"):
+        monkeypatch.setattr(oc, "_linux_fs_flags", lambda p, st: 0x10)
+    else:  # pragma: no cover - macOS/BSD
+        monkeypatch.setattr(oc, "lock_flags_problem", lambda p, st: "is immutable")
+    assert scanned(olj.OrphanLaunchJobReporter, d).remedy is None
+
+
+@posix_only
+def test_apple_names_in_any_case_get_no_remedy(env, monkeypatch):
+    """Minor 5: ``COM.APPLE.*`` (any case) never carries a remedy, so one odd
+    item can never get a whole helper request refused."""
+    odd = daemon(env, "COM.APPLE.x", label="com.vendor.x")
+    item = scanned(olj.OrphanLaunchJobReporter, odd)
+    assert item.remedy is None
+    label = daemon(env, "com.vendor.y", label="Com.Apple.y")
+    assert scanned(olj.OrphanLaunchJobReporter, label).remedy is None
+    r = receipt(env, "COM.APPLE.pkg.x")
+    assert scanned(sr.StaleReceiptReporter, r).remedy is None
+    monkeypatch.setattr(oc.OrphanReporter, "pkg_backend", lambda self: "dpkg")
+    u = unit(env, "COM.APPLE.x.service")
+    assert scanned(ss.StaleSystemdUnitReporter, u).remedy is None
+    mac(monkeypatch)
+    assert system_remedy.check(sys_item(odd, LJ, "com.vendor.x"), Config())[0] == \
+        system_remedy.APPLE
+    assert not remedy_exec.valid_pkg_id("COM.APPLE.pkg.x")
+    assert not remedy_exec.valid_system_label("cOm.ApPlE.x")

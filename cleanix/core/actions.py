@@ -522,17 +522,25 @@ def act(
             if on_quarantine_claim is not None:
                 root_kwargs["on_quarantine_claim"] = on_quarantine_claim
         if allow_root and not dry_run:
+            receipt_items = {path_key(a.path or "") for _i, a in todo
+                             if original[id(a)].remedy is not None
+                             and original[id(a)].remedy.kind is RemedyKind.PKG_RECEIPT}  # type: ignore[union-attr]
+
             def remove_path(path: str):
-                # A prepared receipt is forgotten (pkgutil), never unlinked.
+                # A prepared receipt is forgotten (pkgutil), never unlinked;
+                # anything else in the receipts folder, or a receipt that
+                # was not prepared, is refused (never root_delete.remove).
                 pkg_id = receipts.pop(path_key(path), None)
                 if pkg_id is not None:
                     return system_remedy.forget(pkg_id, path)
+                if path_key(path) in receipt_items or system_remedy.in_receipts_dir(path):
+                    return False, 0, system_remedy.RECEIPT_NOT_UNLINKED
                 return root_delete.remove(path)
 
             root_kwargs["remove_path"] = remove_path
         if on_item is not None:
             root_kwargs["on_outcome"] = engine_outcome
-        # System-scope commands (bootout system/..., systemctl without
+        # System-scope commands (systemctl without
         # --user, pkgutil --forget) are runnable only inside this scope,
         # which only the helper's root mode opens.
         scope = remedy_exec.system_scope() if allow_root else contextlib.nullcontext()

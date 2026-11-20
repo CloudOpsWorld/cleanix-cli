@@ -4,10 +4,12 @@ Three kinds, each bound to one scenario and one platform:
 
 * ``LAUNCH_JOB`` (macOS, ``orphan_launch_jobs``): a plist directly in
   ``/Library/LaunchDaemons`` or ``/Library/LaunchAgents`` (never
-  ``/System``, never ``com.apple.*``). A daemon is stopped with ``launchctl
-  bootout system/<label>``; an agent is NOT stopped (it runs in users'
-  sessions; it simply is not started again at their next login). Then the
-  plist is deleted.
+  ``/System``, never ``com.apple.*`` in any case). NO command is run: its
+  program is missing, so the job cannot be running from this plist, and a
+  ``bootout`` by label could stop a live job of the same label loaded from
+  elsewhere (e.g. an SMAppService helper). Removing the plist (after the
+  copy) is the whole action; launchd forgets a daemon at the next restart,
+  an agent at its users' next login.
 * ``SYSTEMD_UNIT`` (Linux, ``stale_services``): a unit file directly in
   ``/etc/systemd/system`` (never a vendor folder). ``systemctl disable
   --now <unit>`` (template units: without ``--now``), the file is deleted,
@@ -36,7 +38,6 @@ from __future__ import annotations
 
 import os
 import stat
-from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 from cleanix.core import platform as plat
@@ -68,11 +69,6 @@ KEY: Dict[RemedyKind, str] = {
 UNIT_DIR = "/etc/systemd/system"
 LAUNCH_DAEMONS = "/Library/LaunchDaemons"
 LAUNCH_AGENTS = "/Library/LaunchAgents"
-# Every folder whose plists a ``bootout system/<label>`` could hit instead.
-LABEL_DIRS = (
-    "/Library/LaunchDaemons", "/System/Library/LaunchDaemons",
-    "/Library/LaunchAgents", "/System/Library/LaunchAgents",
-)
 
 NOT_HANDLED = "this kind of finding is not handled here"
 WRONG_SCENARIO = "this scenario does not offer this kind of action; refused"
@@ -84,6 +80,8 @@ NOT_IN_PLACE = "not directly inside a folder this action may change; refused"
 IS_LINK = "a link, not a plain file; refused"
 BAD_BOM = "the receipt's .bom file is not a plain file; refused"
 BLOCKED = "blocked by safety guard (protected path)"
+DAEMON_FORGOTTEN = ("the job's file was removed; launchd forgets it at the next "
+                    "restart (it cannot run: its program is missing)")
 AGENT_NOT_STOPPED = ("a system-wide agent is not stopped here: copies already running "
                      "in users' sessions keep running until they log out (it is not "
                      "started again at the next login)")
@@ -129,7 +127,7 @@ def _name_problem(kind: RemedyKind, name: str, base: str) -> Optional[str]:
     if _bad_chars(base):
         return BAD_NAME
     if kind is RemedyKind.LAUNCH_JOB:
-        if base.startswith(remedy_exec.APPLE_PREFIX) or name.startswith(remedy_exec.APPLE_PREFIX):
+        if remedy_exec.is_apple(base) or remedy_exec.is_apple(name):
             return APPLE
         if not remedy_exec.valid_system_label(name):
             return BAD_NAME
@@ -140,11 +138,29 @@ def _name_problem(kind: RemedyKind, name: str, base: str) -> Optional[str]:
         if not remedy_exec.valid_unit(name) or base != name:
             return BAD_NAME
         return None
-    if name.startswith(remedy_exec.APPLE_PREFIX):
+    if remedy_exec.is_apple(name) or remedy_exec.is_apple(base):
         return APPLE
     if not remedy_exec.valid_pkg_id(name) or base != f"{name}.plist":
         return BAD_NAME
     return None
+
+
+RECEIPT_NOT_UNLINKED = ("not removed: an install record is only ever forgotten with "
+                        "pkgutil --forget, never deleted")
+
+
+def in_receipts_dir(path: str) -> bool:
+    """``path`` lies in (or is) the receipts folder, in any spelling of it
+    (``/private/var/db/receipts`` or ``/var/db/receipts``, any case)."""
+    try:
+        here = os.path.normpath(os.path.abspath(str(path))).casefold()
+    except (TypeError, ValueError):
+        return True  # cannot tell: treat as a receipt (refused)
+    for d in ("/private/var/db/receipts", "/var/db/receipts"):
+        top = os.path.normpath(_real(RemedyKind.PKG_RECEIPT, d)).casefold()
+        if here == top or here.startswith(top.rstrip(os.sep) + os.sep):
+            return True
+    return False
 
 
 def bom_path(path: str, pkg_id: str) -> str:
@@ -270,17 +286,17 @@ def _unit_elsewhere(name: str) -> Optional[str]:
 
 
 def unload(kind: RemedyKind, name: str, path: str) -> Stop:
-    """Stop/disable the job best effort (system scope); never raises."""
+    """Disable a unit best effort (system scope); never raises. A launch
+    job is never stopped (see the module docstring): an agent gets a
+    warning, a daemon the note that launchd forgets it at the next
+    restart."""
     try:
         soft: Sequence[int] = ()
         if kind is RemedyKind.LAUNCH_JOB:
             if is_agent(path):
                 return Stop(warnings=[AGENT_NOT_STOPPED])
-            argv = remedy_exec.system_bootout_argv(name)
-            dirs = [Path(_real(kind, d)) for d in LABEL_DIRS]
-            clash = remedy_exec._label_elsewhere(path, name, dirs)
-            soft = remedy_exec._NOT_LOADED_RC
-        elif kind is RemedyKind.SYSTEMD_UNIT:
+            return Stop(info=[DAEMON_FORGOTTEN])
+        if kind is RemedyKind.SYSTEMD_UNIT:
             argv = remedy_exec.system_disable_argv(name)
             clash = _unit_elsewhere(name)
         else:
@@ -353,10 +369,18 @@ def note(kind: RemedyKind, where: object, stop: Optional[Stop], removed: bool,
             return planned_text(kind, where)
         return f"the install record was not forgotten (a copy of its files is kept in {where})"
     stop = stop if stop is not None else Stop(stopped=False)
+    if removed and DAEMON_FORGOTTEN in stop.info:
+        text = (f"permanent: {DAEMON_FORGOTTEN} (a copy of the file is kept in "
+                f"{where} for manual recovery)")
+        warnings = list(stop.warnings) + list(extra_warnings)
+        if warnings:
+            text += "; warning: " + "; ".join(warnings)
+        return text
     if removed:
         return remedy_exec.permanent_note(where, stop, extra_warnings)
     text = ("the job was stopped, but its file was not removed" if stop.stopped
-            else "its file was not removed")
+            else "its file was not removed (nothing was stopped)"
+            if kind is RemedyKind.LAUNCH_JOB else "its file was not removed")
     warnings = list(stop.warnings) + list(extra_warnings)
     if warnings:
         text += "; warning: " + "; ".join(warnings)

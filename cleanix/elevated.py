@@ -120,14 +120,15 @@ nothing in it beyond *identifiers*, and nothing in its environment:
     ignore case, so another spelling of the quarantine is never acted on.
     The root quarantine has no restore or purge yet: the UI must not offer
     Undo for its items.
-    Task 9b: system-wide launch jobs (``launchctl bootout system/<label>``
-    for /Library/LaunchDaemons; agents are not stopped), systemd units in
+    Task 9b: system-wide launch jobs (no command at all: their program is
+    missing; the plist is removed and launchd forgets the job at the next
+    restart / login), systemd units in
     /etc/systemd/system (``systemctl disable [--now]``, one
     ``daemon-reload`` per batch) and package receipts (``pkgutil
     --forget``) are always PERMANENT. Right before each one the helper
     re-checks it (``system_remedy.check``), its parent chain and the file
-    itself (root-owned, not group/world writable, one link, no ACL:
-    ``_system_file_problem``) and the detector's original evidence
+    itself (root-owned, not group/world writable, one link, no ACL, not
+    immutable or append-only: ``_system_file_problem``) and the detector's original evidence
     (``reverify``), then copies every file into a copy-only run of the
     root quarantine (prepared even in permanent mode; ``backup_run`` in
     the result), then runs the command (allowlisted system-scope argv,
@@ -1428,7 +1429,8 @@ def finding_kind_dirs():
 def _system_file_problem(path: str) -> Optional[str]:
     """Why a system-wide job / unit / receipt file must not be acted on as
     root: it must be a regular file (never a link), owned by root, not
-    group/world writable, with one link only and no access control list --
+    group/world writable, with one link only, no immutable/append-only
+    flag and no access control list --
     so nobody but root can rewrite it (e.g. its Label) between the re-check
     and the stop command. Fail closed."""
     try:
@@ -1443,6 +1445,11 @@ def _system_file_problem(path: str) -> Optional[str]:
         return f"{path} is writable by other users"
     if st.st_nlink != 1:
         return f"{path} has more than one link"
+    from cleanix.cleaners import orphan_common
+
+    problem = orphan_common.lock_flags_problem(path, st)
+    if problem:
+        return f"{path} {problem}"
     problem = _acl_problem(path)
     if problem:
         return f"{path} {problem}"

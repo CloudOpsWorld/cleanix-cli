@@ -180,7 +180,9 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
         label = data.get("Label")
         if not isinstance(label, str) or not oc.valid_ident(label):
             return {}
-        if label.startswith("com.apple.") or plist.name.startswith("com.apple."):
+        from cleanix.core.remedy_exec import is_apple
+
+        if is_apple(label) or is_apple(plist.name):  # any case
             return {}
         if oc.bad_name(plist.name) or plist.suffix != ".plist":
             return {}
