@@ -4,14 +4,17 @@ the user answers ``d`` (or ``g``) for it.
 The walk is category -> scenario group -> item. Deletions go through the
 ``act`` callable (``service.act`` in the CLI), so quarantine, the safety guard,
 history and the staleness re-checks are exactly those of ``clean --act-on``.
-``requires_root`` items are never offered here. For duplicate groups the copy
-that stays is chosen with ``keep`` and is never offered.
+``requires_root`` (system-wide) items are never acted on here: when the
+caller passes ``system``, the chosen ones are collected and handed to it once
+at the end (the CLI sends them to the elevated helper after one typed
+confirmation). For duplicate groups the copy that stays is chosen with
+``keep`` and is never offered.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from cleanix.core import findings
 from cleanix.core.curation import safety_of
@@ -30,12 +33,23 @@ def is_job(item: CleanableItem) -> bool:
     return item.remedy is not None and item.remedy.kind in remedy_exec.KINDS
 
 
-def undo_line(item: CleanableItem, permanent: bool) -> str:
-    """What acting on ``item`` does, by remedy kind (unescaped text)."""
-    if is_job(item):
-        from cleanix.core import quarantine, remedy_exec
+# Preview/prompt text for a user-level launch job / unit: the copy-only run
+# that will hold the backup does not exist yet, so no folder is named here
+# (the real one is printed after the run, see backup_line).
+JOB_PLANNED = ("permanent: the job is stopped and its file removed (a backup copy "
+               "is kept for manual recovery; its location is shown after the run)")
+PURGE_CMD = "cleanix quarantine empty"
 
-        return remedy_exec.planned_text(quarantine.quarantine_root())
+
+def undo_line(item: CleanableItem, permanent: bool) -> str:
+    """What acting on ``item`` does, by remedy kind (unescaped text).
+    System-wide items: never an Undo (see ``system_findings.what_happens``)."""
+    if item.requires_root:
+        from cleanix.core import system_findings
+
+        return system_findings.what_happens(item, permanent)
+    if is_job(item):
+        return JOB_PLANNED
     return ("permanent, no undo" if permanent else
             f"kept in quarantine; undo with `{RESTORE_CMD}`")
 
@@ -46,7 +60,8 @@ def backup_line(run_id: str) -> str:
 
     return (f"Copies of the removed job/service files are kept in "
             f"{quarantine.quarantine_root() / run_id / 'files'} for manual "
-            f"recovery; `{RESTORE_CMD}` does not bring them back.")
+            f"recovery; `{RESTORE_CMD}` does not bring them back, and "
+            f"`{PURGE_CMD}` deletes these copies too.")
 PROMPT = "  [d]elete  [s]kip  [g] delete rest of group  [n] skip rest of group  [q]uit  [?] "
 HELP = (
     "  d  delete this item\n"
@@ -70,6 +85,10 @@ class ReviewResult:
     undo_errors: List[str] = field(default_factory=list)
     quit: bool = False  # the user answered q
     aborted: bool = False  # Ctrl-C or end of input
+    # System-wide items the user chose (d/g): collected and handed to the
+    # ``system`` callback ONCE, at the end of the review or at q.
+    system_chosen: int = 0
+    system_code: int = 0  # the callback's exit code (0 ok, 1 abort, 2 error)
 
     @property
     def failed(self) -> bool:
@@ -118,7 +137,7 @@ def _describe(console, item: CleanableItem, category: str, undo: str,
         console.print(f"  hint:    {safe(item.hint)}")
     if survivor is not None:
         console.print(f"  keeps:   {safe(survivor)} (this copy stays)")
-    console.print(f"  [dim]if deleted: {undo}[/dim]")
+    console.print(f"  [dim]if deleted: {safe(undo)}[/dim]")
 
 
 def run(groups: List[findings.FindingGroup],
@@ -127,17 +146,35 @@ def run(groups: List[findings.FindingGroup],
         console,
         *, keep: Optional[str] = None,
         permanent: bool = False,
-        notes: Optional[List[str]] = None) -> ReviewResult:
+        notes: Optional[List[str]] = None,
+        system: Optional[Callable[[List[CleanableItem]], int]] = None,
+        system_plan=None) -> ReviewResult:
     """Walk ``groups`` asking about every item; apply each decision with
     ``act`` at once. Returns what was done (also printed as a summary).
-    ``notes`` are shown before the first prompt and again in the summary."""
+    ``notes`` are shown before the first prompt and again in the summary.
+
+    System-wide (``requires_root``) items are only reviewed when ``system``
+    and ``system_plan`` (``system_findings.SystemPlan``) are given: offered
+    items get the same per-item prompt, but a ``d``/``g`` only COLLECTS
+    them; ``system(chosen)`` is called once at the end of the review (or at
+    ``q``) -- one confirmation, one administrator prompt -- and returns an
+    exit code. Items that are not offered are listed with the reason. On
+    Ctrl-C / end of input the collected items are not acted on."""
     banner = list(notes or [])
     res = ReviewResult()
+    offered: Set[int] = set()
+    blocked: Dict[int, str] = {}
+    if system is not None and system_plan is not None:
+        offered = {id(i) for i in system_plan.offered}
+        blocked = {id(i): why for i, why in system_plan.not_offered}
+    pending: List[CleanableItem] = []
     # Plan every group up front: nothing is asked before the data is sound.
     plans: Dict[int, Tuple[List[CleanableItem], List[Tuple[CleanableItem, str]],
                            List[CleanableItem]]] = {}
     for gi, g in enumerate(groups):
-        its = [i for i in g.items if not i.requires_root]
+        its = [i for i in g.items if not i.requires_root or id(i) in offered]
+        not_offered = [(i, f"not offered: {blocked[id(i)]}") for i in g.items
+                       if i.requires_root and id(i) in blocked]
         dups = [i for i in its if i.remedy is not None and i.remedy.group]
         rest = [i for i in its if not (i.remedy is not None and i.remedy.group)]
         notes: List[Tuple[CleanableItem, str]] = []
@@ -150,7 +187,13 @@ def run(groups: List[findings.FindingGroup],
             kept = list(plan.kept)
             kept_ids = {id(k) for k in kept}
             notes = [(i, w) for i, w in plan.skipped if id(i) not in kept_ids]
-        plans[gi] = (rest, notes, kept)
+        plans[gi] = (rest, not_offered + notes, kept)
+
+    def queue(items: List[CleanableItem]) -> None:
+        pending.extend(items)
+        console.print(f"    [yellow]{len(items)} system-wide item(s) queued: they "
+                      "are acted on together, after one confirmation, at the end "
+                      "of the review[/yellow]")
 
     def decide(prompt: str) -> str:
         while True:
@@ -203,13 +246,30 @@ def run(groups: List[findings.FindingGroup],
                     res.declined += len(todo) - idx
                     break
                 elif ans == "d":
-                    _record(res, act([item]), console)
+                    if id(item) in offered:
+                        queue([item])
+                    else:
+                        _record(res, act([item]), console)
                     idx += 1
                 else:  # g
-                    _record(res, act(todo[idx:]), console)
+                    rest_items = todo[idx:]
+                    users = [x for x in rest_items if id(x) not in offered]
+                    systems = [x for x in rest_items if id(x) in offered]
+                    if users:
+                        _record(res, act(users), console)
+                    if systems:
+                        queue(systems)
                     break
     except _Stop:
         pass
+    if pending:
+        res.system_chosen = len(pending)
+        if res.aborted:
+            for i in pending:
+                res.skipped.append((i, "not done: the review was interrupted before "
+                                       "the system-wide batch"))
+        else:
+            res.system_code = int(system(list(pending)))  # type: ignore[misc]
     _print_summary(res, console, permanent, banner)
     return res
 
@@ -226,6 +286,9 @@ def _print_summary(res: ReviewResult, console, permanent: bool,
     console.print(f"[green]Removed {res.removed} item(s), freed "
                   f"{human_size(res.freed)}.[/green]  "
                   f"Left alone by you: {res.declined}.")
+    if res.system_chosen and not res.aborted:
+        console.print(f"System-wide items chosen: {res.system_chosen} (their "
+                      "outcome is listed above; they are not counted here).")
     for run_id in res.runs:
         r = safe(run_id)
         console.print(f"[cyan]Quarantine run '{r}':[/cyan] undo with "

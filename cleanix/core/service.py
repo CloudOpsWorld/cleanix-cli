@@ -218,9 +218,20 @@ def clean(
     manifest: Optional[str] = None
     run_id: Optional[str] = None
     if not dry_run and record_history and result.outcomes:
+        mode = "quarantine" if quarantine else "delete"
+        if quarantine is not None and delete_instead is not None:
+            # An act batch (actions.act): job/unit files are deleted (a copy
+            # kept), not moved into the quarantine. Record what really
+            # happened: only deletions -> "delete", both -> "mixed".
+            removed = [o for o in result.outcomes if o.removed]
+            deleted = sum(1 for o in removed if delete_instead(o.item))
+            if removed and deleted == len(removed):
+                mode = "delete"
+            elif deleted:
+                mode = "mixed"
         history.record(
             result.freed, result.removed_count,
-            mode="quarantine" if quarantine else "delete",
+            mode=mode,
             registry=sum(1 for o in result.outcomes
                          if o.removed and o.item.kind is ItemKind.REGISTRY),
         )

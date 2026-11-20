@@ -235,7 +235,10 @@ def test_act_on_skips_and_errors_reported_separately(tmp_path, monkeypatch, caps
     code, out = _run(capsys, "--act-on", "big_files", "--execute", "--yes")
     assert code == 0  # skips are not failures
     assert not ok.exists() and gone.exists() and sysf.exists()
-    assert "Needs an elevated run (not done here)" in out
+    # big_files is never a system-wide scenario of the helper (Task 10):
+    # listed as not offered, never acted on in-process
+    assert "System-wide items (need administrator rights)" in out
+    assert "sys.bin: not offered:" in out
     assert "Skipped 2 item(s)" in out and "changed since scan" in out
 
 

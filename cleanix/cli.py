@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -547,12 +548,173 @@ def _act_line(console: Console, item, action: str) -> None:
     console.print(f"              [dim]-> {action}[/dim]")
 
 
+# The launcher for the elevated helper (None: elevate_launch.launch_elevated,
+# i.e. pkexec / osascript; also when this process already runs as root).
+# A seam for tests: they inject a fake and never run a real elevation.
+_findings_launcher = None
+
+
+def _is_root_process() -> bool:
+    """Effective uid 0 on POSIX (Administrator on Windows); patchable."""
+    return is_root()
+
+
+def _batch_text(n_paths: int, n_jobs: int, permanent: bool, future: str) -> str:
+    """Per-kind wording of a user-space act batch (``future``: "would be" or
+    "will be"): file/folder findings are quarantined or deleted, launch
+    jobs / units are always stopped and removed permanently."""
+    parts = []
+    if n_paths:
+        parts.append(f"{n_paths} {future} "
+                     f"{'deleted permanently' if permanent else 'quarantined'}")
+    if n_jobs:
+        parts.append(f"{n_jobs} background job(s)/service(s) {future} stopped and "
+                     "removed permanently (a backup copy of each file is kept)")
+    return "; ".join(parts)
+
+
+def _list_not_offered(console: Console, not_offered) -> None:
+    for i, why in not_offered:
+        _act_line(console, i, safe(f"not offered: {why}"))
+
+
+def _system_listing(console: Console, items, permanent: bool) -> None:
+    """The batch listing shown before the typed confirmation."""
+    from cleanix.core import findings, system_findings
+
+    total = sum(i.size for i in items)
+    cats = sorted({findings.category_or_fallback(i.cleaner_id) for i in items})
+    console.print(
+        f"\n[bold red]System-wide items to act on with administrator rights: "
+        f"{len(items)} item(s), up to {human_size(total)}[/bold red]")
+    console.print(f"Categories: {safe(', '.join(cats))}")
+    for i in items:
+        _act_line(console, i, safe(system_findings.what_happens(i, permanent)))
+    console.print(
+        "[yellow]The administrator helper scans again itself and acts only on "
+        "items its own scan still reports. None of this can be undone from "
+        "Cleanix.[/yellow]")
+
+
+def _system_part(console: Console, items, *, permanent: bool, yes: bool,
+                 ask_phrase) -> int:
+    """Act on offered system-wide findings through the elevated helper:
+    ONE confirmation for the whole batch, ONE helper run. Returns an exit
+    code: 0 done (skips are fine), 1 the user aborted, 2 a real error.
+
+    Interactive: typing exactly ``DELETE SYSTEM FILES`` is required, unless
+    ``--yes`` was given AND this process is elevated. Without a terminal it
+    needs ``--yes`` and an elevated process; otherwise nothing is launched
+    and the items are reported as not done. Never acts in this process."""
+    from cleanix.core import elevate_launch as el
+    from cleanix.core import history, system_findings
+    from cleanix.core.models import item_key
+    from cleanix.core.report import helper_safe
+
+    items = list(items)
+    if not items:
+        return 0
+    _system_listing(console, items, permanent)
+    if not (yes and _is_root_process()):
+        if not _stdin_is_tty():
+            console.print("\n[yellow]System-wide items not done:[/yellow]")
+            for i in items:
+                console.print(f"  {safe(i.description)}: "
+                              f"{safe('not done: ' + system_findings.NOT_ELEVATED)}")
+            return 0
+        phrase = system_findings.CONFIRM_PHRASE
+        try:
+            answer = ask_phrase(
+                f"Type {phrase} to act on these {len(items)} system-wide item(s) "
+                "(anything else aborts): ")
+        except (EOFError, KeyboardInterrupt, OSError):
+            answer = None
+        if answer is None or answer.strip() != phrase:
+            console.print("Aborted: the system-wide items were not touched; "
+                          "nothing of them was removed.")
+            return 1
+
+    # No spinner here: the platform's password prompt may need the terminal.
+    console.print("Asking for administrator permission (one prompt)...")
+    try:
+        result = system_findings.run_batch(items, permanent,
+                                           launcher=_findings_launcher)
+    except ValueError as exc:
+        console.print(f"[red]The administrator request was not sent: "
+                      f"{helper_safe(exc)}. No prompt was shown; nothing was "
+                      "removed.[/red]")
+        return 2
+    except el.ElevationDeclined:
+        console.print("Administrator permission was declined; nothing was removed.")
+        return 1
+    except el.ElevationUnavailable as exc:
+        console.print(f"[red]Acting with administrator rights is not available "
+                      f"on this system ({helper_safe(exc)}); nothing was "
+                      "removed.[/red]")
+        return 2
+    except el.ElevationFailed as exc:
+        if getattr(exc, "exit_code", None) is None and "timed out" in str(exc).lower():
+            console.print(f"[red]The administrator helper timed out "
+                          f"({helper_safe(exc)}): the outcome is unknown and it "
+                          "may still be running. Scan again later to see what is "
+                          "left.[/red]")
+        else:
+            console.print(f"[red]The administrator helper failed "
+                          f"({helper_safe(exc)}): the outcome is unknown; some "
+                          "items may already have been removed. Scan again to "
+                          "see what is left.[/red]")
+        return 2
+
+    got = system_findings.outcomes_by_key(result)
+    console.print("\n[bold]Administrator helper results:[/bold]")
+    for i in items:
+        console.print(f"  {safe(i.description)}  [dim]{safe(i.path or '')}[/dim]")
+        o = got.get(item_key(i))
+        for line in system_findings.outcome_lines(i, o, permanent):
+            console.print(f"      {helper_safe(line)}")
+    if not result.findings and result.errors:
+        console.print("[red]The administrator helper refused the request:[/red]")
+        for e in result.errors[:10]:
+            console.print(f"  {helper_safe(e)}")
+    qdir = system_findings.root_quarantine_dir()
+    console.print(f"[green]Administrator helper: removed {result.removed} "
+                  f"item(s), freed {human_size(result.freed)}.[/green]")
+    if result.quarantine_run:
+        console.print(
+            f"[cyan]Moved into the root-only quarantine run "
+            f"'{helper_safe(result.quarantine_run)}' in {helper_safe(qdir)}.[/cyan] "
+            "You cannot restore from it yet (Cleanix has no restore or purge for "
+            "it), and the space is not freed until it is purged.")
+    if result.backup_run:
+        where = posixpath.join(qdir, result.backup_run, "files")
+        console.print(
+            f"[cyan]Copies of the removed job/service/receipt files are kept in "
+            f"{helper_safe(where)} for manual recovery (root-only; this is not an "
+            "undo).[/cyan]")
+    if result.deadline_hit:
+        console.print("[red]The administrator helper reached its time limit; "
+                      "some items were not processed.[/red]")
+        if any(system_findings._kind(i) == "systemd_unit" for i in items):
+            console.print("[yellow]If service units were removed, run "
+                          "`systemctl daemon-reload` as root.[/yellow]")
+    if system_findings.nothing_removed(result):
+        console.print("Nothing was removed by the administrator helper.")
+    elif result.removed:
+        try:
+            history.record(result.freed, result.removed, mode="administrator")
+        except Exception:  # noqa: BLE001 - history is best-effort
+            pass
+    return 2 if system_findings.batch_failed(result, items) else 0
+
+
 def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
     """`clean --act-on`: act on report-only findings the user named.
 
     Preview by default; --execute acts (one confirmation unless --yes).
-    Quarantine unless --permanent. Scans only the named scenarios."""
-    from cleanix.core import findings, review, service
+    Quarantine unless --permanent. Scans only the named scenarios.
+    System-wide findings are acted on after the user-space batch, by the
+    elevated helper, after one typed confirmation (see _system_part)."""
+    from cleanix.core import findings, review, service, system_findings
 
     for attr, flag in _ACT_ON_CONFLICTS:
         val = getattr(args, attr, None)
@@ -588,6 +750,7 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
         return 0
 
     root_items = [i for i in all_items if i.requires_root]
+    splan = system_findings.plan(root_items)
     rest = [i for i in all_items if not i.requires_root]
     dups = [i for i in rest if i.remedy is not None and i.remedy.group]
     dup_ids = {id(i) for i in dups}
@@ -646,39 +809,55 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
                     action += f" (keeps {safe(kept.path)})"
                 _act_line(console, i, action)
     if root_items:
-        console.print("\n[yellow]Needs an elevated run (not done here)[/yellow]")
-        for i in root_items:
-            _act_line(console, i, "not done here: needs an elevated run")
+        console.print("\n[bold yellow]System-wide items (need administrator "
+                      "rights)[/bold yellow]")
+        for i in splan.offered:
+            _act_line(console, i, safe(system_findings.what_happens(i, permanent)))
+        _list_not_offered(console, splan.not_offered)
 
     total = sum(i.size for i in eligible)
-    if not eligible:
+    sys_items = list(splan.offered)
+    if not eligible and not sys_items:
         console.print("\nNothing can be acted on right now.")
         return 0
     n_jobs = sum(1 for i in eligible if review.is_job(i))
-    jobs_text = (f" {n_jobs} of them are background jobs/services: stopped and "
-                 "removed permanently (a copy of each file is kept)."
-                 if n_jobs else "")
+    n_paths = len(eligible) - n_jobs
+    sys_text = ""
+    if sys_items:
+        sys_text = (f" Plus {len(sys_items)} system-wide item(s), up to "
+                    f"{human_size(sum(i.size for i in sys_items))}: acted on "
+                    "afterwards by the administrator helper, after typing "
+                    f"{system_findings.CONFIRM_PHRASE}.")
     if not args.execute:
-        console.print(
-            f"\n[yellow]Preview: {len(eligible)} item(s), up to "
-            f"{human_size(total)}, would be "
-            f"{'deleted' if permanent else 'quarantined'}.{jobs_text}[/yellow]")
+        if eligible:
+            console.print(
+                f"\n[yellow]Preview: {len(eligible)} item(s), up to "
+                f"{human_size(total)}: "
+                f"{_batch_text(n_paths, n_jobs, permanent, 'would be')}."
+                f"{safe(sys_text)}[/yellow]")
+        else:
+            console.print(f"\n[yellow]Preview:{safe(sys_text)}[/yellow]")
         console.print("[dim]This was a dry run. Add [bold]--execute[/bold] to "
                       "act on these items.[/dim]")
         return 0
 
-    if not args.yes:
+    if not args.yes and not _stdin_is_tty():
         console.print()
-        if not _stdin_is_tty():
-            console.print(
-                "[red]Refusing to act without a terminal to confirm in; pass "
-                "--yes to proceed. Nothing was changed.[/red]")
-            return 2
+        console.print(
+            "[red]Refusing to act without a terminal to confirm in; pass "
+            "--yes to proceed. Nothing was changed.[/red]")
+        for i in sys_items:
+            console.print(f"  {safe(i.description)}: "
+                          f"{safe('not done: ' + system_findings.NOT_ELEVATED)}")
+        return 2
+    if eligible and not args.yes:
+        console.print()
         try:
             confirmed = Confirm.ask(
-                f"{'Permanently delete' if permanent else 'Quarantine'} "
-                f"{len(eligible)} item(s), up to {human_size(total)}?"
-                f"{jobs_text}",
+                f"Act on {len(eligible)} item(s), up to {human_size(total)}? "
+                f"{_batch_text(n_paths, n_jobs, permanent, 'will be')}."
+                + (" (System-wide items are confirmed separately afterwards.)"
+                   if sys_items else ""),
                 default=False)
         except (EOFError, OSError):
             console.print(
@@ -688,6 +867,19 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
         if not confirmed:
             console.print("Aborted. Nothing was changed.")
             return 1
+
+    def ask_phrase(prompt: str) -> str:
+        return Prompt.ask(prompt.rstrip(": "))
+
+    if not eligible:
+        code = _system_part(console, sys_items, permanent=permanent,
+                            yes=bool(args.yes), ask_phrase=ask_phrase)
+        if splan.not_offered:
+            console.print(f"\n[yellow]Not offered {len(splan.not_offered)} "
+                          "system-wide item(s):[/yellow]")
+            for i, why in splan.not_offered:
+                console.print(f"  {safe(i.description)}: {safe('not offered: ' + why)}")
+        return code
 
     with console.status("Working..."):
         summary = service.act(to_act, config, dry_run=False, permanent=permanent)
@@ -712,7 +904,7 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
             console.print(f"  {safe(o.item.description)}: {safe(o.note)}")
     skipped = [(i, w) for i, w in plan_skipped if id(i) not in kept_ids]
     skipped += list(summary.skipped)
-    skipped += [(i, "needs an elevated run (not done here)") for i in root_items]
+    skipped += [(i, f"not offered: {why}") for i, why in splan.not_offered]
     if skipped:
         console.print(f"\n[yellow]Skipped {len(skipped)} item(s):[/yellow]")
         for i, why in skipped:
@@ -722,15 +914,23 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
     for o in summary.errors:
         console.print(
             f"  [red]![/red] {safe(o.item.description)}: {safe(o.error)}")
+    user_failed = bool(summary.errors or summary.undo_record_error)
+    # The user-space part is done (and stays done) before the system part.
+    sys_code = _system_part(console, sys_items, permanent=permanent,
+                            yes=bool(args.yes), ask_phrase=ask_phrase)
     # Same convention as plain `clean`: 2 on real errors, 1 only for a user
-    # abort (above), 0 for success (skips are not failures).
-    return 2 if summary.errors or summary.undo_record_error else 0
+    # abort, 0 for success (skips are not failures).
+    if user_failed or sys_code == 2:
+        return 2
+    return sys_code
 
 
 def cmd_review(args: argparse.Namespace, console: Console) -> int:
     """`review`: walk findings one item at a time; delete only on an explicit
-    `d` (or `g`) per item. Needs a terminal."""
-    from cleanix.core import findings, review, service
+    `d` (or `g`) per item. Needs a terminal. System-wide items chosen with
+    d/g are collected and acted on once, at the end, by the elevated helper
+    after one typed confirmation."""
+    from cleanix.core import findings, review, service, system_findings
 
     config = _load_config()
     targets = list(getattr(args, "targets", None) or [])
@@ -766,10 +966,12 @@ def cmd_review(args: argparse.Namespace, console: Console) -> int:
     _scope_note(console)
     scan = _scan(engine, console)
     groups = findings.group_findings(scan)
-    groups = [g for g in groups if any(not i.requires_root for i in g.items)]
+    groups = [g for g in groups if g.items]
     if not groups:
         console.print("[green]Nothing found to review.[/green]")
         return 0
+    splan = system_findings.plan([i for g in groups for i in g.items
+                                  if i.requires_root])
     notes: List[str] = []
     if not keep:
         # Only reachable without named scenarios (naming duplicates without
@@ -794,11 +996,17 @@ def cmd_review(args: argparse.Namespace, console: Console) -> int:
     def act(items):
         return service.act(items, config, dry_run=False, permanent=permanent)
 
+    def system(items) -> int:
+        # Once, at the end of the review (or at q): one typed confirmation,
+        # one administrator prompt. review has no --yes: always typed.
+        return _system_part(console, items, permanent=permanent, yes=False,
+                            ask_phrase=ask)
+
     res = review.run(groups, ask, act, console, keep=keep, permanent=permanent,
-                     notes=notes)
-    if res.failed:
+                     notes=notes, system=system, system_plan=splan)
+    if res.failed or res.system_code == 2:
         return 2
-    return 1 if res.aborted else 0
+    return 1 if res.aborted or res.system_code == 1 else 0
 
 
 def cmd_clean(args: argparse.Namespace, console: Console) -> int:

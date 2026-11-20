@@ -312,12 +312,15 @@ def test_review_duplicates_require_keep(tmp_path, monkeypatch, capsys):
 
 
 def test_review_never_offers_root_items(tmp_path, monkeypatch, capsys):
+    # Task 10: a system-wide item the helper never acts on (big_files is not
+    # one of its scenarios; Windows: not supported) is listed as "not
+    # offered" with the reason, never prompted for and never touched.
     user = _file(tmp_path, "u.bin", b"u")
     sysf = _file(tmp_path, "sys.bin", b"s")
     _patch_scan(monkeypatch, [_finding(user), _finding(sysf, requires_root=True)])
     code, out, ask = _cli(monkeypatch, capsys, ["d", "d"], "big_files")
     assert len(ask.asked) == 1 and sysf.exists() and not user.exists()
-    assert "sys.bin" not in out
+    assert "sys.bin: not offered:" in out
 
 
 def test_review_permanent_wording(tmp_path, monkeypatch, capsys):

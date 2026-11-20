@@ -707,10 +707,12 @@ def test_cli_act_on_wording_notes_and_restore(cli_env, capsys):
 
     code, out = _cli(env, capsys, "clean", "--act-on", "big_files,orphan_launch_jobs")
     assert code == 0 and p.exists() and env.rec.calls == []
-    planned = " ".join(remedy_exec.planned_text(env.q).split())
-    assert planned in out  # the job's line: permanent, copy kept
+    from cleanix.core import review
+
+    assert review.JOB_PLANNED in out  # the job's line: permanent, copy kept
     assert "kept in quarantine; undo with `cleanix restore`" in out  # the path's line
-    assert "1 of them are background jobs/services: stopped and removed permanently" in out
+    assert ("1 would be quarantined; 1 background job(s)/service(s) would be "
+            "stopped and removed permanently") in out
 
     env.rec.result = (5, "", "Boot-out failed: 5: Input/output error")
     code, out = _cli(env, capsys, "clean", "--act-on", "big_files,orphan_launch_jobs",
@@ -723,6 +725,8 @@ def test_cli_act_on_wording_notes_and_restore(cli_env, capsys):
     assert f"cleanix restore {brun}" not in out
     assert "Copies of the removed job/service files are kept in" in out and brun in out
     assert "Notes on 1 item(s)" in out and "exit 5" in out and "warning" in out
+    # carry-over b: a path quarantined + a job file deleted is a "mixed" run
+    assert [e["mode"] for e in history.load()][-1] == "mixed"
 
     # No-arg restore takes the path run, never the copy-only run.
     code, out = _cli(env, capsys, "restore")
@@ -735,10 +739,16 @@ def test_cli_act_on_jobs_only_prints_no_restore_hint(cli_env, capsys):
     env = cli_env
     p, item = _job_item(env)
     env.scan_gives([item])
+    # jobs only: the headline never says "quarantined" (carry-over c)
+    code, out = _cli(env, capsys, "clean", "--act-on", "orphan_launch_jobs")
+    assert code == 0 and p.exists() and "quarantined" not in out
+    assert ("1 background job(s)/service(s) would be stopped and removed "
+            "permanently") in out
     code, out = _cli(env, capsys, "clean", "--act-on", "orphan_launch_jobs",
                      "--execute", "--yes")
     assert code == 0 and not p.exists()
     assert "cleanix restore" in out  # only inside "does not bring them back"
+    assert [e["mode"] for e in history.load()][-1] == "delete"
     assert "undo with" not in out and "Quarantine run" not in out
     assert "does not bring them back" in out and "Notes on 1 item(s)" in out
 
@@ -758,7 +768,7 @@ def test_review_wording_and_notes_for_jobs(env):
                      lambda its: actions.act(its, Config(), dry_run=False), c)
     out = " ".join(c.export_text().split())
     assert res.removed == 1 and not p.exists()
-    assert " ".join(remedy_exec.planned_text(env.q).split()) in out  # the prompt
+    assert review.JOB_PLANNED in out  # the prompt names no folder yet
     assert "kept in quarantine" not in out and "undo with" not in out
     assert res.backups and "does not bring them back" in out
     assert "Notes on 1 item(s)" in out and "exit 5" in out
