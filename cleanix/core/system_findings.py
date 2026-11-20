@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from cleanix.core.models import CleanableItem, item_key
+from cleanix.core.quarantine import CROSS_FILESYSTEM_QUARANTINE
 
 # The phrase an interactive user types to act on a batch of system-wide items.
 CONFIRM_PHRASE = "DELETE SYSTEM FILES"
@@ -35,18 +36,48 @@ NOT_ALLOWLISTED = "the administrator helper does not act on this scenario"
 KIND_NOT_HERE = "this kind of finding is not handled with administrator rights on this system"
 NO_FINGERPRINT = "it has no evidence fingerprint to re-check it by"
 LISTED_TWICE = "listed twice"
-NOT_ELEVATED = ("needs an elevated run (run as root with --yes, or in a terminal "
-                "to confirm)")
+NOT_ELEVATED = ("needs a terminal to type the confirmation in (system-wide items "
+                "are never acted on without it)")
 SETTINGS_MISMATCH = ("the administrator scan did not report this item (it uses "
                      "default settings, e.g. orphan_min_age_days / orphan_max_items, "
                      "so a changed setting can hide items)")
 NOT_REPORTED = "the administrator helper did not report on it; nothing is known about it"
-CROSS_FILESYSTEM = "another filesystem"
-CROSS_FILESYSTEM_HINT = (
-    "It is on another filesystem than the administrator quarantine, so it cannot "
-    "be moved there. To remove it anyway, run again with --permanent: that DELETES "
-    "it permanently, with no undo and no copy kept (--permanent applies to every "
-    "item of that run, so name only the items you mean).")
+# The quarantine's own wording (quarantine.CROSS_FILESYSTEM_QUARANTINE) and
+# nothing else: a refused permanent deletion that mentions "another
+# filesystem" (root_delete) is a real failure, not this limitation.
+CROSS_FILESYSTEM = CROSS_FILESYSTEM_QUARANTINE
+
+# How each front end says "delete permanently" in the hint below.
+CLI_PERMANENT = "run again with --permanent"
+CLI_PERMANENT_SCOPE = ("--permanent applies to every item of that run, so name "
+                       "only the items you mean")
+GUI_PERMANENT = "tick 'Delete permanently (no Undo)' and act on it again"
+GUI_PERMANENT_SCOPE = ("that setting applies to every item you act on, so select "
+                       "only the items you mean")
+
+
+def cross_filesystem_hint(how: str = CLI_PERMANENT,
+                          scope: str = CLI_PERMANENT_SCOPE) -> str:
+    """The advice for an item on another filesystem than the administrator
+    quarantine; ``how``/``scope`` name the caller's own control."""
+    return ("It is on another filesystem than the administrator quarantine, so it "
+            f"cannot be moved there. To remove it anyway, {how}: that DELETES it "
+            f"permanently, with no undo and no copy kept ({scope}).")
+
+
+CROSS_FILESYSTEM_HINT = cross_filesystem_hint()
+
+# -- beta gate ----------------------------------------------------------------
+# System-wide acting is a beta feature, OFF unless this is exactly "1".
+BETA_ENV = "CLEANIX_BETA_SYSTEM_ACTIONS"
+BETA_OFF = ("system-wide actions are a beta feature not yet verified on real "
+            "systems; set CLEANIX_BETA_SYSTEM_ACTIONS=1 to enable (see "
+            "docs/findings-verification.md)")
+RUN_AS_USER = ("run cleanix as your normal user; it asks for administrator "
+               "rights itself")
+FROZEN_BINARY = ("the standalone binary cannot start the administrator helper; "
+                 "install with pip/pipx to act on system-wide findings")
+TOO_LARGE = "the administrator request would be too large; run again for the rest"
 
 _FP_MIN = -(2 ** 63)
 _FP_MAX = 2 ** 64
@@ -105,11 +136,85 @@ def _item_problem(item: CleanableItem, ctx) -> Optional[str]:
     return None
 
 
+def is_frozen() -> bool:
+    """A standalone (PyInstaller) binary: it cannot start the helper
+    (``python -I -m cleanix.elevated``). A seam for tests."""
+    import sys
+
+    return bool(getattr(sys, "frozen", False))
+
+
+def euid_is_root() -> bool:
+    """POSIX effective uid 0 (never true on Windows). A seam for tests."""
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def beta_enabled() -> bool:
+    return os.environ.get(BETA_ENV) == "1"
+
+
+def gate_problem() -> Optional[str]:
+    """Why no system-wide item may be offered at all in this process, or
+    None. The single client-side gate (CLI ``--act-on``, ``review`` and the
+    GUI all plan through :func:`plan`); the helper is not gated."""
+    if is_frozen():
+        return FROZEN_BINARY
+    if euid_is_root():
+        return RUN_AS_USER
+    if not beta_enabled():
+        return BETA_OFF
+    return None
+
+
+def _request_size(items: Sequence[CleanableItem]) -> int:
+    """Bytes of the request the helper would be sent for ``items`` (the
+    larger of the two ``permanent`` spellings)."""
+    from cleanix.core import elevate
+
+    sizes = []
+    for permanent in (False, True):
+        sel = elevate.Selection(
+            invoking_user=invoking_user_name(), only=[], keys=[], use_quarantine=False,
+            findings=elevate.findings_request_for(list(items), permanent=permanent))
+        sizes.append(len(elevate.request_bytes(sel)))
+    return max(sizes)
+
+
+def _fit_request(out: SystemPlan) -> None:
+    """Move offered items that would make the request too large (the
+    helper refuses it, after the typed phrase) to ``not_offered``. Never
+    raises: when the size cannot be computed nothing is offered."""
+    from cleanix.core import elevate
+
+    offered = out.offered
+    try:
+        if not offered or _request_size(offered) <= elevate.MAX_REQUEST_BYTES:
+            return
+        lo, hi = 0, len(offered)  # largest prefix that fits
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _request_size(offered[:mid]) <= elevate.MAX_REQUEST_BYTES:
+                lo = mid
+            else:
+                hi = mid - 1
+    except Exception:  # noqa: BLE001 - fail closed
+        out.not_offered.extend((i, CANNOT_CHECK) for i in offered)
+        out.offered = []
+        return
+    out.not_offered.extend((i, TOO_LARGE) for i in offered[lo:])
+    out.offered = offered[:lo]
+
+
 def plan(items: Sequence[CleanableItem]) -> SystemPlan:
     """Split system-wide findings into those the helper may be asked to act
     on and those it never would (with the reason). Mirrors, per item, the
     caller-side checks of ``elevate_launch.run_findings_request`` and the
-    request limits. Never raises: on doubt an item is not offered."""
+    request limits (count, scenarios and the serialized size). Never
+    raises: on doubt an item is not offered.
+
+    The beta gate (:func:`gate_problem`) applies first: in a frozen binary,
+    in a root process, or unless ``CLEANIX_BETA_SYSTEM_ACTIONS=1``, NOTHING
+    is offered."""
     from cleanix import elevated
     from cleanix.core import elevate
 
@@ -121,6 +226,13 @@ def plan(items: Sequence[CleanableItem]) -> SystemPlan:
         supported = False
     if not supported:
         out.not_offered = [(i, NOT_ON_WINDOWS) for i in items]
+        return out
+    try:
+        gate = gate_problem()
+    except Exception:  # noqa: BLE001 - fail closed
+        gate = CANNOT_CHECK
+    if gate is not None:
+        out.not_offered = [(i, gate) for i in items]
         return out
     try:
         ctx = (frozenset(elevated.admin_finding_ids()), elevated.finding_path_roots(),
@@ -152,6 +264,7 @@ def plan(items: Sequence[CleanableItem]) -> SystemPlan:
         if item.cleaner_id not in scenarios:
             scenarios.append(item.cleaner_id)
         out.offered.append(item)
+    _fit_request(out)
     return out
 
 
@@ -253,9 +366,13 @@ def is_cross_filesystem(outcome) -> bool:
             and CROSS_FILESYSTEM in (outcome.reason or ""))
 
 
-def outcome_lines(item: CleanableItem, outcome, permanent: bool) -> List[str]:
+def outcome_lines(item: CleanableItem, outcome, permanent: bool, *,
+                  cross_fs_hint: str = CROSS_FILESYSTEM_HINT) -> List[str]:
     """Plain lines for one item's helper outcome (helper text included:
-    print them with ``report.helper_safe``)."""
+    print them with ``report.helper_safe``). ``cross_fs_hint``: the advice
+    for an item on another filesystem than the administrator quarantine,
+    naming the caller's own "delete permanently" control (default: the
+    CLI's ``--permanent``)."""
     from cleanix.core.utils import human_size
 
     if outcome is None:
@@ -277,7 +394,7 @@ def outcome_lines(item: CleanableItem, outcome, permanent: bool) -> List[str]:
         if outcome.freed:
             lines.append(f"{human_size(outcome.freed)} were freed before it stopped")
         if is_cross_filesystem(outcome):
-            lines.append(CROSS_FILESYSTEM_HINT)
+            lines.append(cross_fs_hint)
     elif status == "skipped":
         lines.append(f"skipped: {outcome.reason or 'no reason given'}")
     elif status == "refused":

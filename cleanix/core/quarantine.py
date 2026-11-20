@@ -29,6 +29,10 @@ from cleanix.core.utils import path_size
 _ERROR_NOT_SAME_DEVICE = 17  # Windows winerror for a cross-volume rename
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
+# The one spelling of "cannot be moved into the administrator quarantine
+# because it is on another filesystem" (system_findings matches exactly this).
+CROSS_FILESYSTEM_QUARANTINE = "on another filesystem than the administrator quarantine"
+
 
 def _rename(src: str, dst: str) -> None:
     """os.rename indirection (tests force the cross-volume fallback)."""
@@ -251,8 +255,8 @@ class Quarantine:
                     pass
                 if _is_cross_volume(exc):
                     raise OSError(
-                        "it is on another filesystem than the administrator "
-                        "quarantine; nothing was moved (delete it permanently instead)"
+                        f"it is {CROSS_FILESYSTEM_QUARANTINE}; nothing was moved "
+                        "(delete it permanently instead)"
                     ) from None
                 raise
             return

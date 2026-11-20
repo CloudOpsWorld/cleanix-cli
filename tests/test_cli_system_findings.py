@@ -29,6 +29,10 @@ from cleanix.core import (
 from cleanix.core.models import CleanableItem, CleanerReport, item_key
 from cleanix.core.remedy import Remedy, RemedyKind, path_remedy
 
+# The system-wide path is behind the beta gate (system_findings.gate_problem):
+# these tests opt in to it explicitly (tests/conftest.py beta_system_actions).
+pytestmark = pytest.mark.usefixtures("beta_system_actions")
+
 PHRASE = "DELETE SYSTEM FILES"
 ROOTS = {
     "orphan_files": ("/opt", "/usr/local", "/var/lib", "/var/cache"),
@@ -213,7 +217,8 @@ def test_system_items_skipped_without_elevation(tmp_path, monkeypatch, capsys):
     # Non-interactive, no --yes: refused as before, nothing done, no launch.
     code, out = _run(capsys, "--act-on", "big_files,orphan_files", "--execute")
     assert code == 2 and launch.calls == [] and p.exists()
-    assert "not done: needs an elevated run" in out and "Nothing was changed" in out
+    assert "not done: needs a terminal to type the confirmation" in out
+    assert "Nothing was changed" in out
 
 
 def test_typed_confirmation_wrong_text_aborts(tmp_path, monkeypatch, capsys):
@@ -267,7 +272,9 @@ def test_yes_without_elevation_skips_system_but_runs_user(tmp_path, monkeypatch,
     code, out = _run(capsys, "--act-on", "big_files,orphan_files", "--execute", "--yes")
     assert code == 0 and not p.exists()  # the user part ran
     assert launch.calls == [] and asked == []  # never prompts without a TTY
-    assert "not done: needs an elevated run" in out
+    assert "not done: needs a terminal to type the confirmation" in out
+    # M2: exit 0, but the not-done list is announced prominently
+    assert "1 system-wide item(s) NOT done" in out
     assert len(quarantine.list_runs()) == 1
 
 
@@ -830,7 +837,9 @@ def test_preview_and_non_tty_wording(tmp_path, monkeypatch, capsys):
     _patch_scan(monkeypatch, [_sys()])
     monkeypatch.setattr(cli, "_is_root_process", lambda: True)
     code, out = _run(capsys, "--act-on", "orphan_files", "--yes")
-    assert "after typing" not in out and "no typed confirmation" in out
+    # A root process is never offered system-wide items (beta gate), so the
+    # preview never promises a root shortcut past the typed phrase.
+    assert f"after typing {PHRASE}" in out and "no typed confirmation" not in out
     monkeypatch.setattr(cli, "_is_root_process", lambda: False)
     code, out = _run(capsys, "--act-on", "orphan_files")
     assert f"after typing {PHRASE}" in out
@@ -839,7 +848,7 @@ def test_preview_and_non_tty_wording(tmp_path, monkeypatch, capsys):
     _patch_scan(monkeypatch, [user, _sys()])
     code, out = _run(capsys, "--act-on", "big_files,orphan_files", "--execute", "--yes")
     assert code == 0 and "to act on with administrator rights" not in out
-    assert "not done: needs an elevated run" in out
+    assert "not done: needs a terminal to type the confirmation" in out
     # executing lists each offered item in full only once
     monkeypatch.setattr(cli, "_is_root_process", lambda: True)
     _patch_scan(monkeypatch, [_sys("/opt/only-once")])

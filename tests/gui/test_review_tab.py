@@ -28,6 +28,10 @@ from cleanix.core import (  # noqa: E402
     safety, service, system_findings,
 )
 from cleanix.core.models import CleanableItem, CleanerReport, ScanResult, item_key  # noqa: E402
+
+# The system-wide path is behind the beta gate (system_findings.gate_problem):
+# these tests opt in to it explicitly (tests/conftest.py beta_system_actions).
+pytestmark = pytest.mark.usefixtures("beta_system_actions")
 from cleanix.core.remedy import CHANGED, Remedy, RemedyKind, path_remedy  # noqa: E402
 from cleanix.gui import findings_act, review_view, workers  # noqa: E402
 from cleanix.gui.review_tab import DEEP_TEXT, SCAN_TEXT, ReviewTab, finding_scan_ids  # noqa: E402

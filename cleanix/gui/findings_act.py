@@ -41,6 +41,10 @@ from cleanix.core.remedy import RemedyKind
 from cleanix.core.utils import human_size
 
 CONFIRM_PHRASE = system_findings.CONFIRM_PHRASE
+# The GUI's own "delete permanently" control (the Review tab's
+# "Delete permanently (no Undo)" box), never the CLI's --permanent.
+GUI_CROSS_FS_HINT = system_findings.cross_filesystem_hint(
+    system_findings.GUI_PERMANENT, system_findings.GUI_PERMANENT_SCOPE)
 
 NONE_REMOVED = "none of the system-wide items was removed"
 NOT_USER_ITEM = ("a system-wide item is only acted on by the administrator helper; "
@@ -457,7 +461,8 @@ def _system_lines(out: ActOutcome) -> List[str]:
     lines.append("System-wide items (administrator helper):")
     for i in items:
         lines.append(f"  {shown(i.description)}  ({shown(i.path or '')})")
-        for line in system_findings.outcome_lines(i, got.get(item_key(i)), plan.permanent):
+        for line in system_findings.outcome_lines(i, got.get(item_key(i)), plan.permanent,
+                                                  cross_fs_hint=GUI_CROSS_FS_HINT):
             lines.append(f"      {helper_text(line)}")
     if not res.findings and res.errors:
         lines.append("The administrator helper refused the request:")

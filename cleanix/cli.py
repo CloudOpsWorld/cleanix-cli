@@ -630,8 +630,11 @@ def _system_part(console: Console, items, *, permanent: bool, yes: bool,
     if not items:
         return 0
     if not (yes and _is_root_process()) and not _stdin_is_tty():
-        # Nothing will be done: no banner, just say so per item.
-        console.print("\n[yellow]System-wide items not done:[/yellow]")
+        # Nothing will be done: say so prominently, per item. Not an error
+        # (exit 0): they need a terminal for the typed confirmation.
+        console.print(f"\n[bold yellow]{len(items)} system-wide item(s) NOT done "
+                      "(no terminal to type the confirmation in; run again in a "
+                      "terminal to act on them):[/bold yellow]")
         for i in items:
             console.print(f"  {safe(i.description)}: "
                           f"{safe('not done: ' + system_findings.NOT_ELEVATED)}")
@@ -878,9 +881,9 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
     n_paths = len(eligible) - n_jobs
     sys_text = ""
     if sys_items:
-        how = ("after one administrator prompt (--yes in a root process: no "
-               "typed confirmation)" if args.yes and _is_root_process() else
-               f"after typing {system_findings.CONFIRM_PHRASE}")
+        # (A root process is never offered system-wide items: see
+        # system_findings.gate_problem.)
+        how = f"after typing {system_findings.CONFIRM_PHRASE}"
         sys_text = (f" Plus {len(sys_items)} system-wide item(s), up to "
                     f"{human_size(sum(i.size for i in sys_items))}: acted on "
                     f"afterwards by the administrator helper, {how}.")

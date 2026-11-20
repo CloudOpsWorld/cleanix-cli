@@ -341,6 +341,13 @@ def make_request_dir() -> Path:
 
 
 def write_request(directory: Path, selection: Selection) -> Path:
+    path = Path(directory) / REQUEST_NAME
+    _atomic_write(path, request_bytes(selection), 0o600)
+    return path
+
+
+def request_bytes(selection: Selection) -> bytes:
+    """The exact bytes :func:`write_request` writes for ``selection``."""
     payload = {
         "version": FORMAT_VERSION,
         "invoking_user": selection.invoking_user,
@@ -365,9 +372,7 @@ def write_request(directory: Path, selection: Selection) -> Path:
                        "kind": s.kind} for s in fnd.items],
             "permanent": bool(fnd.permanent),
         }
-    path = Path(directory) / REQUEST_NAME
-    _atomic_write(path, json.dumps(payload).encode("utf-8"), 0o600)
-    return path
+    return json.dumps(payload).encode("utf-8")
 
 
 def _str_list(value, name: str, pattern=None, max_len: int = MAX_KEY_LEN) -> List[str]:

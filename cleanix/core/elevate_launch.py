@@ -191,6 +191,12 @@ def run_findings_request(findings, invoking_user: str, *,
 
     if not elevated._findings_supported():
         raise ValueError(elevated.FINDINGS_NOT_SUPPORTED)
+    if getattr(sys, "frozen", False):
+        # elevated_command runs `sys.executable -I -m cleanix.elevated`; in a
+        # standalone binary that is the cleanix binary itself, which refuses
+        # -I: never ask for the password for a helper that cannot start.
+        raise ValueError("the standalone binary cannot start the administrator "
+                         "helper; install with pip/pipx to act on system-wide findings")
     allowed = elevated.admin_finding_ids()
     if not findings.only or any(c not in allowed for c in findings.only):
         raise ValueError("the request names a scenario the administrator helper does not act on")
