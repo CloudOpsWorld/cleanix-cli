@@ -55,6 +55,8 @@ BLOCKED = "blocked by safety guard (protected path)"
 NO_SURVIVOR = "duplicate copy without a chosen copy to keep; nothing removed"
 KEEPS_COPY = "it is, or contains, the copy kept of a duplicate group"
 LISTED_TWICE = "listed twice"
+STOPPED_AT_DEADLINE = ("the time limit was reached while it was being re-checked; "
+                       "nothing was done")
 
 
 @dataclass
@@ -321,6 +323,10 @@ def act(
     todo: List[Tuple[int, CleanableItem]] = []
     seen: Set[str] = set()
     for idx, item in enumerate(items):
+        if root_mode and cancel is not None and cancel():
+            # The helper's deadline passed while verifying: the rest is left
+            # unprocessed (neither skipped nor acted on), as an Engine cancel.
+            break
         key = path_key(item.path) if item.path else None
         if key is not None and key in seen:
             reason: Optional[str] = LISTED_TWICE
@@ -391,6 +397,10 @@ def act(
                         why = _recheck(finding, config)
                         if why is None:
                             why = run_extra_check(finding, reverify.REMOVAL)
+                        if why is None and root_mode and cancel is not None and cancel():
+                            # the deadline passed during its own re-check:
+                            # never removed after the deadline
+                            why = STOPPED_AT_DEADLINE
                 except Exception as exc:  # noqa: BLE001 - fail closed
                     why = f"could not be verified ({str(exc) or type(exc).__name__})"
             if why is not None:

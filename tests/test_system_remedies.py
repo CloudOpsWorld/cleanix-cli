@@ -53,15 +53,16 @@ def put(base: Path, rel: str, text: str = "x") -> Path:
 
 
 class Dpkg:
-    """A fake dpkg behind ``oc.run``: ``owned`` paths are owned, every other
-    queried path is reported unowned; ``rc`` forces an unknown answer."""
+    """A fake package manager behind ``oc.run`` (dpkg by default; also rpm
+    and pacman): ``owned`` paths are owned, every other queried path is
+    reported unowned; ``rc`` forces an unknown answer."""
 
-    def __init__(self, monkeypatch, env):
+    def __init__(self, monkeypatch, env, backend="dpkg"):
         self.owned = set()
         self.rc = None
         self.installed = ["bash", "coreutils"]
         self.queries = []
-        monkeypatch.setattr(oc.OrphanReporter, "pkg_backend", lambda self_: "dpkg")
+        monkeypatch.setattr(oc.OrphanReporter, "pkg_backend", lambda self_: backend)
         env.cmds.tools = {"dpkg-query"}
         (env.root / "etc").mkdir(parents=True, exist_ok=True)
         (env.root / "etc" / "passwd").write_text("root:x:0:0\n")
@@ -71,8 +72,25 @@ class Dpkg:
         argv = list(argv)
         if argv[:2] == ["env", "LC_ALL=C"]:
             argv = argv[2:]
-        if argv[:2] == ["dpkg-query", "-W"]:
+        if argv[:2] in (["dpkg-query", "-W"], ["rpm", "-qa"], ["pacman", "-Qq"]):
             return 0, "".join(f"{n}\n" for n in self.installed), ""
+        if argv[:2] == ["rpm", "-qf"]:  # owns files only; exits with #failures
+            ps = argv[2:]
+            self.queries.append(ps)
+            if self.rc is not None:
+                return self.rc, "", ""
+            bad = [x for x in ps if x not in self.owned]
+            out = [f"file {x} is not owned by any package" if x in bad else "vendorpkg-1.0-1"
+                   for x in ps]
+            return len(bad), "\n".join(out), ""
+        if argv[:2] == ["pacman", "-Qo"]:
+            ps = argv[2:]
+            self.queries.append(ps)
+            if self.rc is not None:
+                return self.rc, "", ""
+            out = [f"{x} is owned by vendorpkg 1.0-1" for x in ps if x in self.owned]
+            err = [f"error: No package owns {x}" for x in ps if x not in self.owned]
+            return (1 if err else 0), "\n".join(out), "\n".join(err)
         if argv[:2] == ["dpkg-query", "-S"]:
             ps = argv[2:]
             self.queries.append(ps)
@@ -255,6 +273,9 @@ def test_reverify_unknown_is_skip(orphan_env, monkeypatch):
         assert "cannot be confirmed missing" in reverify.reverify(sl, Config())
 
 
+FILLERS_LISTED = "/Applications/Filler0.app\n/Applications/Filler1.app\n/Applications/Filler2.app\n/Applications/Filler3.app\n/Applications/Filler4.app\n"
+
+
 def _mac_inventory(env, n=5):
     for k in range(n):
         app = env.root / "Applications" / f"Filler{k}.app" / "Contents"
@@ -278,15 +299,18 @@ def test_orphan_app_data_reverify_requires_mdfind_and_rechecks_the_id(orphan_env
     mdfind = ("mdfind", "kMDItemContentType == 'com.apple.application-bundle'")
     # mdfind unavailable: unknown -> skip
     assert reverify.reverify(item, Config()) == "the installed apps could not be listed now"
-    env.cmds.on(mdfind, 0, "")
+    # Spotlight lists every bundle the walk found: plausible, still orphaned
+    env.cmds.on(mdfind, 0, FILLERS_LISTED)
     assert reverify.reverify(item, Config()) is None
-    # an app with that vendor appeared meanwhile
+    # an app with that vendor appeared meanwhile (and Spotlight lists it)
     app = env.root / "Applications" / "Thing.app" / "Contents"
     app.mkdir(parents=True)
     import plistlib
 
     with open(str(app / "Info.plist"), "wb") as fh:
         plistlib.dump({"CFBundleIdentifier": "com.gonevendor.Thing"}, fh)
+    env.cmds._rules.clear()
+    env.cmds.on(mdfind, 0, FILLERS_LISTED + "/Applications/Thing.app\n")
     assert "now uses the id" in reverify.reverify(item, Config())
 
 
@@ -416,7 +440,7 @@ def test_broken_wants_link_to_a_unit_known_by_name_gets_no_remedy(orphan_env):
         remedy=Remedy(RemedyKind.PATH, fingerprint_of(str(wants / "copied.service")),
                       extra=((LINK_TARGET, "/usr/lib/systemd/system/copied.service"),)))
     with scanmode.evidence_rule(lambda p: None):
-        assert "may still enable it" in reverify.reverify(forged, Config())
+        assert "may still enable or shadow it" in reverify.reverify(forged, Config())
         user_item = CleanableItem(
             cleaner_id="stale_services", description="d", size=0, kind=ItemKind.PATH,
             path=str(user_wants / "gone.service"), requires_root=True, report_only=True,
@@ -882,7 +906,8 @@ def test_inventory_cached_per_phase_of_a_batch(orphan_env, monkeypatch):
 
     monkeypatch.setattr(oad, "_inventory", counting)
     _mac_inventory(env)
-    env.cmds.on(("mdfind", "kMDItemContentType == 'com.apple.application-bundle'"), 0, "")
+    env.cmds.on(("mdfind", "kMDItemContentType == 'com.apple.application-bundle'"), 0,
+                FILLERS_LISTED)
     items = []
     for n in range(3):
         d = env.root / "Library" / "Application Support" / f"com.gone{n}.Thing"
@@ -929,3 +954,251 @@ def test_ownership_batched_up_front_and_fresh_before_each_removal(orphan_env, mo
     assert by_path[str(a)].error is None and by_path[str(a)].dry_run
     assert dict((i.path, r) for i, r in s.skipped)[str(b)].endswith(
         "a package owns it now, or its ownership could not be confirmed")
+
+
+# --------------------------------------------------------------------------
+# Task 9a round 2: whole-folder ownership (I1), plausible app inventory
+# (I2), shadowing aliases (I3), exact owner-output lines, ACL prefixes
+# --------------------------------------------------------------------------
+def age_tree(d: Path) -> Path:
+    for p in sorted(d.rglob("*"), key=lambda x: len(x.parts), reverse=True):
+        age(p)
+    return age(d)
+
+
+def vendor_tree(env, name, files=("bin/tool", "share/doc/README")):
+    d = env.root / "opt" / name
+    for rel in files:
+        put(d, rel)
+    return age_tree(d)
+
+
+def path_item(cid, path):
+    return CleanableItem(cleaner_id=cid, description="d", size=0, kind=ItemKind.PATH,
+                         path=str(path), requires_root=True, report_only=True,
+                         remedy=Remedy(RemedyKind.PATH, fingerprint_of(str(path))))
+
+
+def test_folder_with_an_owned_deep_file_is_refused_on_every_backend(orphan_env, monkeypatch):
+    """rpm (and fpm/vendor packages elsewhere) own only FILES: the folder
+    and its first-level children answer "not owned" while a deep file is
+    owned. Such a folder gets no remedy and fails the act-time re-check."""
+    for backend in ("rpm", "dpkg", "pacman"):
+        pkg = Dpkg(monkeypatch, orphan_env, backend)
+        name = "zz" + backend
+        d = vendor_tree(orphan_env, name)
+        pkg.owned.add(f"/opt/{name}/bin/tool")  # only the deep file
+        (item,) = [i for i in orphan_file_items(orphan_env) if i.path == str(d)]
+        assert item.remedy is None, backend  # reported, never removable
+        why = reverify.reverify(path_item("orphan_files", d), Config())
+        assert "owns it now" in why, backend
+        assert [f"/opt/{name}", f"/opt/{name}/bin", f"/opt/{name}/bin/tool",
+                f"/opt/{name}/share", f"/opt/{name}/share/doc",
+                f"/opt/{name}/share/doc/README"] == sorted(pkg.queries[-1])
+        pkg.owned.clear()  # a complete, unowned folder passes
+        (item,) = [i for i in orphan_file_items(orphan_env) if i.path == str(d)]
+        assert item.remedy is not None and item.remedy.kind is RemedyKind.PATH, backend
+        assert reverify.reverify(item, Config()) is None, backend
+
+
+def test_folder_above_the_descendant_cap_is_refused(orphan_env, monkeypatch):
+    Dpkg(monkeypatch, orphan_env)
+    from cleanix.cleaners import orphan_files
+
+    files = [f"sub/f{n:03d}" for n in range(orphan_files.MAX_DESCENDANTS)]  # +1 for sub
+    d = vendor_tree(orphan_env, "zzbig", files)
+    (item,) = [i for i in orphan_file_items(orphan_env) if i.path == str(d)]
+    assert item.remedy is None
+    why = reverify.reverify(path_item("orphan_files", d), Config())
+    assert f"more than {orphan_files.MAX_DESCENDANTS} entries" in why
+    os.unlink(str(d / "sub" / "f000"))  # exactly at the cap: complete
+    age_tree(d)
+    (item,) = [i for i in orphan_file_items(orphan_env) if i.path == str(d)]
+    assert item.remedy is not None
+    assert reverify.reverify(item, Config()) is None
+
+
+def test_sampled_folder_is_refused(orphan_env, monkeypatch):
+    Dpkg(monkeypatch, orphan_env)
+    d = vendor_tree(orphan_env, "zzwide", [f"f{n}" for n in range(6)])
+    (item,) = [i for i in orphan_file_items(orphan_env) if i.path == str(d)]
+    assert "Only a sample" in item.hint and item.remedy is None
+    why = reverify.reverify(path_item("orphan_files", d), Config())
+    assert "only sampled" in why
+
+
+@posix_only
+def test_folder_walk_refuses_other_devices_and_odd_names(orphan_env, monkeypatch):
+    Dpkg(monkeypatch, orphan_env)
+    d = vendor_tree(orphan_env, "zzodd", ["bin/tool", "bin/we*ird"])
+    assert UnownedSystemFilesReporter(Config())._descendants(d) is None
+    os.unlink(str(d / "bin" / "we*ird"))
+    rep = UnownedSystemFilesReporter(Config())
+    assert rep._descendants(d) == ["/opt/zzodd/bin", "/opt/zzodd/bin/tool"]
+    os.symlink("/etc", str(d / "bin" / "link"))  # listed, never followed
+    assert rep._descendants(d) == ["/opt/zzodd/bin", "/opt/zzodd/bin/link",
+                                   "/opt/zzodd/bin/tool"]
+    real_lstat = os.lstat
+
+    def other_device(path, *a, **k):
+        st = real_lstat(path, *a, **k)
+        if str(path).endswith("tool"):
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1) + tuple(st)[3:])
+        return st
+
+    monkeypatch.setattr(os, "lstat", other_device)
+    assert rep._descendants(d) is None
+
+
+@posix_only
+def test_package_installed_mid_batch_owning_a_deep_file_is_caught(orphan_env, monkeypatch):
+    pkg = Dpkg(monkeypatch, orphan_env)
+    a = vendor_tree(orphan_env, "zza")
+    b = vendor_tree(orphan_env, "zzb")
+    items = sorted((i for i in orphan_file_items(orphan_env) if i.path in (str(a), str(b))),
+                   key=lambda i: i.path)
+    assert [i.remedy is not None for i in items] == [True, True]
+    monkeypatch.setattr(root_delete, "mount_problem", lambda path, permanent: None)
+    monkeypatch.setattr(engine, "is_root", lambda: True)
+
+    def installing(argv, timeout=120):
+        out = pkg(argv, timeout)
+        paths = list(argv)[4:]
+        if "/opt/zza" in paths and "/opt/zzb" not in paths:  # a's fresh re-check
+            pkg.owned.add("/opt/zzb/share/doc/README")
+        return out
+
+    monkeypatch.setattr(oc, "run_command", installing)
+    s = actions.act(items, Config(), dry_run=True, permanent=True, allow_root=True)
+    assert [o.item.path for o in s.result.outcomes if o.error is None] == [str(a)]
+    assert "owns it now" in dict((i.path, r) for i, r in s.skipped)[str(b)]
+
+
+def _sup_item(env, bid="com.gonevendor.Thing"):
+    sup = env.root / "Library" / "Application Support" / bid
+    put(sup, "data.bin")
+    age(sup / "data.bin")
+    age(sup)
+    return path_item("orphan_app_data", sup)
+
+
+MDFIND = ("mdfind", "kMDItemContentType == 'com.apple.application-bundle'")
+NOT_LISTED = "the installed apps could not be listed now"
+
+
+def _app_bundle(base: Path, bid: str) -> Path:
+    import plistlib
+
+    contents = base / "Contents"
+    contents.mkdir(parents=True)
+    with open(str(contents / "Info.plist"), "wb") as fh:
+        plistlib.dump({"CFBundleIdentifier": bid}, fh)
+    return base
+
+
+def test_empty_or_partial_spotlight_answer_is_unknown(orphan_env):
+    env = orphan_env
+    _mac_inventory(env)
+    item = _sup_item(env)
+    env.cmds.on(MDFIND, 0, "")  # rc 0 but nothing listed (Spotlight off/indexing)
+    assert reverify.reverify(item, Config()) == NOT_LISTED
+    env.cmds._rules.clear()
+    env.cmds.on(MDFIND, 0, "".join(f"/Applications/Filler{k}.app\n" for k in range(4)))
+    assert reverify.reverify(item, Config()) == NOT_LISTED  # Filler4 missing
+    env.cmds._rules.clear()
+    env.cmds.on(MDFIND, 0, FILLERS_LISTED)
+    assert reverify.reverify(item, Config()) is None
+
+
+@posix_only
+def test_app_in_another_users_home_counts_as_installed(orphan_env):
+    env = orphan_env
+    _mac_inventory(env)
+    item = _sup_item(env)
+    bob = env.root / "Users" / "bob"  # owned by the (non-root) test user: human
+    _app_bundle(bob / "Applications" / "Thing.app", "com.gonevendor.Thing")
+    if os.lstat(str(bob)).st_uid < oad_human_uid_min():
+        pytest.skip("needs a non-root test user")
+    # Spotlight does not list bob's app: implausible -> unknown
+    env.cmds.on(MDFIND, 0, FILLERS_LISTED)
+    assert reverify.reverify(item, Config()) == NOT_LISTED
+    env.cmds._rules.clear()
+    env.cmds.on(MDFIND, 0, FILLERS_LISTED + "/Users/bob/Applications/Thing.app\n")
+    assert "now uses the id com.gonevendor.Thing" in reverify.reverify(item, Config())
+
+
+def oad_human_uid_min():
+    from cleanix.cleaners import orphan_app_data
+
+    return orphan_app_data.HUMAN_UID_MIN
+
+
+@posix_only
+def test_unreadable_user_home_is_unknown(orphan_env, monkeypatch):
+    env = orphan_env
+    _mac_inventory(env)
+    item = _sup_item(env)
+    bob = env.root / "Users" / "bob"
+    (bob / "Applications").mkdir(parents=True)
+    if os.lstat(str(bob)).st_uid < oad_human_uid_min():
+        pytest.skip("needs a non-root test user")
+    env.cmds.on(MDFIND, 0, FILLERS_LISTED)
+    assert reverify.reverify(item, Config()) is None
+    real = oc.list_dir
+    monkeypatch.setattr(oc, "list_dir",
+                        lambda p: None if Path(p) == bob / "Applications" else real(p))
+    assert reverify.reverify(item, Config()) == NOT_LISTED
+    users = env.root / "Users"
+    monkeypatch.setattr(oc, "list_dir", lambda p: None if Path(p) == users else real(p))
+    assert reverify.reverify(item, Config()) == NOT_LISTED
+
+
+@posix_only
+def test_dangling_alias_shadowing_a_vendor_unit_gets_no_remedy(orphan_env):
+    env = orphan_env
+    etc = env.root / "etc/systemd/system"
+    etc.mkdir(parents=True)
+    vendor = env.root / "usr/lib/systemd/system"
+    vendor.mkdir(parents=True)
+    os.symlink("/opt/gone/foo.service", str(etc / "foo.service"))
+    os.symlink("/opt/gone/bar@.service", str(etc / "bar@x.service"))
+    os.symlink("/opt/gone/solo.service", str(etc / "solo.service"))
+    put(vendor, "foo.service", "[Service]\nExecStart=/usr/bin/true\n")
+    put(vendor, "bar@.service", "[Service]\n")
+    items = {Path(i.path).name: i
+             for i in stale_services.StaleSystemdUnitReporter(Config()).scan().items}
+    assert items["foo.service"].remedy is None  # it shadows the vendor unit
+    assert items["bar@x.service"].remedy is None  # ... or its template
+    assert link_target(items["solo.service"].remedy) == "/opt/gone/solo.service"
+    with scanmode.evidence_rule(lambda p: None):
+        assert reverify.reverify(items["solo.service"], Config()) is None
+        forged = CleanableItem(
+            cleaner_id="stale_services", description="d", size=0, kind=ItemKind.PATH,
+            path=str(etc / "foo.service"), requires_root=True, report_only=True,
+            remedy=Remedy(RemedyKind.PATH, fingerprint_of(str(etc / "foo.service")),
+                          extra=((LINK_TARGET, "/opt/gone/foo.service"),)))
+        assert "shadow" in reverify.reverify(forged, Config())
+
+
+def test_owner_output_lines_match_exactly(orphan_env, monkeypatch):
+    pattern = "dpkg-query: no path found matching pattern {}"
+    # "P " answering must never count for its sibling "P"
+    assert oc.parse_dpkg(["/opt/p"], 1, "", pattern.format("/opt/p ")) == set()
+    assert oc.parse_dpkg(["/opt/p"], 1, "", pattern.format("/opt/p") + "\r\n") == {"/opt/p"}
+    assert oc.parse_rpm(["/opt/p"], 1, "file /opt/p  is not owned by any package", "") \
+        == set()
+    pkg = Dpkg(monkeypatch, orphan_env)
+    pkg.owned.add("/opt/p")
+    budget = oc.ScanBudget(10, 60)
+    assert oc.query_unowned("dpkg", ["/opt/p", "/opt/p ", " /opt/q"], budget) == set()
+    assert pkg.queries == [["/opt/p"]]  # paths with surrounding spaces: never queried
+
+
+def test_acl_xattr_prefixes_refused(monkeypatch):
+    monkeypatch.setattr(elevated, "_acl_os", lambda: "linux")
+    for name in ("system.richacl", "system.posix_acl_future", "system.nfs4_acl_xdr",
+                 "system.posix_acl_access"):
+        monkeypatch.setattr(elevated, "_list_xattrs", lambda p, n=name: ["user.a", n])
+        assert elevated._acl_problem("/x") == "carries an access control list", name
+    monkeypatch.setattr(elevated, "_list_xattrs", lambda p: ["security.selinux", "user.x"])
+    assert elevated._acl_problem("/x") is None

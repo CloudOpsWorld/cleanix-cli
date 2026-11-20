@@ -1390,11 +1390,10 @@ def test_helper_refuses_the_quarantine_under_another_spelling(fx, monkeypatch):
         assert alias.exists()
 
 
-@posix_only
-def test_deadline_passing_mid_batch_reports_unprocessed_items_honestly(fx, monkeypatch):
-    """A slow act-time re-check pushes the (fake) clock past the helper's
-    deadline right before the first removal: that item is still processed,
-    the rest are reported "deadline reached; not processed" and kept."""
+def _deadline_run(fx, monkeypatch, *, at_call):
+    """Three items; the (fake) clock jumps past the deadline inside the
+    ``at_call``-th re-verifier call (calls 1-3: up front, 4-6: right before
+    each removal)."""
     items = [finding(make(fx, name)) for name in ("a", "b", "c")]
     fx.cleaners.append(FakeCleaner("orphan_files", lambda: items))
     clock = [1000.0]
@@ -1403,17 +1402,44 @@ def test_deadline_passing_mid_batch_reports_unprocessed_items_honestly(fx, monke
 
     def slow(item, config):
         calls.append(item.path)
-        if len(calls) == len(items) + 1:  # the first removal-phase re-check
+        if len(calls) == at_call:
             clock[0] += elevated.DEFAULT_DEADLINE + 1
         return None
 
     monkeypatch.setitem(reverify.REVERIFIERS, "orphan_files", slow)
     rc, result = run_helper(fx, request(items))
+    return rc, result, {o.key.rsplit("/", 1)[1]: o for o in result.findings}, calls
+
+
+@posix_only
+def test_deadline_passing_mid_batch_reports_unprocessed_items_honestly(fx, monkeypatch):
+    """The deadline passes during item b's own re-check right before its
+    removal: a (already done) is removed, b is NOT removed after the
+    deadline, c is "deadline reached; not processed"; all honest."""
+    rc, result, st, _calls = _deadline_run(fx, monkeypatch, at_call=5)
     assert rc == elevated.EXIT_DEADLINE and result.deadline_hit
-    st = {o.key.rsplit("/", 1)[1]: o for o in result.findings}
     assert st["a"].status == "removed" and not (fx.sys / "a").exists()
-    for name in ("b", "c"):
-        assert st[name].status == "not_removed"
-        assert st[name].reason == "deadline reached; not processed"
-        assert (fx.sys / name).exists()
+    assert st["b"].status == "not_removed"
+    assert st["b"].reason == actions.STOPPED_AT_DEADLINE and (fx.sys / "b").exists()
+    assert st["c"].status == "not_removed"
+    assert st["c"].reason == "deadline reached; not processed" and (fx.sys / "c").exists()
     assert result.removed == 1
+
+
+@posix_only
+def test_nothing_is_removed_after_the_deadline(fx, monkeypatch):
+    # passes during the FIRST removal-phase re-check: nothing at all removed
+    rc, result, st, _calls = _deadline_run(fx, monkeypatch, at_call=4)
+    assert rc == elevated.EXIT_DEADLINE and result.removed == 0
+    assert st["a"].reason == actions.STOPPED_AT_DEADLINE
+    assert {st[n].reason for n in "bc"} == {"deadline reached; not processed"}
+    assert all((fx.sys / n).exists() for n in "abc")
+
+
+@posix_only
+def test_deadline_during_the_up_front_checks_stops_verifying(fx, monkeypatch):
+    rc, result, st, calls = _deadline_run(fx, monkeypatch, at_call=1)
+    assert rc == elevated.EXIT_DEADLINE and result.removed == 0
+    assert len(calls) == 1  # b and c were never even re-checked
+    assert {st[n].status for n in "abc"} == {"not_removed"}
+    assert all((fx.sys / n).exists() for n in "abc")

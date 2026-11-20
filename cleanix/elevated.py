@@ -976,11 +976,9 @@ def static_admin_problem(item, cleaner_id_allowlist=None) -> Optional[str]:
 # access control lists (findings action: a component carrying an ACL is
 # refused -- mode bits alone do not say who may modify it)
 # --------------------------------------------------------------------------
-# Linux xattrs that hold an ACL: POSIX access/default ACLs, and the NFSv4
-# ACL some network filesystems expose.
-_ACL_XATTRS = frozenset({
-    "system.posix_acl_access", "system.posix_acl_default", "system.nfs4_acl",
-})
+# Prefixes of Linux xattrs that hold an ACL: POSIX access/default ACLs, the
+# NFSv4 ACL some network filesystems expose, and rich ACLs.
+_ACL_XATTR_PREFIXES = ("system.posix_acl_", "system.nfs4_acl", "system.richacl")
 _ACL_TYPE_EXTENDED = 0x00000100  # macOS <sys/acl.h>
 
 
@@ -1080,7 +1078,8 @@ def _acl_problem(path: str) -> Optional[str]:
     """Why ``path`` (a directory on an item's chain) cannot be trusted
     because of an access control list, or None.
 
-    Linux: any of :data:`_ACL_XATTRS` present is a refusal; a filesystem
+    Linux: any xattr named with one of :data:`_ACL_XATTR_PREFIXES` is a
+    refusal; a filesystem
     that supports no extended attributes at all (ENOTSUP/EOPNOTSUPP) cannot
     hold such an ACL (accepted); any other error refuses. The kernel stores
     these xattrs only for ACLs with entries beyond the base mode bits, so
@@ -1102,7 +1101,7 @@ def _acl_problem(path: str) -> Optional[str]:
             return "has extended attributes that cannot be read (access control list unknown)"
         except Exception:  # noqa: BLE001 - fail closed
             return "cannot be checked for an access control list"
-        if any(n in _ACL_XATTRS for n in names):
+        if any(str(n).startswith(_ACL_XATTR_PREFIXES) for n in names):
             return "carries an access control list"
         return None
     if system == "darwin":
@@ -1726,13 +1725,19 @@ def _execute_findings(session: _Session, plan: _FindingsPlan, config, cancel,
         for item in candidates:
             put(item_key(item), "not_removed", STOPPED_WHILE_ACTING)
         done = set()
+        stopped = [False]
 
         def on_item(item, outcome, reason) -> None:
             key = item_key(item)
             with session.lock:
                 done.add(key)
                 session.processed += 1
-                if outcome is None or (reason is not None and not outcome.removed):
+                if reason == actions.STOPPED_AT_DEADLINE:
+                    # the deadline passed during its own re-check: not removed
+                    stopped[0] = True
+                    put(key, "not_removed", reason)
+                    session.errors.append(f"{item.description}: {reason}")
+                elif outcome is None or (reason is not None and not outcome.removed):
                     put(key, "skipped", reason or "skipped")
                     session.errors.append(f"{item.description}: skipped: {reason}")
                 elif outcome.removed:
@@ -1768,7 +1773,7 @@ def _execute_findings(session: _Session, plan: _FindingsPlan, config, cancel,
             session.quarantine_run = str(summary.quarantine_run or "")
         if summary.undo_record_error:
             session.note(error=summary.undo_record_error)
-        hit = False
+        hit = stopped[0]
         for item in candidates:
             key = item_key(item)
             if key not in done:

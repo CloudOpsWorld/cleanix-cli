@@ -370,6 +370,7 @@ class UnownedSystemFilesReporter(OrphanReporter):
                 "checked for owned contents (may need administrator rights)",
                 "Run the scan as administrator to include them.",
             )
+        actionable = self._actionable(backend, report, unowned)
         for logical, real, sampled in report:
             label = (
                 f"Installed outside the package manager: {logical}"
@@ -379,15 +380,86 @@ class UnownedSystemFilesReporter(OrphanReporter):
             yield Finding(
                 real, label, self._hint(backend, logical, sampled),
                 requires_root=True,
-                remedy_kind=oc.RemedyKind.PATH,
+                remedy_kind=oc.RemedyKind.PATH if logical in actionable else None,
             )
+
+    def _actionable(self, backend: str, report, unowned: set) -> set:
+        """Logical paths of reported items that may carry a PATH remedy: a
+        file or link (itself queried), or a folder that was not sampled and
+        whose EVERY descendant (:meth:`_descendants`, at most
+        :data:`MAX_DESCENDANTS`) is positively unowned. Package managers
+        often own only files (an rpm owns ``/opt/foo/bin/foo`` but not
+        ``/opt/foo`` or ``/opt/foo/bin``), so the folder's own answer and a
+        sample of its children prove nothing about what lies deeper."""
+        ok = set()
+        need = {}
+        for logical, real, sampled in report:
+            if not _is_real_dir(real):
+                ok.add(logical)
+                continue
+            if sampled:
+                continue
+            desc = self._descendants(real)
+            if desc is not None:
+                need[logical] = desc
+        wanted = list(dict.fromkeys(d for ds in need.values() for d in ds
+                                    if d not in unowned))
+        more = oc.query_unowned(backend, wanted, self.budget) if wanted else set()
+        for logical, desc in need.items():
+            if all(d in unowned or d in more for d in desc):
+                ok.add(logical)
+        return ok
+
+    def _descendants(self, real: Path) -> Optional[list]:
+        """Logical paths of every entry below the folder ``real`` (lstat
+        walk, links listed but never followed), or None when they cannot ALL
+        be queried: more than :data:`MAX_DESCENDANTS`, an unreadable folder
+        or entry, an entry on another device, or a name a package query
+        cannot carry (glob characters, newline/CR/NUL, surrounding spaces).
+        ``[]`` for a file or link."""
+        import stat as _stat
+
+        try:
+            st = real.lstat()
+        except OSError:
+            return None
+        if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISDIR(st.st_mode):
+            return []
+        out: list = []
+        stack = [real]
+        while stack:
+            d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    entries = list(it)
+            except OSError:
+                return None
+            for e in entries:
+                name = e.name
+                if oc.bad_name(name) or (_GLOB & set(name)) or name != name.strip():
+                    return None
+                child = Path(e.path)
+                try:
+                    est = os.lstat(child)  # not entry.stat(): no st_dev on Windows
+                except OSError:
+                    return None
+                if est.st_dev != st.st_dev:
+                    return None
+                out.append(oc.logical_path(self.sysroot, child))
+                if len(out) > MAX_DESCENDANTS:
+                    return None
+                if _stat.S_ISDIR(est.st_mode):
+                    stack.append(child)
+        return sorted(out)
 
     # ------------------------------------------------- act-time re-check
     def still_unowned(self, real: Path) -> Optional[str]:
         """Why ``real`` (a finding of this detector) must not be removed
         now, or None when the scan's evidence still holds: the package
         manager still answers, positively, that no package owns it (nor,
-        for a folder, its probed children -- the usr-merge alias rule of
+        for a folder, ANY entry below it: a fresh walk, at most
+        :data:`MAX_DESCENDANTS` entries; a sampled, larger, unreadable or
+        multi-device folder is refused -- the usr-merge alias rule of
         :func:`orphan_common.query_unowned` applies), no installed package,
         system account or service has its name (``/var/lib``,
         ``/var/cache``; ``/opt``: no service runs from it) and it did not
@@ -403,9 +475,13 @@ class UnownedSystemFilesReporter(OrphanReporter):
         name = real.name
         if oc.bad_name(logical) or (_GLOB & set(logical)):
             return "its name cannot be checked for package ownership"
-        units = self._unit_evidence()
+        from cleanix.core import reverify
+
+        # name evidence: once per phase of a helper batch (reverify.cached)
+        units = reverify.cached("orphan_files.units", self._unit_evidence)
         if root in _NEEDS_NAMES:
-            names = oc.installed_package_names(backend)
+            names = reverify.cached("orphan_files.names",
+                                    lambda: oc.installed_package_names(backend))
             if not names:
                 return "the installed packages could not be listed now"
             evidence = NameEvidence(names | oc.system_account_names(self.sysroot) | units)
@@ -417,14 +493,20 @@ class UnownedSystemFilesReporter(OrphanReporter):
         cutoff = time.time() - days * 86400 if days > 0 else None
         if self._is_fresh(real, cutoff):
             return "it changed recently (it may be in use)"
-        status, probes, _sampled = self._probes(real)
+        status, _probes, sampled = self._probes(real)
         if status != "ok":
             return "its contents could not be checked for package ownership"
-        queried = [logical] + list(probes)
-        from cleanix.core import reverify
-
+        if sampled:
+            return ("it is a large folder whose contents were only sampled for "
+                    "package ownership")
+        desc = self._descendants(real)
+        if desc is None:
+            return ("its contents could not all be checked for package ownership "
+                    f"(more than {MAX_DESCENDANTS} entries, unreadable, or on "
+                    "another filesystem)")
+        queried = [logical] + desc
         unowned = reverify.prefetched(self.id)  # up front: one batched query
-        if unowned is None:  # right before the removal: always a fresh query
+        if unowned is None:  # right before the removal: a fresh walk and query
             budget = oc.ScanBudget(len(queried) + 1, _REVERIFY_SECONDS)
             budget.start()
             unowned = oc.query_unowned(backend, queried, budget)
@@ -434,13 +516,25 @@ class UnownedSystemFilesReporter(OrphanReporter):
 
 
 _REVERIFY_SECONDS = 120.0
+# Most entries below a folder item that are queried for package ownership;
+# a larger folder is never removed (report only).
+MAX_DESCENDANTS = 200
+
+
+def _is_real_dir(path: Path) -> bool:
+    import stat as _stat
+
+    try:
+        return _stat.S_ISDIR(path.lstat().st_mode)
+    except OSError:
+        return False
 
 
 def prefetch_unowned(paths, config) -> Optional[set]:
     """The up-front (whole batch) ownership answer: ONE ``query_unowned``
     call (several paths per ``dpkg-query -S`` / ``rpm -qf`` / ``pacman -Qo``
-    argv, as the read-only allowlist permits) over every path and its
-    probed children; the set of positively unowned ones, or None (no
+    argv, as the read-only allowlist permits) over every path and all its
+    descendants; the set of positively unowned ones, or None (no
     backend). The removal-phase re-check never uses it."""
     reporter = UnownedSystemFilesReporter(config)
     reporter.budget.start()
@@ -451,9 +545,7 @@ def prefetch_unowned(paths, config) -> Optional[set]:
     for path in paths:
         real = Path(path)
         queried.append(oc.logical_path(reporter.sysroot, real))
-        status, probes, _sampled = reporter._probes(real)
-        if status == "ok":
-            queried.extend(probes)
+        queried.extend(reporter._descendants(real) or ())
     queried = list(dict.fromkeys(queried))
     budget = oc.ScanBudget(len(queried) + 1, _REVERIFY_SECONDS)
     budget.start()

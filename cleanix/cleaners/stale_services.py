@@ -184,20 +184,29 @@ class StaleSystemdUnitReporter(OrphanReporter):
         such a link still enables its unit when a unit of that name (or its
         ``prefix@.type`` template) exists anywhere on the load path; links
         under /etc/systemd/user are resolved by each user's manager against
-        units this scan cannot see (their homes). Unknown is "maybe live"."""
+        units this scan cannot see (their homes). A dangling ALIAS directly
+        in a scanned folder (``/etc/systemd/system/foo.service``) takes
+        priority over a unit of the same name lower on the load path (e.g.
+        the vendor's ``/usr/lib/systemd/system/foo.service``), which it then
+        shadows; removing it would bring that unit back -- so it gets no
+        remedy either when that name (or its template) exists in any other
+        lookup folder. Unknown is "maybe live"."""
         if user:
             return {}
         if logical == _SYSTEM_USER_DIR or logical.startswith(_SYSTEM_USER_DIR + "/"):
             return {}
-        if in_link_dir:
-            if lookup is None:
-                return {}
-            name = link.name
-            stem, dot, typ = name.rpartition(".")
-            if not dot or _unit_known(name, lookup):
-                return {}
-            if "@" in stem and _unit_known(f"{stem.split('@', 1)[0]}@.{typ}", lookup):
-                return {}
+        if lookup is None:
+            return {}
+        if not in_link_dir:
+            # never the link's own folder: _unit_known would find the link
+            own = os.path.normpath(str(link.parent))
+            lookup = [d for d in lookup if os.path.normpath(str(d)) != own]
+        name = link.name
+        stem, dot, typ = name.rpartition(".")
+        if not dot or _unit_known(name, lookup):
+            return {}
+        if "@" in stem and _unit_known(f"{stem.split('@', 1)[0]}@.{typ}", lookup):
+            return {}
         return {"remedy_kind": RemedyKind.PATH, "remedy_extra": oc.LINK_REMEDY}
 
     # ------------------------------------------------------ (c) drop-in
@@ -463,7 +472,7 @@ def reverify_system_item(path: str, config) -> Optional[str]:
         if not found:
             return "its target exists now, or cannot be confirmed missing"
         if found[0].remedy_kind is not RemedyKind.PATH:
-            return "a unit of that name exists now (the link may still enable it)"
+            return "a unit of that name exists now (the link may still enable or shadow it)"
         return None
     directly_in_root = logical.rsplit("/", 1)[0] == root
     if stat.S_ISDIR(mode) and real.name.endswith(".d") and directly_in_root:

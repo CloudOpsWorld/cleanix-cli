@@ -382,7 +382,9 @@ def _parse(paths, rc, text, patterns, max_rc: int = 1) -> Optional[set]:
     # refused, missing) and anything larger mean "unknown", never "unowned".
     if not (0 <= rc <= max_rc):
         return None
-    lines = {ln.strip() for ln in text.splitlines()}
+    # Only the line ending is removed, never spaces: "P " must not answer
+    # for its sibling "P" (paths with surrounding spaces are never queried).
+    lines = {ln.rstrip("\r\n") for ln in text.splitlines()}
     return {p for p in paths if any(pat.format(p=p) in lines for pat in patterns)}
 
 
@@ -438,15 +440,16 @@ def query_unowned(
 ) -> set:
     """Subset of ``logical_paths`` that no package owns (positive evidence only).
 
-    Skipped (counted as owned): paths with glob characters or with newline /
-    CR / NUL (a crafted name could forge an "unowned" output line). A path in a
+    Skipped (counted as owned): paths with glob characters, with newline /
+    CR / NUL (a crafted name could forge an "unowned" output line) or with
+    leading/trailing whitespace (unknown, never matched). A path in a
     usr-merge alias pair is unowned only if both forms are unowned.
     """
     if backend not in _PARSERS:
         return set()
     wanted = [
         p for p in logical_paths
-        if not (_GLOB_CHARS & set(p)) and not bad_name(p)
+        if not (_GLOB_CHARS & set(p)) and not bad_name(p) and p == p.strip()
     ]
     queryable = list(dict.fromkeys(
         q for p in wanted for q in (p, _usr_alias(p)) if q
