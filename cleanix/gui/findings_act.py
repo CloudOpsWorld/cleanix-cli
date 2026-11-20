@@ -112,6 +112,9 @@ class ActPlan:
     system_offered: List[CleanableItem] = field(default_factory=list)
     system_not_offered: List[Tuple[CleanableItem, str]] = field(default_factory=list)
     cancelled: bool = False
+    # Every copy kept by a planned duplicate group (``findings.kept_context``):
+    # protected in the real run even if its stamped copies were skipped.
+    protect: List[findings.Survivor] = field(default_factory=list)
 
     @property
     def has_system(self) -> bool:
@@ -149,6 +152,7 @@ def build_plan(user_items: Sequence[CleanableItem],
         plan.user_skipped.extend((i, why) for i, why in dplan.skipped
                                  if id(i) not in kept_ids)
         candidates.extend(dplan.items)
+        plan.protect = findings.kept_context(dplan.items, dplan.kept)
     if candidates:
         pre = service.act(candidates, config, dry_run=True, permanent=permanent,
                           record_history=False, cancel=cancel)
@@ -303,7 +307,7 @@ def run_act(plan: ActPlan, config, *,
         try:
             out.user_summary = service.act(
                 plan.user_items, config, dry_run=False, permanent=plan.permanent,
-                progress=progress, cancel=cancel)
+                progress=progress, cancel=cancel, protect=list(plan.protect))
             out.user_cancelled = bool(getattr(out.user_summary, "cancelled", False))
         except service.Cancelled:
             out.user_cancelled = True

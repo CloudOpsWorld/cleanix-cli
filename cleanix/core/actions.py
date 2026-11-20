@@ -25,17 +25,21 @@ import dataclasses
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from cleanix.config import Config
 from cleanix.core import quarantine, safety, service
 from cleanix.core.findings import (  # re-exported: actions is the public home
+    DIFFERENT_OWNERS,
     KEEP_POLICIES,
     ActPlan,
+    Survivor,
     check_survivor,
     content_matches_group,
     copy_vs_survivor,
     path_key,
+    kept_context,
+    owners_differ,
     plan_duplicates,
     plan_duplicates_keeping,
     survivor_of,
@@ -45,8 +49,8 @@ from cleanix.core.models import CleanableItem, CleanOutcome, CleanResult, ItemKi
 from cleanix.core.remedy import CHANGED, RemedyKind, link_target, unchanged, verify_path
 
 __all__ = [
-    "ActPlan", "ActSummary", "KEEP_POLICIES", "act", "plan_duplicates",
-    "plan_duplicates_keeping",
+    "ActPlan", "ActSummary", "KEEP_POLICIES", "act", "holds_kept_copy",
+    "kept_context", "plan_duplicates", "plan_duplicates_keeping",
 ]
 
 NOT_A_FINDING = "not a finding with a remedy (only findings are acted on here)"
@@ -102,6 +106,8 @@ def _survivor_reason(item: CleanableItem, batch: Optional[Set[str]] = None) -> O
     why = copy_vs_survivor(remedy.fingerprint, remedy.group, kept)
     if why is not None:
         return why
+    if owners_differ((item.path or "", kept.path)):
+        return DIFFERENT_OWNERS
     why = check_survivor(kept.path, kept.fingerprint)
     if why is not None:
         return f"the copy to keep ({kept.path}) {why}; nothing removed"
@@ -240,6 +246,17 @@ def _holds_kept_copy(item: CleanableItem, kept: Set[str],
     return False
 
 
+def holds_kept_copy(item: CleanableItem, protect: Iterable[Survivor]) -> bool:
+    """True when ``item`` is, or contains, one of the kept copies in
+    ``protect`` (same test as :func:`act` applies; see ``protect``)."""
+    kept: Set[str] = set()
+    kept_ids: Set[Tuple[int, ...]] = set()
+    for stamp in protect:
+        kept |= _spellings(stamp.path)
+        kept_ids.add(tuple(stamp.fingerprint)[2:])
+    return bool(item.path) and _holds_kept_copy(item, kept, kept_ids)
+
+
 def act(
     items: Sequence[CleanableItem],
     config: Config,
@@ -257,6 +274,7 @@ def act(
     on_quarantine_claim: Optional[Callable[[str], None]] = None,
     backup_root: Optional[Path] = None,
     on_backup_claim: Optional[Callable[[str], None]] = None,
+    protect: Optional[Iterable[Survivor]] = None,
 ) -> ActSummary:
     """Act on findings: quarantine (or, with ``permanent``, delete) each
     verified PATH finding through :func:`service.clean`, as one batch (one
@@ -296,6 +314,14 @@ def act(
     mount point or has a mount below it is skipped, and a permanent removal
     goes through :func:`root_delete.remove` (never ignores errors, never
     crosses filesystems, reports a partial removal as not removed).
+
+    ``protect`` (default None): kept copies (:class:`findings.Survivor`,
+    e.g. from :func:`kept_context`) of duplicate groups planned outside
+    this batch. Like the kept copies stamped on the supplied items, they
+    and any folder containing them are skipped (``KEEPS_COPY``). Callers
+    that act on parts of one plan in several calls (``review``) MUST pass
+    the whole plan's kept copies here, or an item of a later call could
+    remove a copy kept for an earlier one.
 
     ``on_item(finding, outcome, skip_reason)`` (default None) reports each
     finding as soon as its fate is known: skipped up front (outcome None),
@@ -359,6 +385,12 @@ def act(
         if stamp is not None:
             kept |= _spellings(stamp.path)
             kept_ids.add(tuple(stamp.fingerprint)[2:])
+    # ... and so is every kept copy the caller names in ``protect``: copies
+    # kept by duplicate groups planned for OTHER calls of the same session
+    # (review acts per answer; a preview may have skipped a stamped copy).
+    for stamp in protect or ():
+        kept |= _spellings(stamp.path)
+        kept_ids.add(tuple(stamp.fingerprint)[2:])
 
     if root_mode:
         # One batched ownership query for the up-front pass (best effort).

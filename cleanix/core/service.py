@@ -79,17 +79,19 @@ def act(
     progress: Optional[Callable[[str, int, int], None]] = None,
     cancel: CancelCB = None,
     record_history: bool = True,
+    protect=None,
 ) -> CleanSummary:
     """Act on report-only findings; see :func:`cleanix.core.actions.act`.
 
     Each finding is re-verified, then removed through :func:`clean` (same
     guard, quarantine, history and Undo). ``permanent`` deletes instead of
-    quarantining."""
+    quarantining. ``protect``: kept duplicate copies planned outside this
+    batch (``findings.kept_context``); they are never acted on."""
     from cleanix.core import actions  # actions imports this module
 
     return actions.act(
         items, config, dry_run=dry_run, permanent=permanent, progress=progress,
-        cancel=cancel, record_history=record_history,
+        cancel=cancel, record_history=record_history, protect=protect,
     )
 
 

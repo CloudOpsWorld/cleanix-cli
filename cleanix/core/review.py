@@ -150,7 +150,10 @@ def run(groups: List[findings.FindingGroup],
         system: Optional[Callable[[List[CleanableItem]], int]] = None,
         system_plan=None) -> ReviewResult:
     """Walk ``groups`` asking about every item; apply each decision with
-    ``act`` at once. Returns what was done (also printed as a summary).
+    ``act(items, protect=...)`` at once (``protect``: every copy kept by a
+    duplicate group of this review, for ``service.act``; items that are or
+    contain such a copy are never offered nor passed to ``act``). Returns
+    what was done (also printed as a summary).
     ``notes`` are shown before the first prompt and again in the summary.
 
     System-wide (``requires_root``) items are only reviewed when ``system``
@@ -188,6 +191,33 @@ def run(groups: List[findings.FindingGroup],
             kept_ids = {id(k) for k in kept}
             notes = [(i, w) for i, w in plan.skipped if id(i) not in kept_ids]
         plans[gi] = (rest, not_offered + notes, kept)
+
+    # Every copy kept by ANY duplicate group of this review is protected
+    # from every answer: items are acted on one answer at a time, so the
+    # executor alone (which protects the kept copies named in its own
+    # batch) would not see a copy kept for an earlier answer -- e.g. a
+    # Downloads finding that IS the copy kept of a duplicate group.
+    from cleanix.core import actions
+
+    protect = findings.kept_context(
+        [i for rest, _n, _k in plans.values() for i in rest],
+        [k for _r, _n, kept in plans.values() for k in kept])
+    for gi, (rest, skipped, kept) in list(plans.items()):
+        held = [i for i in rest if actions.holds_kept_copy(i, protect)]
+        if held:
+            held_ids = {id(i) for i in held}
+            plans[gi] = ([i for i in rest if id(i) not in held_ids],
+                         skipped + [(i, actions.KEEPS_COPY) for i in held], kept)
+
+    def act_on(items: List[CleanableItem]) -> None:
+        # Checked again here (as well as by the executor via ``protect``).
+        held = [i for i in items if actions.holds_kept_copy(i, protect)]
+        for i in held:
+            res.skipped.append((i, actions.KEEPS_COPY))
+            console.print(f"    [yellow]skipped:[/yellow] {safe(actions.KEEPS_COPY)}")
+        items = [i for i in items if not any(i is h for h in held)]
+        if items:
+            _record(res, act(items, protect=protect), console)
 
     def queue(items: List[CleanableItem]) -> None:
         pending.extend(items)
@@ -249,14 +279,14 @@ def run(groups: List[findings.FindingGroup],
                     if id(item) in offered:
                         queue([item])
                     else:
-                        _record(res, act([item]), console)
+                        act_on([item])
                     idx += 1
                 else:  # g
                     rest_items = todo[idx:]
                     users = [x for x in rest_items if id(x) not in offered]
                     systems = [x for x in rest_items if id(x) in offered]
                     if users:
-                        _record(res, act(users), console)
+                        act_on(users)
                     if systems:
                         queue(systems)
                     break

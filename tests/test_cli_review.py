@@ -110,8 +110,8 @@ def _script(answers):
 
 
 def _act(permanent=False):
-    return lambda its: service.act(its, Config(), dry_run=False,
-                                   permanent=permanent)
+    return lambda its, protect=None: service.act(its, Config(), dry_run=False,
+                                                 permanent=permanent, protect=protect)
 
 
 def _console():
@@ -243,7 +243,7 @@ def test_review_summary_lists_skips_and_errors_separately(tmp_path, monkeypatch)
         a = next(ans)
         return a
 
-    def act(its):
+    def act(its, protect=None):
         if its[0].path == str(bad):
             monkeypatch.setattr(safety, "safe_rmtree", boom)
         return real(its, Config(), dry_run=False, permanent=True)

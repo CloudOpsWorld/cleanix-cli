@@ -12,7 +12,8 @@ import dataclasses
 import hashlib
 import os
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import (Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional,
+                    Sequence, Tuple)
 
 from cleanix.core.curation import copy_for
 from cleanix.core.models import CleanableItem, ScanResult
@@ -295,6 +296,23 @@ def _as_survivor(item: CleanableItem) -> Survivor:
     return Survivor(item.path or "", tuple(remedy.fingerprint), remedy.group or "")
 
 
+def kept_context(items: Iterable[CleanableItem],
+                 kept: Iterable[CleanableItem] = ()) -> List[Survivor]:
+    """Every kept copy named by the stamped ``items`` (from a duplicates
+    plan) plus the kept copies ``kept`` themselves (``ActPlan.kept``): the
+    ``protect`` argument of :func:`actions.act` for a caller that acts on
+    one plan in several calls, or on only part of it."""
+    out: List[Survivor] = []
+    for i in items:
+        stamp = survivor_of(i)
+        if stamp is not None:
+            out.append(stamp)
+    for k in kept:
+        if k.remedy is not None and k.path:
+            out.append(_as_survivor(k))
+    return out
+
+
 def _group_copies(items: Sequence[CleanableItem], plan: ActPlan
                   ) -> Dict[str, List[CleanableItem]]:
     """Supplied duplicate copies by group (each path once); others skipped."""
@@ -315,11 +333,40 @@ def _group_copies(items: Sequence[CleanableItem], plan: ActPlan
     return groups
 
 
+DIFFERENT_OWNERS = "copies belong to different accounts; nothing removed"
+
+
+def _is_posix() -> bool:
+    return os.name != "nt"
+
+
+def _owner_uid(path: str) -> Optional[int]:
+    """The lstat owner uid of ``path`` (None when it cannot be read: the
+    copy's own checks then refuse it). A seam for tests."""
+    try:
+        return int(os.lstat(path).st_uid)
+    except (OSError, ValueError):
+        return None
+
+
+def owners_differ(paths: Iterable[str]) -> bool:
+    """POSIX: True when the files at ``paths`` are owned by more than one
+    account (a scan of several homes must never keep one user's copy in
+    place of another's). Always False on Windows."""
+    if not _is_posix():
+        return False
+    uids = {_owner_uid(p) for p in paths}
+    uids.discard(None)
+    return len(uids) > 1
+
+
 def _plan_group(copies: List[CleanableItem], survivor: CleanableItem, plan: ActPlan) -> None:
     """Plan one group around ``survivor`` (one of ``copies``), fail closed."""
     reason: Optional[str] = None
     if len(copies) < 2:
         reason = "fewer than two copies of this file were chosen; nothing removed"
+    elif owners_differ(c.path or "" for c in copies):
+        reason = DIFFERENT_OWNERS
     else:
         why = check_survivor(survivor.path or "", survivor.remedy.fingerprint)  # type: ignore[union-attr]
         if why is None and not unchanged(survivor):

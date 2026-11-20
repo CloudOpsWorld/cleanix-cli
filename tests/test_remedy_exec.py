@@ -765,7 +765,8 @@ def test_review_wording_and_notes_for_jobs(env):
     env.rec.result = (5, "", "boom")
     c = Console(record=True, width=400, force_terminal=False)
     res = review.run(findings.group_findings(scan), lambda prompt: "d",
-                     lambda its: actions.act(its, Config(), dry_run=False), c)
+                     lambda its, protect=None: actions.act(its, Config(), dry_run=False,
+                                                           protect=protect), c)
     out = " ".join(c.export_text().split())
     assert res.removed == 1 and not p.exists()
     assert review.JOB_PLANNED in out  # the prompt names no folder yet

@@ -608,7 +608,7 @@ def test_describe_undo_line_is_escaped(tmp_path, monkeypatch):
     p, user = _user(tmp_path)
     c = Console(record=True, width=300, force_terminal=False)
     review.run(findings.group_findings(_scan([user])), lambda prompt: "s",
-               lambda its: None, c)
+               lambda its, protect=None: None, c)
     assert "[bold]x[/] [oops" in c.export_text()
 
 

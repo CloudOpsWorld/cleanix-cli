@@ -486,7 +486,22 @@ _ACT_ON_CONFLICTS = (
     ("profile", "--profile"), ("simulate", "--simulate"),
     ("interactive", "--interactive"), ("quarantine", "--quarantine"),
     ("min_size", "--min-size"),
+    # Acting on findings always covers ONE account (see _act_scope).
+    ("all_users", "--all-users"), ("current_user", "--current-user"),
+    ("min_uid", "--min-uid"),
 )
+# Flags whose value counts as "given" when it is not None (0 is a value).
+_ACT_ON_VALUED = ("only", "exclude", "profile", "min_uid")
+
+
+def _act_scope() -> None:
+    """Acting on findings (``clean --act-on``, ``review``) always scans only
+    the invoking user's home (under sudo: SUDO_USER's), never every user's:
+    duplicate groups would merge across accounts and one user's files could
+    be removed in favour of another's copy."""
+    from cleanix.core import context
+
+    context.configure(all_users=False)
 _BLANKET_WORDS = ("all", "*", "everything")
 
 
@@ -746,8 +761,12 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
 
     for attr, flag in _ACT_ON_CONFLICTS:
         val = getattr(args, attr, None)
-        used = (val is not None) if attr in ("only", "exclude", "profile") else bool(val)
+        used = (val is not None) if attr in _ACT_ON_VALUED else bool(val)
         if used:
+            if attr in ("all_users", "current_user", "min_uid"):
+                return _act_error(
+                    console, f"--act-on cannot be combined with {flag}: acting "
+                    "on findings always covers only your own account")
             return _act_error(
                 console, f"--act-on cannot be combined with {flag}: it names "
                 "its own scenarios")
@@ -767,7 +786,7 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
             "to choose which copy stays")
     permanent = bool(getattr(args, "permanent", False))
 
-    _configure_scope(args)
+    _act_scope()
     engine = _make_engine(config, ids, None)
     _scope_note(console)
     scan = _scan(engine, console)
@@ -923,8 +942,13 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
                 console.print(f"  {safe(i.description)}: {safe('not offered: ' + why)}")
         return code
 
+    # Only what the user saw as acted on (``eligible``), never an item the
+    # preview showed as skipped; every copy kept by a planned duplicate
+    # group stays protected even when its stamped copies were skipped.
+    protect = findings.kept_context(to_act, plan.kept if dups else ())
     with console.status("Working..."):
-        summary = service.act(to_act, config, dry_run=False, permanent=permanent)
+        summary = service.act(eligible, config, dry_run=False, permanent=permanent,
+                              protect=protect)
     console.print()
     console.print(
         f"[green]Freed {human_size(summary.freed)} across {summary.removed} "
@@ -1003,7 +1027,7 @@ def cmd_review(args: argparse.Namespace, console: Console) -> int:
             console, "review is interactive and needs a terminal; run it in "
             "one (or use `clean --act-on` with --execute). Nothing was changed.")
 
-    _configure_scope(args)
+    _act_scope()
     engine = _make_engine(config, ids, None)
     _scope_note(console)
     scan = _scan(engine, console)
@@ -1035,8 +1059,9 @@ def cmd_review(args: argparse.Namespace, console: Console) -> int:
     def ask(prompt: str) -> str:
         return input(prompt)
 
-    def act(items):
-        return service.act(items, config, dry_run=False, permanent=permanent)
+    def act(items, protect=None):
+        return service.act(items, config, dry_run=False, permanent=permanent,
+                           protect=protect)
 
     def system(items) -> int:
         # Once, at the end of the review (or at q): one typed confirmation,
