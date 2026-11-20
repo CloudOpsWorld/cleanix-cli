@@ -14,14 +14,25 @@ Beta means: the features are available, the README documents them as beta, and
 pip needs `--pre`. It does not loosen any check. When in doubt every check
 fails closed (an unknown answer means "skip").
 
+**Beta gate.** Acting on system-wide findings is additionally switched off in
+the client unless the environment variable `CLEANIX_BETA_SYSTEM_ACTIONS` is
+exactly `1` (`system_findings.gate_problem`, applied in `system_findings.plan`,
+which the CLI `--act-on`, `review` and the GUI Review tab all use). Without
+it every system-wide item is "not offered" with the reason. Even with it, a
+process running as root (euid 0) and the standalone (frozen PyInstaller)
+binary are never offered system-wide items. The helper itself is not gated
+(it sanitises its own environment). Set the variable only on the disposable
+verification machines below; remove the gate only when this list is done.
+
 ## What the user sees today (compare observations against this)
 
 - A scan never removes anything; acting is always an explicit, named action.
 - User-space items: moved to the user quarantine (Undo), or deleted with
   `--permanent`. Launch jobs and systemd units are always permanent (a copy of
   the file is kept for manual recovery).
-- System-wide items: only through the administrator helper, after the typed
-  phrase `DELETE SYSTEM FILES` (or `--yes` in a root process). By default moved
+- System-wide items: only with `CLEANIX_BETA_SYSTEM_ACTIONS=1`, never from a
+  root process or the standalone binary, only through the administrator
+  helper, and always after the typed phrase `DELETE SYSTEM FILES`. By default moved
   into a root-only quarantine (`/var/lib/cleanix/quarantine`; macOS
   `/Library/Application Support/Cleanix/quarantine`) that has **no restore and
   no purge**, so no space is freed; or deleted with `--permanent`. No Undo is
@@ -55,10 +66,25 @@ fails closed (an unknown answer means "skip").
 - **A deadline stop.** The helper has a time limit. A stop mid-batch leaves the
   later items untouched; units removed before the stop may need a manual
   `systemctl daemon-reload`.
-- **`sudo cleanix clean --act-on ... --yes`** still starts the helper through
-  `pkexec`/`osascript` and fails on hosts without `pkexec`; under `sudo` the
-  helper reads root's config (your own `protected_globs` do not apply to the
-  system part).
+- **Root and multi-user scope (fixed in the final review; keep checking).**
+  Under `sudo`, `clean --act-on` and `review` used to scan every user's home
+  and merge duplicate groups across accounts (one user's copies could be
+  removed in favour of another user's copy). Now acting on findings always
+  scans only the invoking user's home (SUDO_USER under sudo), `--all-users`,
+  `--current-user` and `--min-uid` are refused with `--act-on`, a duplicate
+  group whose copies have different owners (lstat uid) is skipped whole, and a
+  root process is never offered system-wide items (so the old limitations
+  "sudo still starts pkexec" and "under sudo the helper reads root's config"
+  no longer apply to findings).
+- **Standalone binary.** The PyInstaller binary cannot start the helper (it
+  runs `sys.executable -I -m cleanix.elevated`, and the binary refuses `-I`),
+  so system-wide items are never offered there and `run_findings_request`
+  refuses before any prompt. Install with pip/pipx to act on them.
+- **32-bit Linux.** The immutable/append-only check reads the inode flags with
+  `FS_IOC_GETFLAGS`, whose ioctl number depends on `sizeof(long)` of the
+  Python process (0x80086601 on 64-bit, 0x80046601 on 32-bit); Cleanix picks
+  it with `struct.calcsize("l")`. It has never run on a real 32-bit system; a
+  read that fails is treated as "no flags".
 
 ## How to use this checklist
 
@@ -66,7 +92,9 @@ Use a disposable machine or VM (snapshot first). Never run these steps on a
 machine whose data matters. For each box: do the step, record the **exact
 observation** (command output, text on screen), compare with the expectation,
 and if it differs do what the "If it differs" line says before ticking the box.
-Run the CLI as a normal user unless a step says root.
+Run the CLI as a normal user unless a step says root, with
+`export CLEANIX_BETA_SYSTEM_ACTIONS=1` for every step that acts on
+system-wide items (and for the GUI: start it from that shell).
 
 ## Linux (the helper runs as real root)
 
@@ -150,9 +178,21 @@ files, the same under `/usr/local` and `/var/lib/cleanix-test-data`, and a
       terminal on a desktop VM: the polkit prompt appears, the phrase
       `DELETE SYSTEM FILES` is required, the result lists each item. Record the
       prompt text and the printed per-item lines. Also
-      `sudo cleanix clean --act-on orphan_files --execute --yes` on a host with
-      and without `pkexec` (the documented limitation: without it, "not
-      available; nothing was removed", exit 2).
+      `sudo cleanix clean --act-on orphan_files --execute --yes`: expected every
+      system item "not offered: run cleanix as your normal user ...", nothing
+      launched, and only the invoking user's home scanned. On a host without
+      `pkexec` as a normal user: "not available; nothing was removed", exit 2.
+- [ ] **Beta gate off.** The same command without
+      `CLEANIX_BETA_SYSTEM_ACTIONS` (and with it set to `true` or `0`): every
+      system item "not offered: system-wide actions are a beta feature ...",
+      no prompt, nothing launched.
+- [ ] **32-bit flags read.** On a 32-bit Linux (or a 32-bit Python on a 64-bit
+      kernel), `chattr +i` a test unit file: expected refused as immutable.
+      Record `python3 -c 'import struct; print(struct.calcsize("l"))'`.
+- [ ] **Multi-user duplicates.** As root with two test accounts holding the
+      same file twice each, `sudo cleanix clean --act-on duplicates --keep
+      oldest`: expected only the invoking user's copies are listed; with
+      `--all-users` the command is refused (exit 2).
 
 ## macOS (the helper runs as real root)
 
@@ -233,8 +273,8 @@ package whose installed files are gone.
       from `osascript ... with administrator privileges`, and moves into
       `/Library/Application Support/Cleanix/quarantine` succeeding.
 - [ ] **End to end.** The same typed-phrase run as on Linux through
-      `osascript`. Also `sudo cleanix clean --act-on ... --yes` (still launches
-      `osascript`; record the result).
+      `osascript`. Also `sudo cleanix clean --act-on ... --yes`: expected the
+      system items "not offered" (root process), nothing launched.
 
 ## Windows
 
@@ -278,6 +318,10 @@ package whose installed files are gone.
       matrix (Ubuntu and macOS, Python 3.8 to 3.13) is green. These tests are
       skipped on Windows: the symlink-swap tests, the ownership/uid tests, the
       helper's parent-chain and ACL tests and the POSIX-only helper fixtures.
+- [ ] **Standalone binary.** Build the PyInstaller binary and run
+      `CLEANIX_BETA_SYSTEM_ACTIONS=1 ./cleanix clean --act-on orphan_files`:
+      expected every system item "not offered: the standalone binary cannot
+      start the administrator helper ...", no prompt.
 - [ ] **The beta text is accurate.** Re-read the README section "Findings and
       what you can do with them" against what you observed above and fix any
       sentence that no longer matches.

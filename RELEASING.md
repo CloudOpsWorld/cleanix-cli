@@ -46,6 +46,28 @@ the checklist in [docs/findings-verification.md](docs/findings-verification.md)
 has been run on real Linux and macOS machines (and Windows, where it says so)
 and every box is ticked. Then change the version to `1.5.0` in both files.
 
+### Changes in 1.5.0b1
+
+Put these in the GitHub Release notes:
+
+- **New commands:** `cleanix clean --act-on SCENARIOS` (preview by default;
+  `--execute`, `--keep oldest|newest|shortest-path` for duplicates,
+  `--permanent`) and `cleanix review` (interactive, one finding at a time).
+  Both act only on the invoking user's home, also under `sudo`, and refuse
+  `--all-users` / `--current-user` / `--min-uid`.
+- **New GUI tabs:** Review (opt-in findings scan; tick findings, one
+  confirmation, user files first, then one administrator prompt) and Registry
+  (Windows; the `win_reg_*` cleaners moved out of the Cleanup tab).
+- **Beta gate:** acting on system-wide findings (through the administrator
+  helper) is OFF unless `CLEANIX_BETA_SYSTEM_ACTIONS=1`; it is never offered to
+  a process running as root or to the standalone (PyInstaller) binary, which
+  cannot start the helper. Remove the gate only after the checklist in
+  [docs/findings-verification.md](docs/findings-verification.md) is complete.
+- **Duplicates output change:** `scan` (text and `--json`) now lists one item
+  per copy of each duplicate group (`n` items for `n` copies, the copy kept by
+  default at 0 B). The duplicates cleaner's item count went up and its `bytes`
+  is now `(n-1)*S` per group, where it used to be `S`.
+
 ## The GUI
 
 The desktop GUI ships inside the same wheel: `pip install "cleanix-cli[gui]"`

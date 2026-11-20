@@ -516,3 +516,19 @@ def test_run_pins_exact_argv_shapes(monkeypatch, argv):
 def test_run_allows_exact_argv_shapes(monkeypatch, argv):
     monkeypatch.setattr(oc, "run_command", lambda a, t=120: (0, "", ""))
     assert oc.run(argv) == (0, "", "")
+
+
+@pytest.mark.parametrize("long_size, number", [(8, 0x80086601), (4, 0x80046601)])
+def test_fs_ioc_getflags_number_follows_sizeof_long(long_size, number):
+    """M7: _IOR('f', 1, long) -- 64-bit and 32-bit processes differ."""
+    from cleanix.cleaners import orphan_common as oc
+
+    assert oc._getflags_number(long_size) == number
+
+
+def test_fs_ioc_getflags_uses_this_process_long_size():
+    import struct
+
+    from cleanix.cleaners import orphan_common as oc
+
+    assert oc._FS_IOC_GETFLAGS == oc._getflags_number(struct.calcsize("l"))

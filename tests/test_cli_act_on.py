@@ -340,3 +340,32 @@ def test_plan_exposes_kept_copies_and_cli_never_lists_them_as_skipped(
                      "--execute", "--yes")
     assert code == 0 and paths[0].exists() and not paths[1].exists()
     assert "Skipped" not in out
+
+
+def _sub_options(name):
+    parser = cli.build_parser()
+    sub = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
+    return {o for a in sub.choices[name]._actions for o in a.option_strings}
+
+
+def test_completion_options_are_accepted_by_their_subcommand():
+    """M4: every option completed for scan/clean is one that subcommand
+    accepts (scan rejects --act-on/--keep/--permanent)."""
+    scan, clean = _sub_options("scan"), _sub_options("clean")
+    assert set(completion.SCAN_OPTS) <= scan
+    assert set(completion.CLEAN_OPTS) <= clean
+    for opt in ("--act-on", "--keep", "--permanent"):
+        assert opt not in scan and opt in completion.CLEAN_ONLY_OPTS
+        assert opt not in completion.SCAN_OPTS
+    bash = completion.generate("bash")
+    scan_line = next(x for x in bash.splitlines() if x.strip() == "scan)")
+    after = bash.splitlines()[bash.splitlines().index(scan_line) + 1]
+    assert "--act-on" not in after and "--json" in after
+    zsh = completion.generate("zsh")
+    assert f"_values 'option' {' '.join(completion.SCAN_OPTS)}" in zsh
+
+
+def test_fish_completes_act_on_and_permanent_for_clean():
+    fish = completion.generate("fish")
+    assert '__fish_seen_subcommand_from clean" -l act-on' in fish
+    assert '__fish_seen_subcommand_from clean" -l permanent' in fish

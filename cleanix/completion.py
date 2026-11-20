@@ -14,12 +14,22 @@ SUBCOMMANDS = [
     "list", "scan", "clean", "review", "info", "stats", "restore", "quarantine",
     "config", "schedule", "factory-reset", "completion", "gui",
 ]
+# Options both `scan` and `clean` accept.
 SCAN_CLEAN_OPTS = [
-    "--only", "--exclude", "--json", "--output", "--quiet", "--summary",
-    "--sort", "--top", "--all-users", "--current-user", "--min-uid",
-    "--execute", "--yes", "--quarantine", "--registry",
+    "--only", "--exclude", "--all-users", "--current-user", "--min-uid",
+    "--registry", "--min-size", "--profile",
+]
+# Only `scan` accepts these.
+SCAN_ONLY_OPTS = [
+    "--json", "--output", "--quiet", "--summary", "--sort", "--top", "--input",
+]
+# Only `clean` accepts these (scan rejects them).
+CLEAN_ONLY_OPTS = [
+    "--execute", "--yes", "--quarantine", "--simulate", "--interactive",
     "--act-on", "--keep", "--permanent",
 ]
+SCAN_OPTS = SCAN_CLEAN_OPTS + SCAN_ONLY_OPTS
+CLEAN_OPTS = SCAN_CLEAN_OPTS + CLEAN_ONLY_OPTS
 
 
 def _ids() -> str:
@@ -56,8 +66,10 @@ _cleanix() {{
         --keep) COMPREPLY=( $(compgen -W "oldest newest shortest-path" -- "$cur") ); return;;
     esac
     case "${{COMP_WORDS[1]}}" in
-        scan|clean)
-            COMPREPLY=( $(compgen -W "{' '.join(SCAN_CLEAN_OPTS)}" -- "$cur") );;
+        scan)
+            COMPREPLY=( $(compgen -W "{' '.join(SCAN_OPTS)}" -- "$cur") );;
+        clean)
+            COMPREPLY=( $(compgen -W "{' '.join(CLEAN_OPTS)}" -- "$cur") );;
         config)
             if [ "$COMP_CWORD" -eq 2 ]; then
                 COMPREPLY=( $(compgen -W "list get set unset path" -- "$cur") )
@@ -101,7 +113,8 @@ _cleanix() {{
                 --sort) _values 'sort' none size name; return;;
                 --keep) _values 'keep' oldest newest shortest-path; return;;
             esac
-            _values 'option' {' '.join(SCAN_CLEAN_OPTS)};;
+            if [[ "$words[2]" == scan ]]; then _values 'option' {' '.join(SCAN_OPTS)}
+            else _values 'option' {' '.join(CLEAN_OPTS)}; fi;;
         config)
             if (( CURRENT == 3 )); then _values 'action' list get set unset path
             else _values 'key' $cfgkeys; fi;;
@@ -134,6 +147,13 @@ def fish_script() -> str:
     lines.append(
         'complete -c cleanix -n "__fish_seen_subcommand_from clean review" '
         '-l keep -a "oldest newest shortest-path"'
+    )
+    lines.append(
+        'complete -c cleanix -n "__fish_seen_subcommand_from clean" '
+        f'-l act-on -a "{_finding_ids()}"'
+    )
+    lines.append(
+        'complete -c cleanix -n "__fish_seen_subcommand_from clean" -l permanent'
     )
     lines.append(
         'complete -c cleanix -n "__fish_seen_subcommand_from review" '

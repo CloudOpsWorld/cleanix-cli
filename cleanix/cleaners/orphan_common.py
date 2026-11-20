@@ -19,6 +19,7 @@ import os
 import re
 import shlex
 import stat as _stat_mod
+import struct
 import sys
 import time
 from dataclasses import dataclass
@@ -63,8 +64,16 @@ SYSTEM_JOB_KINDS = frozenset({RemedyKind.LAUNCH_JOB, RemedyKind.SYSTEMD_UNIT,
 _BSD_LOCK_FLAGS = (getattr(_stat_mod, "UF_IMMUTABLE", 0x2) | getattr(_stat_mod, "UF_APPEND", 0x4)
                    | getattr(_stat_mod, "SF_IMMUTABLE", 0x20000)
                    | getattr(_stat_mod, "SF_APPEND", 0x40000))
-# Linux inode flags (chattr +i / +a) read with FS_IOC_GETFLAGS.
-_FS_IOC_GETFLAGS = 0x80086601
+# Linux inode flags (chattr +i / +a) read with FS_IOC_GETFLAGS, which is
+# _IOR('f', 1, long): its number encodes sizeof(long) of THIS process --
+# 0x80086601 on 64-bit, 0x80046601 on 32-bit (also a 32-bit Python on a
+# 64-bit kernel, via the compat ioctl). A wrong number makes the read fail,
+# which would be treated as "no flags".
+def _getflags_number(long_size: int) -> int:
+    return 0x80006601 | ((long_size & 0x3FFF) << 16)
+
+
+_FS_IOC_GETFLAGS = _getflags_number(struct.calcsize("l"))
 _FS_LOCK_FLAGS = 0x10 | 0x20  # FS_IMMUTABLE_FL | FS_APPEND_FL
 
 

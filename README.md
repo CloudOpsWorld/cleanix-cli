@@ -153,6 +153,12 @@ directories and the generic `~/.cache` catch-all defers to them.
 - **Duplicate files** (`duplicates`, report-only). Identical large files (same
   size + SHA-256) grouped with the space reclaimable by keeping one copy. Acting on
   them always keeps one copy of each group (you choose which).
+
+  Since 1.5.0b1 `scan` (text and `--json`) lists **one item per copy**: a group of
+  `n` identical files of size `S` shows `n` items, and the copy kept by default
+  (the oldest) is listed at `0 B`. The cleaner's item count therefore went up, and
+  its `bytes` is now `(n-1)*S` per group (what you can actually reclaim) where it
+  used to be `S`. Scripts that read the duplicates count or size need updating.
 - **Stale downloads** (`downloads`, report-only). Old, large installers/ISOs in
   `~/Downloads` (the folder itself stays hard-protected from deletion; individual
   files can be acted on explicitly).
@@ -226,8 +232,11 @@ are not reported; 0 turns the check off).
 > **Beta.** Acting on findings ships as a pre-release (1.5.0b1). The
 > system-wide part has not been run on a real Linux or macOS machine as root
 > yet; [docs/findings-verification.md](docs/findings-verification.md) lists
-> what is still unverified. Prefer previews, and try it on a machine you can
-> restore.
+> what is still unverified. It is therefore **off by default**: system-wide
+> items are listed as "not offered" unless you set
+> `CLEANIX_BETA_SYSTEM_ACTIONS=1` (see [System-wide findings](#system-wide-findings-linux-and-macos)).
+> Acting on your own files is on. Prefer previews, and try it on a machine you
+> can restore.
 
 A scan only reports **findings**: things that may be junk but need your
 judgment (big files, duplicates, leftovers of removed apps, system files no
@@ -252,9 +261,19 @@ example snapshots, `Windows.old`, Prefetch, WSL disks, `project_cruft`,
 `browser_profiles`, `stale_alternatives`) stays report-only.
 
 Right before an item is removed, Cleanix checks it again: it must be unchanged
-since the scan, still be a regular file or folder (never a link), and pass the
-protected-path guard. Anything that changed is skipped and listed, never
-removed.
+since the scan, still be the same kind of entry the scan found, and pass the
+protected-path guard. Files and folders must still be a regular file or folder,
+never a link; the only links ever removed are the dangling systemd enable links
+of `stale_services` (system-wide only), and only while they still point at a
+unit that is gone. Anything that changed is skipped and listed, never removed.
+
+Acting on findings always covers **your own account only**: even under `sudo`
+it scans just the invoking user's home, and `--all-users`, `--current-user`
+and `--min-uid` are refused with `--act-on`. A duplicate group whose copies
+belong to different accounts is skipped whole ("copies belong to different
+accounts; nothing removed"). A copy kept for a duplicate group is never
+removed by any other finding (for example an old download that is that copy),
+in the CLI, in `review` and in the GUI.
 
 ### `cleanix clean --act-on`
 
@@ -276,8 +295,11 @@ cleanix clean --act-on big_files --permanent --execute --yes
 - `--act-on` takes finding ids or category names, comma separated, in any
   case. There is no "all": `all`, `*` and `everything` are refused, so you
   always name what you mean. It cannot be combined with `--only`, `--exclude`,
-  `--registry`, `--profile`, `--simulate`, `--interactive`, `--quarantine` or
-  `--min-size`; it scans exactly the scenarios you name.
+  `--registry`, `--profile`, `--simulate`, `--interactive`, `--quarantine`,
+  `--min-size`, `--all-users`, `--current-user` or `--min-uid`; it scans
+  exactly the scenarios you name, in your own home.
+- `--execute` acts only on the items the preview showed as acted on; an item
+  listed as skipped is never acted on, even if the reason went away meanwhile.
 - It is a **preview unless you add `--execute`**. Items are moved into the
   quarantine unless you add `--permanent`.
 - `duplicates` needs `--keep oldest|newest|shortest-path` (also when a category
@@ -289,8 +311,10 @@ cleanix clean --act-on big_files --permanent --execute --yes
   `cleanix quarantine empty` deletes these copies too), then the file is
   removed.
 - Exit codes: `0` preview or done (skipped items are listed, they are not an
-  error); `1` you declined or aborted; `2` an error, a refusal or invalid
-  options.
+  error; system-wide items not done because there is no terminal to type the
+  confirmation in are listed prominently and are not an error either); `1` you
+  declined or aborted (including a declined or mistyped `DELETE SYSTEM FILES`);
+  `2` an error, a refusal or invalid options.
 
 ### `cleanix review`
 
@@ -305,13 +329,35 @@ this one and the rest of the group, `n` skip the rest of the group, `q` quit,
 `?` help. Nothing is removed unless you answer `d` or `g`. Without arguments
 it reviews every scenario that applies to your system; duplicate groups are
 then skipped, with a note, unless you pass `--keep`. Naming `duplicates`
-without `--keep` is an error and nothing is scanned. Exit codes: `0` finished
-or `q`; `1` end of input or Ctrl-C; `2` errors, or no terminal (`review` needs
-one).
+without `--keep` is an error and nothing is scanned. Like `clean --act-on` it
+covers only your own home (also under `sudo`). Exit codes: `0` finished or
+`q`; `1` end of input or Ctrl-C, or the system-wide batch was not confirmed (a
+declined or mistyped `DELETE SYSTEM FILES`, or the administrator prompt was
+declined); `2` errors, or no terminal (`review` needs one).
 
 ### System-wide findings (Linux and macOS)
 
-Some findings sit outside your home and need administrator rights:
+Some findings sit outside your home and need administrator rights.
+
+**Beta switch.** Acting on them is off unless the environment variable
+`CLEANIX_BETA_SYSTEM_ACTIONS` is exactly `1`; otherwise every system-wide item
+is listed as "not offered" with the reason, in the CLI, in `review` and in the
+GUI. Turn it on only on a disposable machine (a VM snapshot you can roll back),
+for example:
+
+```bash
+CLEANIX_BETA_SYSTEM_ACTIONS=1 cleanix clean --act-on orphan_files   # preview first
+```
+
+Even with the switch on, system-wide items are never offered:
+
+- in a process that already runs as root (`sudo cleanix ...`): run cleanix as
+  your normal user; it asks for administrator rights itself;
+- in the standalone binary (PyInstaller build): it cannot start the
+  administrator helper; install with `pip`/`pipx` to act on system-wide
+  findings.
+
+What is offered when the switch is on:
 
 | OS | Offered |
 |---|---|
@@ -346,19 +392,19 @@ password prompt). The helper:
 Confirmation: in a terminal you must type exactly `DELETE SYSTEM FILES` after
 the user-space part (anything else, end of input or Ctrl-C leaves the system
 items untouched). `review` collects the system items you chose and asks once,
-at the end. Without a terminal there is no prompt only with `--yes` **and** an
-already-root process; without a terminal, with `--yes` as a normal user, the
-user-space part runs and the system items are reported as not done.
+at the end. There is no way around the typed phrase: without a terminal (for
+example `--execute --yes` in a script) the user-space part runs and the
+system-wide items are listed prominently as not done (exit code `0`).
 
 Honest limitations:
 
 - **No Undo for system items.** Cleanix cannot restore from, or purge, the
   helper's quarantine; removing it means deleting it as root.
-- `sudo cleanix clean --act-on ... --yes` still starts the helper through
-  `pkexec` / `osascript`. On a host without `pkexec` (a server, a minimal
-  container) it ends with "not available; nothing was removed" and exit code
-  `2`. Under `sudo` the helper reads **root's** config, so your own
-  `protected_globs` are not applied to the system part.
+- A root process (`sudo cleanix ...`) is never offered system-wide items (see
+  the beta switch above), so the helper always runs with your own config and
+  your `protected_globs`. On a host without `pkexec` (a server, a minimal
+  container) the system part ends with "not available; nothing was removed"
+  and exit code `2`.
 - On Linux a folder in the `orphan_files` roots with more than 5 entries is
   report-only: a sample cannot prove that no package owns something deeper. A
   folder is acted on only when every file below it (at most 200, on one
@@ -368,7 +414,11 @@ Honest limitations:
   `orphan_app_data` items are not offered. Receipts of software installed into
   user-writable places (for example Homebrew on Intel) are not offered.
 - An item on another filesystem than the quarantine cannot be moved there;
-  `--permanent` is then the only way, and it applies to the whole run.
+  `--permanent` (in the GUI: "Delete permanently (no Undo)") is then the only
+  way, and it applies to the whole run. A permanent deletion that would cross
+  into another filesystem below the item is refused and reported as a failure.
+- Too many items for one administrator request are listed as "not offered"
+  before you are asked anything; run again for the rest.
 - Items with ACLs, mount points, immutable flags or unusual names are refused,
   not removed. The helper has a time limit; when it is hit, the items not
   processed are listed (and, when units were involved, run
@@ -386,8 +436,10 @@ History | Schedule | Settings | Findings**.
   deep scan (slow)" adds the slow scenarios and is off by default). Tick files
   one by one or by category. For duplicates each group keeps one copy (the
   oldest by default; you can pick another), and a group can never be fully
-  ticked. System-wide items can be ticked only when administrator permission
-  is available; otherwise they are listed read-only with the reason.
+  ticked. System-wide items can be ticked only when the beta switch
+  `CLEANIX_BETA_SYSTEM_ACTIONS=1` is set in the GUI's environment, the GUI does
+  not run as root and is not the standalone binary, and administrator
+  permission is available; otherwise they are listed read-only with the reason.
 - One confirmation dialog (plain text) lists what happens to every item and
   what is not acted on. With system-wide items it also asks you to type
   `DELETE SYSTEM FILES` before Act is enabled. Your own files are acted on
@@ -1056,6 +1108,9 @@ How it works:
 - The protected-path guard is extended to cover **every** scanned user's home
   (and their `~/.config`, `~/.local`, `~/Library`, …), so a bug can never wipe
   another user's home.
+- Acting on findings (`clean --act-on`, `review`) is the exception: it always
+  covers only the invoking user's home, even as root (see
+  [Findings and what you can do with them](#findings-and-what-you-can-do-with-them)).
 
 ## Report-only tier (backups & snapshots)
 
@@ -1101,7 +1156,8 @@ Beyond the core cleaners, cleanix also handles:
    Findings are acted on only when you name them (`clean --act-on`, `review`,
    the GUI Review tab); `--act-on` is a preview unless `--execute`, never
    accepts "all", and system-wide items need the typed phrase
-   `DELETE SYSTEM FILES` (or `--yes` in a root process).
+   `DELETE SYSTEM FILES` (never skipped; system-wide acting is a beta switch,
+   `CLEANIX_BETA_SYSTEM_ACTIONS=1`, and never offered to a root process).
 2. **Protected paths**: deletion of (or inside) critical paths is refused at the
    lowest level — see `cleanix/core/safety.py`.
 3. **Age thresholds**: temp/log cleaners only consider files older than a
