@@ -8,12 +8,16 @@ more, and none of the bundles it installed (``Foo.app`` ...) turns up in the
 install location or in the usual application folders (a moved or renamed app
 is not a removed one).
 
+A finding offers ``pkgutil --forget`` (a PKG_RECEIPT remedy, acted on only
+by the elevated helper) only when EVERY listed file -- not just the sample
+-- is gone under the strict evidence rule; see ``_receipt_remedy``.
+
 Unknown is not stale: ``com.apple.*`` receipts, volumes other than ``/``,
 staging or relocated install locations, locations that are not a stable
 parent, failing or unparsable ``pkgutil`` answers, anything whose existence
 cannot be determined, symlinked receipts and receipts without a file on disk
-are never reported. Nothing is ever forgotten or removed; each hint names the
-one receipt only.
+are never reported. The detector itself never forgets or removes anything;
+each hint names the one receipt only.
 """
 
 from __future__ import annotations
@@ -40,6 +44,9 @@ MAX_RECEIPTS = 1000  # receipts examined per scan; only findings use the budget
 MAX_BUNDLES = 50
 MAX_OUTPUT_CHARS = 4 * 1024 * 1024
 MAX_CALL_TIMEOUT = 60
+# A receipt listing more files than this never gets a remedy (every listed
+# file must be checked before pkgutil --forget is offered).
+MAX_FORGET_FILES = 5000
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 # Stable parents: install locations that always exist for many packages. Any
 # other location (a package's own folder, a relocated or missing one) is
@@ -216,8 +223,7 @@ class StaleReceiptReporter(oc.OrphanReporter):
             if oc.bad_name(rel) or ".." in rel.split("/"):
                 return None  # cannot be judged safely
         for rel in sample_files(pkg_id, files):
-            logical = posixpath.normpath(location.rstrip("/") + "/" + rel.lstrip("/"))
-            if _exists(oc.in_root(self.sysroot, logical)) is not False:
+            if not self._gone(location, rel):
                 return None  # present, or unknown (early exit)
         if self._bundle_survives(location, files):
             return None
@@ -229,7 +235,53 @@ class StaleReceiptReporter(oc.OrphanReporter):
             f"`pkgutil --pkg-info {q}` and `pkgutil --files {q}`, you can drop "
             f"only that record: sudo pkgutil --forget {q}",
             requires_root=True,
+            **self._receipt_remedy(pkg_id, receipt, plist, location, files),
         )
+
+    def _gone(self, location: str, rel: str) -> bool:
+        """The listed file is positively absent: lstat says missing AND (in
+        helper/strict mode) no ordinary user could have caused that absence
+        (``oc.evidence_problem``: a folder on the way they can write, a
+        link, an access control list)."""
+        logical = posixpath.normpath(location.rstrip("/") + "/" + rel.lstrip("/"))
+        real = oc.in_root(self.sysroot, logical)
+        if _exists(real) is not False:
+            return False
+        return not oc.evidence_problem(real)
+
+    def _receipt_remedy(self, pkg_id: str, receipt: Path, info: dict,
+                        location: str, files: list) -> dict:
+        """A PKG_RECEIPT remedy (Task 9b; ``pkgutil --forget`` by the
+        elevated helper), only when every precondition holds: a plain,
+        non-Apple package id that is also the id pkgutil reports and the
+        receipt plist's own name (``<id>.plist``); the receipt plist (and
+        its ``.bom``, if any) are plain root-owned files only root can
+        change, below folders only system accounts can change; the file
+        list holds at most MAX_FORGET_FILES entries; and EVERY listed file
+        (not a sample) is positively gone under the strict evidence rule.
+        Anything else: no remedy (the finding stays report-only)."""
+        from cleanix.core import remedy_exec
+
+        if not remedy_exec.valid_pkg_id(pkg_id) or info.get("pkgid") != pkg_id:
+            return {}
+        if receipt.name != f"{pkg_id}.plist":
+            return {}
+        if oc.system_file_problem(receipt):
+            return {}
+        bom = receipt.with_name(f"{pkg_id}.bom")
+        if os.path.lexists(bom) and oc.system_file_problem(bom):
+            return {}
+        if len(files) > MAX_FORGET_FILES:
+            return {}
+        for rel in files:
+            if self.budget.expired():
+                return {}
+            if not self._gone(location, rel):
+                return {}
+        return {
+            "remedy_kind": oc.RemedyKind.PKG_RECEIPT,
+            "remedy_extra": (("pkg_id", pkg_id),),
+        }
 
     def _bundle_survives(self, location: str, files: list) -> bool:
         """A top-level bundle (``Foo.app``, ``*.framework`` ...) still exists in
@@ -259,3 +311,37 @@ class StaleReceiptReporter(oc.OrphanReporter):
             if _exists(p) is True:
                 return p
         return None
+
+
+def reverify_system_item(item, config) -> Optional[str]:
+    """Act-time re-check of one PKG_RECEIPT finding (``reverify`` table;
+    strict evidence): the receipt is ``<RECEIPTS_DIR>/<id>.plist`` for the
+    remedy's package id, and the detector's own check, re-run for that id
+    (fresh ``pkgutil --pkg-info-plist`` / ``--only-files --files``, every
+    listed file, the bundles), still reports it WITH the same remedy. Any
+    file present again, a query error or timeout, a list above the cap or
+    an invalid id is a reason (fail closed)."""
+    from cleanix.core import remedy_exec
+
+    remedy = item.remedy
+    extra = tuple(remedy.extra) if remedy is not None else ()
+    if len(extra) != 1 or len(extra[0]) != 2 or extra[0][0] != "pkg_id":
+        return "unexpected remedy data"
+    pkg_id = extra[0][1]
+    if not remedy_exec.valid_pkg_id(pkg_id):
+        return "not a valid package id"
+    reporter = StaleReceiptReporter(config)
+    reporter.budget.start()
+    expected = oc.in_root(reporter.sysroot, f"{RECEIPTS_DIR}/{pkg_id}.plist")
+    if os.path.abspath(item.path or "") != os.path.abspath(str(expected)):
+        return "it is not this package's receipt"
+    reporter._app_dirs = reporter._application_dirs()
+    reporter._unchecked = 0
+    fresh = reporter._check(pkg_id)
+    if (fresh is None or fresh.note or not fresh.requires_root
+            or fresh.remedy_kind is not oc.RemedyKind.PKG_RECEIPT
+            or tuple(fresh.remedy_extra) != extra
+            or os.path.abspath(str(fresh.path)) != os.path.abspath(str(expected))):
+        return ("a file of the package exists now, pkgutil gave no usable answer, "
+                "or this cannot be confirmed; nothing was done")
+    return None

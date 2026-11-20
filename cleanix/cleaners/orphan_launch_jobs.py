@@ -113,7 +113,8 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
                     f"Broken job link: {logical}",
                     self._hint(logical, "", system),
                     requires_root=system,
-                    **self._job_remedy(plist.stem),
+                    # a system-wide link: no job file to copy and stop
+                    **({} if system else self._job_remedy(plist.stem)),
                 )
             try:
                 if os.readlink(plist) == "/dev/null":
@@ -143,12 +144,16 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
             return None
         if self._exists_or_unknown(program):
             return None
+        if system:
+            remedy = self._system_job_remedy(plist, data)
+        else:
+            remedy = self._job_remedy(label)
         return oc.Finding(
             plist,
             f"Background job for a missing program: {label} (runs {program})",
             self._hint(logical, label, system),
             requires_root=system,
-            **self._job_remedy(label),
+            **remedy,
         )
 
     @staticmethod
@@ -160,6 +165,28 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
             "remedy_kind": oc.RemedyKind.LAUNCH_JOB,
             "remedy_extra": (("label", label),),
         }
+
+    def _system_job_remedy(self, plist: Path, data: dict) -> dict:
+        """A system-wide LAUNCH_JOB remedy (Task 9b; the elevated helper),
+        only when every precondition holds: the plist lies DIRECTLY in
+        ``/Library/LaunchDaemons`` or ``/Library/LaunchAgents``; it declares
+        its own ``Label`` (launchd's name for it; never the file name) and
+        that label is plain and not Apple's (nor is the file name); the
+        file is a plain root-owned file only root can change, below folders
+        only system accounts can change (``oc.system_file_problem``)."""
+        parent = oc.logical_path(self.sysroot, plist.parent)
+        if parent not in SYSTEM_DIRS:
+            return {}
+        label = data.get("Label")
+        if not isinstance(label, str) or not oc.valid_ident(label):
+            return {}
+        if label.startswith("com.apple.") or plist.name.startswith("com.apple."):
+            return {}
+        if oc.bad_name(plist.name) or plist.suffix != ".plist":
+            return {}
+        if oc.system_file_problem(plist):
+            return {}
+        return self._job_remedy(label)
 
     def _load(self, plist: Path):
         """dict on success, None to skip silently, str reason when unreadable."""
@@ -208,3 +235,31 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
         if label.startswith("homebrew.mxcl."):
             hint += " For Homebrew services, check brew services list first."
         return hint
+
+
+def reverify_system_item(item, config) -> Optional[str]:
+    """Act-time re-check of one system-wide LAUNCH_JOB finding (``reverify``
+    table; strict evidence): the plist lies directly in one of
+    ``SYSTEM_DIRS``, is not a link, and the detector's own check, re-run
+    on it, still reports a missing program with a system remedy naming the
+    SAME label (the plist's own ``Label`` key) -- so a reinstalled program,
+    a changed plist or an unjudgeable absence is a reason (fail closed)."""
+    path = item.path or ""
+    remedy = item.remedy
+    if remedy is None:
+        return "no remedy"
+    reporter = OrphanLaunchJobReporter(config)
+    reporter.budget.start()
+    real = Path(path)
+    if oc.logical_path(reporter.sysroot, real.parent) not in SYSTEM_DIRS:
+        return "it is not in a folder this scenario checks"
+    if os.path.islink(real):
+        return "it is a link, not a job file"
+    fresh = reporter._check(real, system=True)
+    if (fresh is None or fresh.note or not fresh.requires_root
+            or fresh.remedy_kind is not oc.RemedyKind.LAUNCH_JOB
+            or tuple(fresh.remedy_extra) != tuple(remedy.extra)
+            or os.path.abspath(str(fresh.path)) != os.path.abspath(path)):
+        return ("its program exists now, the job file changed, or this cannot "
+                "be confirmed; nothing was done")
+    return None

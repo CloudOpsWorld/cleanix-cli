@@ -24,16 +24,30 @@ refuses every shape here -- and run through the single injectable
 default runner uses fixed absolute tool paths where they exist, the C locale
 and no stdin. A failing, missing or timed-out command never raises: it
 becomes a warning.
+
+System scope (Task 9b; the elevated helper's findings action only, see
+:mod:`cleanix.core.system_remedy`): ``launchctl bootout system/<label>``,
+``systemctl disable [--now] <unit>``, ``systemctl daemon-reload`` (no
+``--user``) and ``pkgutil --forget <id>``. These shapes are a scope of their
+own (:data:`SYSTEM_MUTATING_COMMANDS`, :func:`system_argv_allowed`): they
+are run only by ``run_mutating(..., scope=SYSTEM)`` and only while
+:func:`system_scope` is active inside helper scan mode (``actions.act``
+root mode in the helper). An ordinary (unprivileged) call path -- the
+default user scope -- refuses every one of them, and the user-scope shapes
+are refused in system scope. System-scope tools are run only from their
+fixed absolute paths (never looked up on ``PATH``).
 """
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import os
 import re
 import stat
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Sequence, Tuple
 
 from cleanix.core import safety
 from cleanix.core.remedy import CHANGED, RemedyKind, verify_path
@@ -44,25 +58,46 @@ if TYPE_CHECKING:  # pragma: no cover
     from cleanix.core.models import CleanableItem
 
 KINDS = frozenset({RemedyKind.LAUNCH_JOB, RemedyKind.SYSTEMD_UNIT})
+# Kinds the elevated helper acts on system-wide (Task 9b; system_remedy).
+SYSTEM_KINDS = frozenset({RemedyKind.LAUNCH_JOB, RemedyKind.SYSTEMD_UNIT,
+                          RemedyKind.PKG_RECEIPT})
 COMMAND_TIMEOUT = 30  # seconds per command
 MAX_LABEL_SCAN = 10000  # plists read when looking for another job's label
 
-# The mutating command shapes (verb prefixes). The operands are checked by
-# :func:`argv_allowed`; nothing outside these shapes is ever run from here.
-MUTATING_COMMANDS: frozenset = frozenset(
+USER = "user"
+SYSTEM = "system"
+
+# The mutating command shapes of the user scope (verb prefixes). The
+# operands are checked by :func:`argv_allowed`.
+USER_MUTATING_COMMANDS: frozenset = frozenset(
     {
-        ("launchctl", "bootout"),
+        ("launchctl", "bootout"),  # gui/<uid>/<label> only
         ("systemctl", "--user", "disable", "--now"),
         ("systemctl", "--user", "disable"),  # template units only (no --now)
         ("systemctl", "--user", "daemon-reload"),
     }
 )
+# The system scope (elevated helper only); operands checked by
+# :func:`system_argv_allowed`.
+SYSTEM_MUTATING_COMMANDS: frozenset = frozenset(
+    {
+        ("launchctl", "bootout"),  # system/<label> only
+        ("systemctl", "disable", "--now"),
+        ("systemctl", "disable"),  # template units only (no --now)
+        ("systemctl", "daemon-reload"),
+        ("pkgutil", "--forget"),
+    }
+)
+# Every mutating shape; nothing outside them is ever run from here.
+MUTATING_COMMANDS: frozenset = USER_MUTATING_COMMANDS | SYSTEM_MUTATING_COMMANDS
 
-# Where the tools live; ``which`` is asked only when none of these exists.
+# Where the tools live; ``which`` is asked only when none of these exists
+# (user scope only: system-scope commands use these fixed paths or nothing).
 _TOOL_PATHS = {
     "env": ("/usr/bin/env", "/bin/env"),
     "launchctl": ("/bin/launchctl",),
     "systemctl": ("/usr/bin/systemctl", "/bin/systemctl"),
+    "pkgutil": ("/usr/sbin/pkgutil",),
 }
 
 Runner = Callable[[Sequence[str], int], Tuple[int, str, str]]
@@ -70,6 +105,11 @@ Runner = Callable[[Sequence[str], int], Tuple[int, str, str]]
 _NO_FINGERPRINT = (0, 0, 0, 0)
 _REPARSE = 0x400
 _SERVICE_TARGET = re.compile(r"gui/(0|[1-9][0-9]{0,9})/(.+)")
+_SYSTEM_TARGET = re.compile(r"system/(.+)")
+# A package receipt id usable in ``pkgutil --forget`` (stricter than a label:
+# pkgutil ids are reverse-DNS names).
+_PKG_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,254}")
+APPLE_PREFIX = "com.apple."
 # launchctl bootout exit codes taken to mean "no such process" / "could not
 # find service": the job simply was not loaded (a note, not a warning).
 # UNVERIFIED on a real Mac.
@@ -111,6 +151,21 @@ def is_template(unit: str) -> bool:
     return unit.endswith("@.service")
 
 
+def valid_system_label(label: object) -> bool:
+    """A launchd label usable in ``bootout system/<label>``: a plain label
+    that is never Apple's."""
+    return valid_label(label) and not str(label).startswith(APPLE_PREFIX)
+
+
+def valid_pkg_id(pkg_id: object) -> bool:
+    """A package receipt id usable in ``pkgutil --forget``: a plain
+    reverse-DNS name (letters, digits, ``. _ + -``; no leading ``-``, no
+    ``..``, no separators, whitespace or control characters), never
+    Apple's."""
+    return (isinstance(pkg_id, str) and bool(_PKG_ID.fullmatch(pkg_id))
+            and _ident(pkg_id) and not pkg_id.startswith(APPLE_PREFIX))
+
+
 # --------------------------------------------------------------- commands
 def bootout_argv(uid: int, label: str) -> List[str]:
     """``launchctl bootout gui/<uid>/<label>`` (the service-target form: a
@@ -136,15 +191,97 @@ def daemon_reload_argv() -> List[str]:
     return ["systemctl", "--user", "daemon-reload"]
 
 
-def argv_allowed(argv: object) -> bool:
-    """True only for exactly one of the fixed shapes with valid operands."""
+def system_bootout_argv(label: str) -> List[str]:
+    """``launchctl bootout system/<label>`` (system domain; never Apple)."""
+    if not valid_system_label(label):
+        raise ValueError("invalid launchd label")
+    return ["launchctl", "bootout", f"system/{label}"]
+
+
+def system_disable_argv(unit: str) -> List[str]:
+    """``systemctl disable --now <unit>`` (system manager: no ``--user``;
+    no ``--now`` for a template unit)."""
+    if not valid_unit(unit):
+        raise ValueError("invalid systemd unit name")
+    if is_template(unit):
+        return ["systemctl", "disable", unit]
+    return ["systemctl", "disable", "--now", unit]
+
+
+def system_daemon_reload_argv() -> List[str]:
+    return ["systemctl", "daemon-reload"]
+
+
+def forget_argv(pkg_id: str) -> List[str]:
+    """``pkgutil --forget <id>``."""
+    if not valid_pkg_id(pkg_id):
+        raise ValueError("invalid package id")
+    return ["pkgutil", "--forget", pkg_id]
+
+
+def _as_argv(argv: object) -> Optional[Tuple[str, ...]]:
     if isinstance(argv, (str, bytes)):
-        return False
+        return None
     try:
         a = tuple(argv)  # type: ignore[arg-type]
     except TypeError:
-        return False
+        return None
     if not all(isinstance(x, str) for x in a):
+        return None
+    return a
+
+
+def system_argv_allowed(argv: object) -> bool:
+    """True only for exactly one of the fixed SYSTEM-scope shapes with valid
+    operands (see :data:`SYSTEM_MUTATING_COMMANDS`)."""
+    a = _as_argv(argv)
+    if a is None:
+        return False
+    if a == ("systemctl", "daemon-reload"):
+        return True
+    if len(a) == 4 and a[:3] == ("systemctl", "disable", "--now"):
+        return valid_unit(a[3]) and not is_template(a[3])
+    if len(a) == 3 and a[:2] == ("systemctl", "disable"):
+        return valid_unit(a[2]) and is_template(a[2])
+    if len(a) == 3 and a[:2] == ("launchctl", "bootout"):
+        m = _SYSTEM_TARGET.fullmatch(a[2])
+        return bool(m) and valid_system_label(m.group(1))
+    if len(a) == 3 and a[:2] == ("pkgutil", "--forget"):
+        return valid_pkg_id(a[2])
+    return False
+
+
+# Set (True) only by :func:`system_scope`, i.e. by ``actions.act`` in the
+# elevated helper's root mode; context-local, so no other thread or call
+# path sees it.
+_system_scope: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "cleanix_system_scope", default=False)
+
+
+@contextlib.contextmanager
+def system_scope() -> Iterator[None]:
+    """Open the system scope for the current context (helper root mode
+    only; still refused outside helper scan mode)."""
+    token = _system_scope.set(True)
+    try:
+        yield
+    finally:
+        _system_scope.reset(token)
+
+
+def system_scope_open() -> bool:
+    """Both gates of the system scope: :func:`system_scope` is active AND
+    this is the elevated helper (``scanmode`` helper mode)."""
+    from cleanix.core import scanmode
+
+    return bool(_system_scope.get()) and scanmode.is_helper_mode()
+
+
+def argv_allowed(argv: object) -> bool:
+    """True only for exactly one of the fixed USER-scope shapes with valid
+    operands."""
+    a = _as_argv(argv)
+    if a is None:
         return False
     if a == ("systemctl", "--user", "daemon-reload"):
         return True
@@ -158,11 +295,14 @@ def argv_allowed(argv: object) -> bool:
     return False
 
 
-def _resolve(name: str) -> Optional[str]:
-    """The tool's fixed absolute path, else ``which`` (None: not installed)."""
+def _resolve(name: str, fixed_only: bool = False) -> Optional[str]:
+    """The tool's fixed absolute path, else (user scope only) ``which``
+    (None: not installed)."""
     for p in _TOOL_PATHS.get(name, ()):
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
+    if fixed_only:
+        return None
     return which(name)
 
 
@@ -184,9 +324,11 @@ def _spawn(argv: List[str], timeout: int) -> Tuple[int, str, str]:
 
 def default_runner(argv: Sequence[str], timeout: int) -> Tuple[int, str, str]:
     """Run under the C locale (as ``orphan_common.run``) with the tools at
-    fixed absolute paths where they exist."""
-    env = _resolve("env")
-    tool = _resolve(argv[0]) if argv else None
+    fixed absolute paths where they exist (system-scope shapes: ONLY there,
+    never looked up on ``PATH``)."""
+    fixed = system_argv_allowed(argv)
+    env = _resolve("env", fixed_only=fixed)
+    tool = _resolve(argv[0], fixed_only=fixed) if argv else None
     if env is None or tool is None:
         return 127, "", f"command not found: {argv[0] if argv else ''}"
     return _spawn([env, "LC_ALL=C", tool, *argv[1:]], timeout)
@@ -196,10 +338,21 @@ def default_runner(argv: Sequence[str], timeout: int) -> Tuple[int, str, str]:
 runner: Runner = default_runner
 
 
-def run_mutating(argv: Sequence[str], timeout: int = COMMAND_TIMEOUT) -> Tuple[int, str, str]:
+def run_mutating(argv: Sequence[str], timeout: int = COMMAND_TIMEOUT, *,
+                 scope: str = USER) -> Tuple[int, str, str]:
     """Run an allowlisted mutating command; refused shapes give rc 126 and
-    are never passed on. Never raises (an exception is rc 125)."""
-    if not argv_allowed(argv):
+    are never passed on. Never raises (an exception is rc 125).
+
+    ``scope`` USER (default): only the user-scope shapes. SYSTEM: only the
+    system-scope shapes, and only while :func:`system_scope_open` (the
+    elevated helper's root-mode act); anything else is refused."""
+    if scope == USER:
+        allowed = argv_allowed(argv)
+    elif scope == SYSTEM:
+        allowed = system_argv_allowed(argv) and system_scope_open()
+    else:
+        allowed = False
+    if not allowed:
         return 126, "", "refused"
     try:
         return runner(list(argv), timeout)
@@ -225,9 +378,9 @@ class Stop:
         self.info = list(info)
 
 
-def _step(argv: List[str], soft: Sequence[int] = ()) -> Stop:
+def _step(argv: List[str], soft: Sequence[int] = (), scope: str = USER) -> Stop:
     """Run one best-effort step."""
-    rc, out, err = run_mutating(argv)
+    rc, out, err = run_mutating(argv, scope=scope)
     if rc == 0:
         return Stop(stopped=True)
     if rc in soft:
@@ -251,18 +404,20 @@ def _same(a: object, b: object) -> bool:
     return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
 
 
-def _label_elsewhere(path: str, label: str) -> Optional[str]:
+def _label_elsewhere(path: str, label: str, dirs: Optional[Sequence[Path]] = None) -> Optional[str]:
     """Why ``bootout`` by ``label`` could hit another job: another plist in
-    the user's, the local or the system LaunchAgents declares the same
-    Label (or a folder/plist there cannot be read). None when clear."""
+    ``dirs`` (default: the user's, the local and the system LaunchAgents)
+    declares the same Label (or a folder/plist there cannot be read). None
+    when clear."""
     from cleanix.cleaners import orphan_common as oc
     from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
 
     load = OrphanLaunchJobReporter._load  # size-capped; uses no instance state
     root = OrphanLaunchJobReporter.sysroot
-    dirs = [expected_dir(RemedyKind.LAUNCH_JOB),
-            oc.in_root(root, "/Library/LaunchAgents"),
-            oc.in_root(root, "/System/Library/LaunchAgents")]
+    if dirs is None:
+        dirs = [expected_dir(RemedyKind.LAUNCH_JOB),
+                oc.in_root(root, "/Library/LaunchAgents"),
+                oc.in_root(root, "/System/Library/LaunchAgents")]
     seen = 0
     for d in dirs:
         children = oc.list_dir(d)

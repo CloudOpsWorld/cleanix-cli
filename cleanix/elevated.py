@@ -86,7 +86,12 @@ nothing in it beyond *identifiers*, and nothing in its environment:
     normalised absolute path strictly inside a root its own detector scans
     (``finding_path_roots``), never a protected folder, an ancestor of one
     or the helper's own quarantine; the process is root. Items of a remedy
-    kind other than PATH are refused individually. The helper then
+    kind the helper does not handle on this system are refused individually
+    (PATH everywhere; launch jobs and package receipts on macOS, systemd
+    units on Linux: ``helper_finding_kinds``); a non-path item must belong
+    to its kind's one scenario and lie DIRECTLY in one of that kind's
+    folders with a plain name, else the whole request is refused. The
+    helper then
     re-scans with exactly those scenarios in helper scan mode (the
     detectors skip their per-user candidates) and acts only on items of
     its OWN scan whose key AND remedy fingerprint equal the request's:
@@ -115,6 +120,21 @@ nothing in it beyond *identifiers*, and nothing in its environment:
     ignore case, so another spelling of the quarantine is never acted on.
     The root quarantine has no restore or purge yet: the UI must not offer
     Undo for its items.
+    Task 9b: system-wide launch jobs (``launchctl bootout system/<label>``
+    for /Library/LaunchDaemons; agents are not stopped), systemd units in
+    /etc/systemd/system (``systemctl disable [--now]``, one
+    ``daemon-reload`` per batch) and package receipts (``pkgutil
+    --forget``) are always PERMANENT. Right before each one the helper
+    re-checks it (``system_remedy.check``), its parent chain and the file
+    itself (root-owned, not group/world writable, one link, no ACL:
+    ``_system_file_problem``) and the detector's original evidence
+    (``reverify``), then copies every file into a copy-only run of the
+    root quarantine (prepared even in permanent mode; ``backup_run`` in
+    the result), then runs the command (allowlisted system-scope argv,
+    fixed tool paths, only inside ``remedy_exec.system_scope``), then
+    removes the file (a receipt: verifies pkgutil removed it). A failing
+    stop command does not block the removal; it becomes a warning in the
+    item's ``note``.
 
 What the design does and does not protect:
 * The nonce only detects stale or mixed-up result files; it provides no
@@ -1362,9 +1382,17 @@ NOT_SYSTEM_WIDE = ("not a system-wide finding (it is acted on without administra
 NO_DUPLICATES = "duplicates are not handled by the administrator helper; nothing was done"
 STOPPED_WHILE_ACTING = ("the helper stopped while acting on it; it may have been "
                         "removed or moved")
-# Remedy kinds (RemedyKind values) the helper acts on. Every other kind is
-# refused per item; Task 9 registers the others with their own checks.
+# Remedy kinds (RemedyKind values) the helper acts on on every POSIX system
+# (PATH, Task 9a), plus per platform the system-wide job kinds (Task 9b; see
+# ``helper_finding_kinds``). Every other kind is refused per item.
 _HELPER_FINDING_KINDS = frozenset({"path"})
+_PLATFORM_FINDING_KINDS = {
+    "macos": frozenset({"launch_job", "pkg_receipt"}),
+    "linux": frozenset({"systemd_unit"}),
+}
+NOT_A_PLAIN_SYSTEM_FILE = "the file is not a plain file only root can change"
+NO_BACKUP_LOCATION = ("the administrator quarantine (where a copy is kept before "
+                      "removal) is not usable ({}); nothing was removed")
 # The uid that must own the root quarantine (0; a seam for hermetic tests).
 _ROOT_UID = 0
 _mkdir = os.mkdir
@@ -1379,6 +1407,62 @@ def _is_elevated() -> bool:
     from cleanix.core import utils
 
     return utils.is_root()
+
+
+def helper_finding_kinds() -> FrozenSet[str]:
+    """The remedy kinds the helper acts on HERE: "path" everywhere (POSIX);
+    "launch_job" and "pkg_receipt" on macOS only; "systemd_unit" on Linux
+    only."""
+    from cleanix.core import platform as plat
+
+    return _HELPER_FINDING_KINDS | _PLATFORM_FINDING_KINDS.get(plat.current_os(), frozenset())
+
+
+def finding_kind_dirs():
+    """Per non-path kind, the folders its files lie directly in (see
+    ``elevate.finding_kind_dirs``; a seam for hermetic tests)."""
+    return elevate.finding_kind_dirs()
+
+
+def _system_file_problem(path: str) -> Optional[str]:
+    """Why a system-wide job / unit / receipt file must not be acted on as
+    root: it must be a regular file (never a link), owned by root, not
+    group/world writable, with one link only and no access control list --
+    so nobody but root can rewrite it (e.g. its Label) between the re-check
+    and the stop command. Fail closed."""
+    try:
+        st = _lstat(path)
+    except OSError:
+        return f"{path} cannot be inspected"
+    if _stat_mod.S_ISLNK(st.st_mode) or not _stat_mod.S_ISREG(st.st_mode):
+        return f"{path} is not a plain file"
+    if st.st_uid != _ROOT_UID:
+        return f"{path} is not owned by root"
+    if st.st_mode & 0o022:
+        return f"{path} is writable by other users"
+    if st.st_nlink != 1:
+        return f"{path} has more than one link"
+    problem = _acl_problem(path)
+    if problem:
+        return f"{path} {problem}"
+    return None
+
+
+def _job_files(item) -> List[str]:
+    """The files a system-wide job/unit/receipt item acts on (a receipt's
+    ``.bom`` too, when present)."""
+    import posixpath
+
+    path = item.path or ""
+    files = [path]
+    remedy = item.remedy
+    if remedy is not None and getattr(remedy.kind, "value", None) == "pkg_receipt":
+        extra = dict(remedy.extra)
+        pkg_id = extra.get("pkg_id", "")
+        bom = posixpath.join(posixpath.dirname(path), f"{pkg_id}.bom")
+        if pkg_id and os.path.lexists(bom):
+            files.append(bom)
+    return files
 
 
 def admin_finding_ids() -> FrozenSet[str]:
@@ -1490,7 +1574,11 @@ def _prepare_findings(req: elevate.FindingsRequest) -> _FindingsPlan:
     (``finding_path_roots``) that is neither a protected folder, an
     ancestor of one, nor the helper's own quarantine; and the process runs
     as root. Items of a remedy kind the helper does not handle are refused
-    individually (``KIND_NOT_SUPPORTED``)."""
+    individually (``KIND_NOT_SUPPORTED``; ``helper_finding_kinds``); an
+    item of a non-path kind must belong to that kind's one scenario and lie
+    DIRECTLY in one of its folders with a plain name
+    (``elevate.finding_kind_problem``), else the whole request is
+    refused."""
     if not _findings_supported():
         raise Refused(FINDINGS_NOT_SUPPORTED)
     allowed = admin_finding_ids()
@@ -1500,6 +1588,8 @@ def _prepare_findings(req: elevate.FindingsRequest) -> _FindingsPlan:
         raise Refused("the findings part names no item")
     roots = finding_path_roots()
     never = root_quarantine_never()
+    kinds = helper_finding_kinds()
+    kind_dirs = finding_kind_dirs()
     refused = {}
     seen = set()
     for sel in req.items:
@@ -1513,7 +1603,10 @@ def _prepare_findings(req: elevate.FindingsRequest) -> _FindingsPlan:
         problem = elevate.finding_path_problem(cid, path, roots, never)
         if problem:
             raise Refused(f"the findings part names a path the helper never acts on ({problem})")
-        if sel.kind not in _HELPER_FINDING_KINDS:
+        problem = elevate.finding_kind_problem(cid, sel.kind, path, kind_dirs)
+        if problem:
+            raise Refused(f"the findings part names an item the helper never acts on ({problem})")
+        if sel.kind not in kinds:
             refused[sel.key] = KIND_NOT_SUPPORTED
     if not _is_elevated():
         raise Refused("the helper is not running as root; nothing was removed")
@@ -1539,8 +1632,12 @@ def _finding_problem(item, sel: elevate.FindingSelection, allowed, roots, never)
     if remedy.group:
         return "refused", NO_DUPLICATES
     kind = getattr(remedy.kind, "value", None)
-    if kind not in _HELPER_FINDING_KINDS or kind != sel.kind:
+    if kind not in helper_finding_kinds() or kind != sel.kind:
         return "refused", KIND_NOT_SUPPORTED
+    problem = elevate.finding_kind_problem(item.cleaner_id, str(kind), item.path,
+                                           finding_kind_dirs())
+    if problem:
+        return "refused", f"the helper never acts on this item ({problem})"
     try:
         fp = tuple(int(x) for x in remedy.fingerprint)
     except (TypeError, ValueError):
@@ -1700,12 +1797,21 @@ def _execute_findings(session: _Session, plan: _FindingsPlan, config, cancel,
             return False
         with session.lock:
             session.total += len(candidates)
+        # System-wide jobs/units/receipts are always permanent, but a copy
+        # of each file is kept first: in a copy-only run of the root-owned
+        # quarantine, which is therefore prepared even in permanent mode.
+        needs_backup = any(getattr(i.remedy.kind, "value", None) != "path"
+                           for i in candidates)
         qroot = None
-        if not plan.permanent:
+        if not plan.permanent or needs_backup:
             try:
                 qroot = _prepare_root_quarantine(expected_uid, group_ids)
             except Refused as exc:
-                reason = f"the administrator quarantine is not usable ({exc}); nothing was removed"
+                if plan.permanent:
+                    reason = NO_BACKUP_LOCATION.format(exc)
+                else:
+                    reason = (f"the administrator quarantine is not usable ({exc}); "
+                              "nothing was removed")
                 for item in candidates:
                     put(item_key(item), "not_removed", reason)
                 session.note(error=f"findings not removed: {reason}")
@@ -1717,7 +1823,14 @@ def _execute_findings(session: _Session, plan: _FindingsPlan, config, cancel,
             if problem:
                 return f"untrusted parent directory ({problem})"
             alias = _quarantine_alias_problem(path)
-            return f"not removed: {alias}" if alias else None
+            if alias:
+                return f"not removed: {alias}"
+            if getattr(item.remedy.kind, "value", None) != "path":
+                for f in _job_files(item):
+                    problem = _system_file_problem(f)
+                    if problem:
+                        return f"{NOT_A_PLAIN_SYSTEM_FILE} ({problem})"
+            return None
 
         # Until an item's fate is known it is reported as possibly acted on:
         # if the watchdog ends the process mid-batch, the result it writes
@@ -1755,6 +1868,10 @@ def _execute_findings(session: _Session, plan: _FindingsPlan, config, cancel,
             with session.lock:
                 session.quarantine_run = str(run_id)
 
+        def on_backup_claim(run_id: str) -> None:
+            with session.lock:
+                session.backup_run = str(run_id)
+
         flush()
         old_mask = os.umask(0o077)
         try:
@@ -1764,13 +1881,24 @@ def _execute_findings(session: _Session, plan: _FindingsPlan, config, cancel,
                 summary = actions.act(candidates, config, dry_run=False,
                                       permanent=plan.permanent, cancel=cancel,
                                       record_history=False, allow_root=True,
-                                      quarantine_root=qroot, extra_check=chain,
-                                      on_item=on_item, on_quarantine_claim=on_claim)
+                                      quarantine_root=None if plan.permanent else qroot,
+                                      extra_check=chain,
+                                      on_item=on_item, on_quarantine_claim=on_claim,
+                                      backup_root=qroot if needs_backup else None,
+                                      on_backup_claim=on_backup_claim)
         finally:
             os.umask(old_mask)
         with session.lock:
             # A claimed run that ended up empty was discarded ("").
             session.quarantine_run = str(summary.quarantine_run or "")
+            session.backup_run = str(summary.backup_run or "")
+            # What was done beyond the status (permanent removal, where the
+            # copy is, command warnings): known only once act returned.
+            for outcome in summary.result.outcomes:
+                key = item_key(outcome.item)
+                if outcome.note and key in out:
+                    out[key] = dataclasses.replace(out[key], note=str(outcome.note))
+            session.findings = [out[k] for k in order if k in out]
         if summary.undo_record_error:
             session.note(error=summary.undo_record_error)
         hit = stopped[0]
@@ -1812,6 +1940,7 @@ class _Session:
         # findings action
         self.findings: List[elevate.FindingOutcome] = []
         self.quarantine_run = ""
+        self.backup_run = ""
 
     def record(self, summary) -> None:
         """Add one item's clean summary to the tally."""
@@ -1834,7 +1963,8 @@ class _Session:
             freed=self.freed, removed=self.removed,
             errors=list(self.errors) + list(extra_errors), unmatched=self.unmatched,
             nonce=self.nonce, deadline_hit=hit, refused=self.refused,
-            findings=list(self.findings), quarantine_run=self.quarantine_run)
+            findings=list(self.findings), quarantine_run=self.quarantine_run,
+            backup_run=self.backup_run)
 
     def _write(self, result: elevate.HelperResult) -> bool:
         try:

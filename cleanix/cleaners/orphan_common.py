@@ -47,6 +47,38 @@ def evidence_problem(path) -> Optional[str]:
     as ``oc.evidence_problem`` before calling anything "missing"."""
     return scanmode.evidence_problem(str(path))
 
+
+# The owner a system-wide job/unit/receipt file must have to get a remedy
+# (root; a seam for hermetic tests).
+SYSTEM_FILE_UID = 0
+# System-wide remedy kinds other than PATH (Task 9b; the elevated helper).
+SYSTEM_JOB_KINDS = frozenset({RemedyKind.LAUNCH_JOB, RemedyKind.SYSTEMD_UNIT,
+                              RemedyKind.PKG_RECEIPT})
+
+
+def system_file_problem(path) -> Optional[str]:
+    """Why ``path`` is not a plain file only root can change (a precondition
+    of every system-wide launch job / unit / receipt remedy), else None:
+    a regular file (never a link), owned by root, not group/world
+    writable, one link only. In helper/strict mode its parent chain must
+    also pass the evidence rule (folders only system accounts can change,
+    no links, no access control lists)."""
+    import stat as _stat
+
+    try:
+        st = os.lstat(str(path))
+    except (OSError, ValueError):
+        return "cannot be inspected"
+    if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
+        return "is not a plain file"
+    if st.st_uid != SYSTEM_FILE_UID:
+        return "is not owned by root"
+    if st.st_mode & 0o022:
+        return "is writable by other users"
+    if st.st_nlink != 1:
+        return "has more than one link"
+    return evidence_problem(path)
+
 READ_ONLY_COMMANDS: frozenset = frozenset(
     {
         ("dpkg-query", "-S"),
@@ -623,14 +655,18 @@ class OrphanReporter(Cleaner):
     def _remedy(f: Finding) -> Optional[Remedy]:
         """The remedy for a non-note finding that asks for one.
 
-        System-wide (``requires_root``) findings get PATH remedies only (the
-        elevated helper's findings action): a real file or folder, or -- when
-        the detector asks for it with :data:`LINK_REMEDY` -- the symbolic
-        link itself. Other system-wide kinds (launch jobs, units, receipts)
-        get none yet."""
+        System-wide (``requires_root``) findings (the elevated helper's
+        findings action): a PATH remedy for a real file or folder, or --
+        when the detector asks for it with :data:`LINK_REMEDY` -- the
+        symbolic link itself; a launch-job / unit / receipt remedy
+        (Task 9b) only for a plain regular file pinned to its current
+        lstat identity (the detector asks for one only when every
+        precondition holds; see ``system_file_problem``)."""
         if f.remedy_kind is None or f.note:
             return None
         if f.requires_root:
+            if f.remedy_kind in SYSTEM_JOB_KINDS:
+                return _system_job_remedy(f)
             if f.remedy_kind is not RemedyKind.PATH:
                 return None
             if f.remedy_extra == LINK_REMEDY:
@@ -642,3 +678,27 @@ class OrphanReporter(Cleaner):
                 return None
             return Remedy(RemedyKind.PATH, fp)
         return Remedy(f.remedy_kind, fp or (0, 0, 0, 0), extra=f.remedy_extra)
+
+
+def _system_job_remedy(f: Finding) -> Optional[Remedy]:
+    """A system-wide LAUNCH_JOB / SYSTEMD_UNIT / PKG_RECEIPT remedy: one
+    ``(key, name)`` pair and a plain regular file with a real fingerprint
+    (never the zero placeholder); else None."""
+    import stat as _stat
+
+    extra = tuple(f.remedy_extra)
+    if len(extra) != 1 or len(extra[0]) != 2 or not valid_ident(str(extra[0][1])):
+        return None
+    path = str(f.path)
+    if bad_name(os.path.basename(path)):
+        return None
+    try:
+        st = os.lstat(path)
+    except (OSError, ValueError):
+        return None
+    if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
+        return None
+    fp = fingerprint_of(path)
+    if fp is None or fp == (0, 0, 0, 0):
+        return None
+    return Remedy(f.remedy_kind, fp, extra=extra)  # type: ignore[arg-type]

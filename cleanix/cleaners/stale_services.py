@@ -32,6 +32,8 @@ _SYSTEM_SCAN = (
     "/etc/systemd/user",
 )
 _SYSTEM_USER_DIR = "/etc/systemd/user"
+# The only folder whose unit FILES get a system-wide remedy (Task 9b).
+_UNIT_DIR = "/etc/systemd/system"
 # The system unit search path (systemd.unit(5)), plus Debian's /lib.
 _SYSTEM_LOOKUP = (
     "/etc/systemd/system.control",
@@ -271,12 +273,17 @@ class StaleSystemdUnitReporter(OrphanReporter):
             if any(binary in c for c in conds):
                 return
         logical = oc.logical_path(self.sysroot, path)
+        hint = self._hint(path.name, logical, user)
+        if user:
+            remedy = self._unit_remedy(path.name)
+        else:
+            remedy = self._system_unit_remedy(path, logical, lookup)
         yield Finding(
             path,
             f"Service for a missing program: {path.name} (runs {binaries[0]})",
-            self._hint(path.name, logical, user),
+            hint,
             requires_root=not user,
-            **self._unit_remedy(path.name),
+            **remedy,
         )
 
     @staticmethod
@@ -288,6 +295,44 @@ class StaleSystemdUnitReporter(OrphanReporter):
             "remedy_kind": RemedyKind.SYSTEMD_UNIT,
             "remedy_extra": (("unit", unit),),
         }
+
+    def _system_unit_remedy(self, path: Path, logical: str, lookup: list) -> dict:
+        """A system-wide SYSTEMD_UNIT remedy (Task 9b; the elevated helper),
+        only when every precondition holds: the unit file lies DIRECTLY in
+        /etc/systemd/system (never a vendor or /usr/local folder, never
+        /etc/systemd/user); its name is a plain ``.service`` name; no unit of
+        that name (or, for an instance, its template) exists in any other
+        folder of the system search path -- removing this file would bring
+        that one back, still enabled, and ``disable`` by name would hit it;
+        the file is a plain root-owned file only root can change, below
+        folders only system accounts can change; and the package manager
+        positively says no package owns it (unknown backend, error, timeout:
+        no remedy)."""
+        if logical.rsplit("/", 1)[0] != _UNIT_DIR:
+            return {}
+        remedy = self._unit_remedy(path.name)
+        if not remedy:
+            return {}
+        own = os.path.normpath(str(path.parent))
+        others = [d for d in lookup if os.path.normpath(str(d)) != own]
+        name = path.name
+        stem, _dot, typ = name.rpartition(".")
+        if _unit_known(name, others):
+            return {}
+        if "@" in stem and _unit_known(f"{stem.split('@', 1)[0]}@.{typ}", others):
+            return {}
+        if oc.system_file_problem(path):
+            return {}
+        if not self._backend_known:
+            self._backend_known = True
+            self._backend = self.pkg_backend()
+        if not self._backend or self.budget.expired():
+            return {}
+        unowned = oc.query_unowned(self._backend, [logical], self.budget,
+                                   timeout=max(1, min(60, int(self.budget.remaining()))))
+        if logical not in unowned:
+            return {}
+        return remedy
 
     def _binary_present(self, binary: str) -> Optional[bool]:
         """True/False, or None when it cannot be judged."""
@@ -449,8 +494,9 @@ def reverify_system_item(path: str, config) -> Optional[str]:
     a broken unit link must still be a link whose target is positively
     missing (strict evidence); a drop-in folder (directly in a scanned
     folder, never ``/etc/systemd/user``) must still belong to no known
-    unit. Unit files are not handled here (no PATH remedy). Anything
-    unknown is a reason (fail closed)."""
+    unit. Unit files are not handled here (no PATH remedy; see
+    :func:`reverify_system_unit`). Anything unknown is a reason (fail
+    closed)."""
     reporter = StaleSystemdUnitReporter(config)
     reporter.budget.start()
     real = Path(path)
@@ -483,3 +529,37 @@ def reverify_system_item(path: str, config) -> Optional[str]:
             return "its service exists now, or cannot be confirmed missing"
         return None
     return "it is not a link or settings folder this scenario removes"
+
+
+def reverify_system_unit(item, config) -> Optional[str]:
+    """Act-time re-check of one system-wide SYSTEMD_UNIT finding (``reverify``
+    table; strict evidence): a regular ``.service`` file (never a link)
+    directly in /etc/systemd/system whose detector check, re-run on it with
+    the full system search path, still reports a missing program WITH the
+    system remedy for the same unit name -- which re-runs every
+    precondition, the package-ownership query included (fresh). Anything
+    unknown is a reason (fail closed)."""
+    remedy = item.remedy
+    if remedy is None:
+        return "no remedy"
+    reporter = StaleSystemdUnitReporter(config)
+    reporter.budget.start()
+    real = Path(item.path or "")
+    logical = oc.logical_path(reporter.sysroot, real)
+    if logical.rsplit("/", 1)[0] != _UNIT_DIR:
+        return "it is not in a folder this scenario removes unit files from"
+    if oc.bad_name(real.name):
+        return "its name cannot be checked"
+    mode = _lmode(real)
+    if mode is None:
+        return "it cannot be inspected"
+    if not stat.S_ISREG(mode) or not real.name.endswith(".service"):
+        return "it is not a unit file"
+    dirs = [oc.in_root(reporter.sysroot, d) for d in _SYSTEM_LOOKUP]
+    found = list(reporter._check_unit(real, dirs, user=False))
+    if (len(found) != 1 or found[0].note or not found[0].requires_root
+            or found[0].remedy_kind is not RemedyKind.SYSTEMD_UNIT
+            or tuple(found[0].remedy_extra) != tuple(remedy.extra)):
+        return ("its program exists now, a package owns it, another unit of that "
+                "name exists, or this cannot be confirmed; nothing was done")
+    return None

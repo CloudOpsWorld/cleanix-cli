@@ -175,14 +175,26 @@ def test_notes_and_unknown_have_no_remedy(orphan_env, monkeypatch):
     assert rep._item(f, 0, True).remedy is None
 
 
-def test_system_non_path_kinds_get_no_remedy(tmp_path):
+def test_system_non_path_kinds_need_a_plain_file_and_one_name(tmp_path):
+    # Task 9b: a system-wide job/unit/receipt remedy is pinned to a plain
+    # regular file with one plain name; anything else gets none.
     p = tmp_path / "x"
     p.write_text("x")
     rep = oc.OrphanReporter(Config())
     for kind in (RemedyKind.LAUNCH_JOB, RemedyKind.SYSTEMD_UNIT, RemedyKind.PKG_RECEIPT):
         f = oc.Finding(p, "l", "h", requires_root=True, remedy_kind=kind,
                        remedy_extra=(("label", "a.b"),))
-        assert rep._item(f, 0, True).remedy is None
+        r = rep._item(f, 0, True).remedy
+        assert r.kind is kind and r.fingerprint == fingerprint_of(str(p))
+        assert r.extra == (("label", "a.b"),)
+        for extra in ((), (("label", "-x"),), (("a", "b"), ("c", "d"))):
+            f = oc.Finding(p, "l", "h", requires_root=True, remedy_kind=kind,
+                           remedy_extra=extra)
+            assert rep._item(f, 0, True).remedy is None, extra
+        for where in (tmp_path, tmp_path / "missing"):  # a folder; nothing
+            f = oc.Finding(where, "l", "h", requires_root=True, remedy_kind=kind,
+                           remedy_extra=(("label", "a.b"),))
+            assert rep._item(f, 0, True).remedy is None
     f = oc.Finding(p, "l", "h", requires_root=True, remedy_kind=RemedyKind.PATH)
     assert rep._item(f, 0, True).remedy.kind is RemedyKind.PATH
 
@@ -247,16 +259,22 @@ def test_unowned_file_now_named_after_a_package_is_skip(orphan_env, monkeypatch)
 
 
 def test_reverify_unknown_is_skip(orphan_env, monkeypatch):
-    item = CleanableItem(cleaner_id="orphan_launch_jobs", description="d", size=0,
+    item = CleanableItem(cleaner_id="big_files", description="d", size=0,
                          kind=ItemKind.PATH, path="/Library/LaunchDaemons/x.plist",
                          requires_root=True, report_only=True,
                          remedy=Remedy(RemedyKind.PATH, (1, 2, 3, 4)))
     assert reverify.reverify(item, Config()) == reverify.NO_REVERIFIER
+    # a kind the scenario never offers system-wide (Task 9b binding)
+    olj_path = CleanableItem(cleaner_id="orphan_launch_jobs", description="d", size=0,
+                             kind=ItemKind.PATH, path="/Library/LaunchDaemons/x.plist",
+                             requires_root=True, report_only=True,
+                             remedy=Remedy(RemedyKind.PATH, (1, 2, 3, 4)))
+    assert reverify.reverify(olj_path, Config()) == reverify.WRONG_KIND
 
     def boom(item, config):
         raise RuntimeError("kaputt")
 
-    monkeypatch.setitem(reverify.REVERIFIERS, "orphan_launch_jobs", boom)
+    monkeypatch.setitem(reverify.REVERIFIERS, "big_files", boom)
     assert reverify.reverify(item, Config()) == "could not be re-checked (kaputt)"
 
     # stale_launchers: the program is missing, but in strict mode with no
@@ -320,11 +338,10 @@ def test_admin_finding_scenarios_have_re_verifiers():
     # A new system scenario fails here until someone decides its re-verifier.
     assert set(elevate.SYSTEM_FINDING_IDS) == path_scenarios | {"orphan_launch_jobs",
                                                                 "stale_receipts"}
-    for cid in path_scenarios:
+    # Task 9b: every system scenario has one, bound to the kinds it offers
+    for cid in elevate.SYSTEM_FINDING_IDS:
         assert reverify.has_reverifier(cid), cid
-    # kinds not supported in 9a stay refused: no re-verifier, kind not handled
-    for cid in set(elevate.SYSTEM_FINDING_IDS) - path_scenarios:
-        assert not reverify.has_reverifier(cid), cid
+    assert set(elevate.SCENARIO_KINDS) == set(elevate.SYSTEM_FINDING_IDS)
     assert elevated._HELPER_FINDING_KINDS == frozenset({"path"})
     # every scenario the helper may act on (any platform) is covered
     for cid in elevate.SYSTEM_FINDING_IDS:
@@ -337,8 +354,9 @@ def test_admin_finding_scenarios_have_re_verifiers():
                                         {cid: ("/x",)}, ())
         if cid in path_scenarios:
             assert why is None, cid
-        else:
-            assert why == ("refused", reverify.NO_REVERIFIER), cid
+        else:  # orphan_launch_jobs / stale_receipts never offer a PATH action
+            assert why is not None and why[0] == "refused", cid
+            assert "never offers" in why[1], cid
     # admin_finding_ids() (any platform) is a subset of the decided set
     assert set(elevate.admin_finding_ids()) <= set(elevate.SYSTEM_FINDING_IDS)
 
@@ -346,12 +364,19 @@ def test_admin_finding_scenarios_have_re_verifiers():
 def test_root_mode_act_refuses_a_scenario_without_re_verifier(tmp_path, monkeypatch):
     p = tmp_path / "f"
     p.write_text("x")
-    item = CleanableItem(cleaner_id="stale_receipts", description="d", size=0,
+    item = CleanableItem(cleaner_id="big_files", description="d", size=0,
                          kind=ItemKind.PATH, path=str(p), requires_root=True,
                          report_only=True, remedy=Remedy(RemedyKind.PATH, fingerprint_of(str(p))))
     monkeypatch.setattr(root_delete, "mount_problem", lambda path, permanent: None)
     s = actions.act([item], Config(), dry_run=True, permanent=True, allow_root=True)
     assert s.skipped == [(item, reverify.NO_REVERIFIER)] and p.exists()
+    # stale_receipts never offers a PATH action (Task 9b binding)
+    receipt = CleanableItem(cleaner_id="stale_receipts", description="d", size=0,
+                            kind=ItemKind.PATH, path=str(p), requires_root=True,
+                            report_only=True,
+                            remedy=Remedy(RemedyKind.PATH, fingerprint_of(str(p))))
+    s = actions.act([receipt], Config(), dry_run=True, permanent=True, allow_root=True)
+    assert s.skipped == [(receipt, reverify.WRONG_KIND)] and p.exists()
 
 
 def test_normal_path_still_skips_requires_root(orphan_env, monkeypatch):

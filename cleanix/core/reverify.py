@@ -13,9 +13,10 @@ skip reason, never a pass. Re-verifiers run with strict evidence
 (``scanmode.strict_evidence``): an absence an ordinary user could have
 caused is "unknown" (see ``scanmode.evidence_problem``).
 
-Only PATH remedies are re-verified here (Task 9a). LAUNCH_JOB, SYSTEMD_UNIT
-and PKG_RECEIPT system findings carry no remedy yet and are refused by the
-helper before this is reached.
+PATH remedies (Task 9a) and the system-wide LAUNCH_JOB, SYSTEMD_UNIT and
+PKG_RECEIPT remedies (Task 9b) are re-verified here; each re-verifier binds
+the remedy kind to its scenario (a kind its scenario never offers is
+refused).
 """
 
 from __future__ import annotations
@@ -26,9 +27,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from cleanix.config import Config
 from cleanix.core import scanmode
 from cleanix.core.models import CleanableItem
+from cleanix.core.remedy import RemedyKind
 
 NO_REVERIFIER = ("this kind of system-wide finding cannot be re-checked right "
                  "before removal; nothing was done")
+WRONG_KIND = "this scenario never offers this kind of action; nothing was done"
 
 Reverifier = Callable[[CleanableItem, Config], Optional[str]]
 
@@ -84,20 +87,55 @@ def _stale_launchers(item: CleanableItem, config: Config) -> Optional[str]:
     return stale_launchers.reverify_system_item(item.path or "", config)
 
 
+def _kind(item: CleanableItem) -> Optional[RemedyKind]:
+    return item.remedy.kind if item.remedy is not None else None
+
+
 def _stale_services(item: CleanableItem, config: Config) -> Optional[str]:
     from cleanix.cleaners import stale_services
 
+    kind = _kind(item)
+    if kind is RemedyKind.SYSTEMD_UNIT:
+        return stale_services.reverify_system_unit(item, config)
+    if kind is not RemedyKind.PATH:
+        return WRONG_KIND
     return stale_services.reverify_system_item(item.path or "", config)
 
 
-# cleaner id -> re-verifier of its system-wide PATH findings. Scenarios that
-# emit no system-wide PATH remedy (orphan_launch_jobs, stale_receipts: their
-# kinds are Task 9b) deliberately have none: refused.
+def _orphan_launch_jobs(item: CleanableItem, config: Config) -> Optional[str]:
+    from cleanix.cleaners import orphan_launch_jobs
+
+    if _kind(item) is not RemedyKind.LAUNCH_JOB:
+        return WRONG_KIND
+    return orphan_launch_jobs.reverify_system_item(item, config)
+
+
+def _stale_receipts(item: CleanableItem, config: Config) -> Optional[str]:
+    from cleanix.cleaners import stale_receipts
+
+    if _kind(item) is not RemedyKind.PKG_RECEIPT:
+        return WRONG_KIND
+    return stale_receipts.reverify_system_item(item, config)
+
+
+def _path_only(fn: Reverifier) -> Reverifier:
+    def check(item: CleanableItem, config: Config) -> Optional[str]:
+        if _kind(item) is not RemedyKind.PATH:
+            return WRONG_KIND
+        return fn(item, config)
+
+    return check
+
+
+# cleaner id -> re-verifier of its system-wide findings (each bound to the
+# remedy kinds its detector offers system-wide).
 REVERIFIERS: Dict[str, Reverifier] = {
-    "orphan_files": _orphan_files,
-    "orphan_app_data": _orphan_app_data,
-    "stale_launchers": _stale_launchers,
+    "orphan_files": _path_only(_orphan_files),
+    "orphan_app_data": _path_only(_orphan_app_data),
+    "stale_launchers": _path_only(_stale_launchers),
     "stale_services": _stale_services,
+    "orphan_launch_jobs": _orphan_launch_jobs,
+    "stale_receipts": _stale_receipts,
 }
 
 

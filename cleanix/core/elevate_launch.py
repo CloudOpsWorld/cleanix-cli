@@ -189,7 +189,9 @@ def run_findings_request(findings, invoking_user: str, *,
     never = elevated.root_quarantine_never()
     for sel in findings.items:
         cid, path = elevate.finding_key_parts(sel.key)
-        problem = elevate.finding_path_problem(cid, path, roots, never)
+        problem = (elevate.finding_path_problem(cid, path, roots, never)
+                   or elevate.finding_kind_problem(cid, sel.kind, path,
+                                                   elevated.finding_kind_dirs()))
         if problem:
             raise ValueError(f"the administrator helper never acts on this item ({problem})")
     selection = elevate.Selection(invoking_user=invoking_user, only=[], keys=[],

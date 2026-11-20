@@ -478,12 +478,28 @@ def test_stale_receipts_and_launch_jobs_have_no_path_roots_outside_their_folders
         elevated._prepare_findings(sel.findings)
 
 
-def test_non_path_kind_refused_for_now(lexical):
+def test_non_path_kind_refused_for_its_scenario_or_platform(lexical, monkeypatch):
+    # a kind its scenario never offers refuses the WHOLE request (lexical)
     sel = parse(payload([dict(GOOD_ITEM, kind="launch_job"),
                          dict(GOOD_ITEM, key="orphan_files|path|/var/lib/b", kind="path")]))
+    with pytest.raises(elevated.Refused, match="never offers"):
+        elevated._prepare_findings(sel.findings)
+    # a kind not handled on this platform is refused per item
+    monkeypatch.setattr(elevated, "admin_finding_ids",
+                        lambda: frozenset({"orphan_files", "stale_services"}))
+    monkeypatch.setattr(elevated, "finding_path_roots", lambda: dict(
+        LINUX_ROOTS, stale_services=("/etc/systemd/system",)))
+    monkeypatch.setattr(plat, "current_os", lambda: plat.MACOS)
+    unit = {"key": "stale_services|path|/etc/systemd/system/gone.service",
+            "fingerprint": [1, 2, 3, 4], "kind": "systemd_unit"}
+    sel = parse(payload([unit, dict(GOOD_ITEM, key="orphan_files|path|/var/lib/b")],
+                        only=("stale_services", "orphan_files")))
     plan = elevated._prepare_findings(sel.findings)
-    assert plan.refused == {"orphan_files|path|/var/lib/gone": elevated.KIND_NOT_SUPPORTED}
+    assert plan.refused == {unit["key"]: elevated.KIND_NOT_SUPPORTED}
+    assert plan.only == ["orphan_files"]
     assert "not handled" in elevated.KIND_NOT_SUPPORTED
+    monkeypatch.setattr(plat, "current_os", lambda: plat.LINUX)
+    assert elevated._prepare_findings(sel.findings).refused == {}
 
 
 def test_windows_refuses_findings_request(lexical, monkeypatch):
@@ -523,11 +539,24 @@ def test_root_mode_handles_plain_paths_only(tmp_path, monkeypatch):
     a.write_text("x")
     b = tmp_path / "dup"
     b.write_text("x")
-    items = [finding(a, kind=RemedyKind.LAUNCH_JOB), finding(b, group="g1")]
+    c = tmp_path / "user.plist"
+    c.write_text("x")
+    # Root mode: no duplicates, no user-level jobs; a system-wide job kind
+    # only with a backup location (Task 9b) and only from its own scenario.
+    items = [finding(a, kind=RemedyKind.LAUNCH_JOB), finding(b, group="g1"),
+             finding(c, kind=RemedyKind.LAUNCH_JOB, requires_root=False)]
     summary = actions.act(items, Config(), dry_run=False, permanent=True,
                           record_history=False, allow_root=True)
-    assert a.exists() and b.exists()
-    assert [r for _i, r in summary.skipped] == [actions.NOT_HANDLED, actions.NOT_HANDLED]
+    assert a.exists() and b.exists() and c.exists()
+    assert [r for _i, r in summary.skipped] == [actions.NO_BACKUP_PLACE, actions.NOT_HANDLED,
+                                                actions.NOT_HANDLED]
+    from cleanix.core import system_remedy
+
+    summary = actions.act(items[:1], Config(), dry_run=False, permanent=True,
+                          record_history=False, allow_root=True,
+                          backup_root=tmp_path / "backup")
+    assert [r for _i, r in summary.skipped] == [system_remedy.WRONG_SCENARIO]
+    assert a.exists() and not (tmp_path / "backup").exists()
 
 
 def test_history_off_with_quarantine_still_refused_without_root_dir(tmp_path):
@@ -638,6 +667,9 @@ def test_run_findings_request_rejects_a_result_for_unrequested_items(lexical):
         "orphan_files|path|/etc/passwd", (1, 2, 3, 4), "path")]),
     elevate.FindingsRequest(only=["orphan_files"], items=[elevate.FindingSelection(
         "orphan_files|path|/var/lib/cleanix", (1, 2, 3, 4), "path")]),
+    # a remedy kind its scenario never offers (Task 9b)
+    elevate.FindingsRequest(only=["orphan_files"], items=[elevate.FindingSelection(
+        "orphan_files|path|/var/lib/gone", (1, 2, 3, 4), "launch_job")]),
 ])
 def test_run_findings_request_checks_allowlist_and_paths_before_prompting(lexical, bad):
     launch = _fake_launcher()
@@ -675,8 +707,13 @@ def test_findings_plan_scans_only_scenarios_left(lexical, monkeypatch):
                          {"key": "stale_services|path|/etc/systemd/system/x.service",
                           "fingerprint": [1, 2, 3, 4], "kind": "systemd_unit"}],
                         only=("orphan_files", "stale_services")))
+    # systemd units are acted on on Linux only (Task 9b)
+    monkeypatch.setattr(plat, "current_os", lambda: plat.MACOS)
     plan = elevated._prepare_findings(sel.findings)
     assert plan.only == ["orphan_files"]
+    monkeypatch.setattr(plat, "current_os", lambda: plat.LINUX)
+    plan = elevated._prepare_findings(sel.findings)
+    assert plan.only == ["orphan_files", "stale_services"]
 
 
 def test_run_findings_request_never_prompts_for_an_oversized_request(lexical):
@@ -795,10 +832,10 @@ def test_non_path_kind_refused_end_to_end(fx):
     job = make(fx, "job.plist")
     fx.cleaners.append(FakeCleaner("orphan_files", lambda: [finding(job)]))
     rc, result = run_helper(fx, request([finding(job)], kinds={0: "launch_job"}))
-    assert rc == elevated.EXIT_OK and job.exists()
-    assert result.findings[0].status == "refused"
-    assert result.findings[0].reason == elevated.KIND_NOT_SUPPORTED
-    assert fx.scans == []  # nothing left to scan for
+    # orphan_files never offers a launch-job action: the request is refused
+    assert rc == elevated.EXIT_REFUSED and job.exists()
+    assert result.findings == []
+    assert fx.scans == []  # nothing was scanned
 
 
 @posix_only
@@ -1443,3 +1480,545 @@ def test_deadline_during_the_up_front_checks_stops_verifying(fx, monkeypatch):
     assert len(calls) == 1  # b and c were never even re-checked
     assert {st[n].status for n in "abc"} == {"not_removed"}
     assert all((fx.sys / n).exists() for n in "abc")
+
+
+# --------------------------------------------------------------------------
+# Task 9b: system-wide launch jobs, systemd units and package receipts,
+# end to end through the helper (real detectors and re-verifiers, a
+# recording command runner; nothing is ever executed)
+# --------------------------------------------------------------------------
+class _Runner:
+    """``remedy_exec.runner`` stand-in: records argv into the shared event
+    log and answers per command (``answers``: argv tuple -> result or
+    callable)."""
+
+    def __init__(self, events):
+        self.events = events
+        self.calls = []
+        self.answers = {}
+
+    def __call__(self, argv, timeout):
+        self.calls.append(list(argv))
+        self.events.append(("cmd", tuple(argv)))
+        ans = self.answers.get(tuple(argv), (0, "", ""))
+        return ans(list(argv)) if callable(ans) else ans
+
+
+class _ReadOnlyTools:
+    """Fake read-only package tools behind ``orphan_common.run_command``."""
+
+    def __init__(self):
+        self.owned = set()
+        self.pkgs = {}  # id -> (info text, files)
+
+    def __call__(self, argv, timeout=120):
+        argv = list(argv)
+        if argv[:2] == ["env", "LC_ALL=C"]:
+            argv = argv[2:]
+        if argv[:2] == ["dpkg-query", "-S"]:
+            out = [f"pkg: {p}" for p in argv[2:] if p in self.owned]
+            err = [f"dpkg-query: no path found matching pattern {p}"
+                   for p in argv[2:] if p not in self.owned]
+            return (1 if err else 0), "\n".join(out), "\n".join(err)
+        if argv[:2] == ["pkgutil", "--pkgs"]:
+            return 0, "".join(f"{i}\n" for i in self.pkgs), ""
+        if argv[:2] == ["pkgutil", "--pkg-info-plist"] and argv[2] in self.pkgs:
+            return 0, self.pkgs[argv[2]][0], ""
+        if argv[:3] == ["pkgutil", "--only-files", "--files"] and argv[3] in self.pkgs:
+            return 0, "".join(f"{f}\n" for f in self.pkgs[argv[3]][1]), ""
+        return 127, "", "not found"
+
+
+def _sys_env(fx, monkeypatch, osname, cid, kind, dirs):
+    """Point the real detector ``cid`` at a fake system root, as root-owned
+    files (``_ROOT_UID``/``SYSTEM_FILE_UID`` = the test user), on
+    ``osname``, and log verify / copy / command / delete events."""
+    from cleanix.core import remedy_exec, root_delete
+
+    sysroot = fx.tmp / "fsroot"
+    sysroot.mkdir(exist_ok=True)
+    monkeypatch.setattr(oc.OrphanReporter, "sysroot", str(sysroot))
+    monkeypatch.setattr(plat, "current_os", lambda: osname)
+    monkeypatch.setattr(oc, "SYSTEM_FILE_UID", UID)
+    # tmp_path lies in sticky, world-writable /tmp: accept the chain for the
+    # absence rule here (its own logic is tested in test_system_remedies)
+    monkeypatch.setattr(elevated, "_evidence_component_problem", lambda st, u, g: None)
+    real_dirs = tuple(str(sysroot / d.lstrip("/")) for d in dirs)
+    monkeypatch.setattr(elevated, "admin_finding_ids", lambda: frozenset({cid}))
+    monkeypatch.setattr(elevated, "finding_path_roots", lambda: {cid: real_dirs})
+    monkeypatch.setattr(elevated, "finding_kind_dirs", lambda: {kind: real_dirs})
+    events = []
+    runner = _Runner(events)
+    monkeypatch.setattr(remedy_exec, "runner", runner)
+
+    def no_spawn(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("a real command was about to run")
+
+    monkeypatch.setattr(remedy_exec, "_spawn", no_spawn)
+    real_copy = quarantine.Quarantine.store_copy
+
+    def store_copy(self, path):
+        events.append(("copy", str(path)))
+        return real_copy(self, path)
+
+    monkeypatch.setattr(quarantine.Quarantine, "store_copy", store_copy)
+    real_remove = root_delete.remove
+
+    def remove(path):
+        events.append(("delete", str(path)))
+        return real_remove(path)
+
+    monkeypatch.setattr(root_delete, "remove", remove)
+    real_verify = reverify.REVERIFIERS[cid]
+
+    def verify(item, config):
+        events.append(("verify", item.path))
+        return real_verify(item, config)
+
+    monkeypatch.setitem(reverify.REVERIFIERS, cid, verify)
+    tools = _ReadOnlyTools()
+    monkeypatch.setattr(oc, "run_command", tools)
+    for d in dirs:
+        (sysroot / d.lstrip("/")).mkdir(parents=True, exist_ok=True)
+    return sysroot, events, runner, tools
+
+
+def _plain(p):
+    os.chmod(str(p), 0o644)
+    return p
+
+
+def _plist_job(where, name, label=None, program=None):
+    import plistlib
+
+    p = where / f"{name}.plist"
+    with open(str(p), "wb") as fh:
+        plistlib.dump({"Label": label or name,
+                       "ProgramArguments": [program or f"/opt/gone/{name}", "-x"]}, fh)
+    return _plain(p)
+
+
+def _own_items(reporter_cls, prefix):
+    return [i for i in reporter_cls(Config()).scan().items
+            if i.remedy is not None and i.path.startswith(str(prefix))]
+
+
+def _by_name(result):
+    return {Path(o.key.split("|", 2)[2]).name: o for o in result.findings}
+
+
+def _idx(events, kind, what):
+    return [n for n, e in enumerate(events) if e[0] == kind and what in str(e[1])]
+
+
+@posix_only
+def test_helper_system_launch_jobs_end_to_end(fx, monkeypatch):
+    """macOS: a LaunchDaemon is re-verified, copied into the root
+    quarantine's copy-only run, booted out (system domain) and deleted, in
+    that order; a LaunchAgent is copied and deleted but never booted out.
+    Permanent (no quarantine run), a note says where the copy is, and
+    nothing is written under the user's home."""
+    from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
+
+    sysroot, events, runner, _t = _sys_env(
+        fx, monkeypatch, plat.MACOS, "orphan_launch_jobs", "launch_job",
+        ("/Library/LaunchAgents", "/Library/LaunchDaemons"))
+    daemons = sysroot / "Library" / "LaunchDaemons"
+    agents = sysroot / "Library" / "LaunchAgents"
+    d = _plist_job(daemons, "com.gone.d")
+    a = _plist_job(agents, "com.gone.a")
+    originals = {str(d): d.read_bytes(), str(a): a.read_bytes()}
+    items = _own_items(OrphanLaunchJobReporter, sysroot)
+    assert {Path(i.path).name for i in items} == {"com.gone.d.plist", "com.gone.a.plist"}
+    assert all(i.remedy.kind is RemedyKind.LAUNCH_JOB for i in items)
+    seen_at_stop = []
+
+    def at_bootout(argv):
+        kept = sorted(fx.qbase.glob("*/files/*"))
+        seen_at_stop.append((d.exists(), [k.read_bytes() for k in kept]))
+        return 0, "", ""
+
+    runner.answers[("launchctl", "bootout", "system/com.gone.d")] = at_bootout
+    fx.cleaners.append(OrphanLaunchJobReporter(Config()))
+    home_before = tree(fx.home)
+    rc, result = run_helper(fx, request(items))
+    assert rc == elevated.EXIT_OK, result.errors
+    st = _by_name(result)
+    assert st["com.gone.d.plist"].status == "removed"
+    assert st["com.gone.a.plist"].status == "removed"
+    assert not d.exists() and not a.exists()
+    # exactly one command, the system-domain bootout of the daemon
+    assert runner.calls == [["launchctl", "bootout", "system/com.gone.d"]]
+    # the copy existed (and the plist was still there) when it was stopped
+    ((present, kept),) = seen_at_stop
+    assert present and originals[str(d)] in kept
+    # order: re-verified -> copied -> stopped -> deleted
+    v, c = _idx(events, "verify", str(d)), _idx(events, "copy", str(d))
+    s, x = _idx(events, "cmd", "system/com.gone.d"), _idx(events, "delete", str(d))
+    assert len(v) == 2 and len(c) == 1 and len(s) == 1 and len(x) == 1
+    assert v[-1] < c[0] < s[0] < x[0]
+    ca, xa = _idx(events, "copy", str(a)), _idx(events, "delete", str(a))
+    assert len(ca) == 1 and len(xa) == 1 and ca[0] < xa[0]
+    # the copies: one copy-only run in the ROOT quarantine, no restorable run
+    assert result.quarantine_run == "" and result.backup_run
+    run = fx.qbase / result.backup_run
+    assert stat.S_IMODE(os.lstat(str(run)).st_mode) == 0o700
+    manifest = json.loads((run / "manifest.json").read_text())
+    assert [m["type"] for m in manifest["items"]] == ["copy", "copy"]
+    for m in manifest["items"]:
+        assert Path(m["stored"]).read_bytes() == originals[m["original"]]
+    # honest notes: permanent, where the copy is; the agent was not stopped
+    where = str(run / "files")
+    assert st["com.gone.d.plist"].note.startswith(
+        "permanent: the job is stopped and its file removed (a copy of the file is kept in "
+        + where)
+    assert st["com.gone.a.plist"].note.startswith("permanent: its file was removed")
+    assert "not stopped here" in st["com.gone.a.plist"].note
+    assert tree(fx.home) == home_before
+    assert not fx.user_qroot.exists()
+
+
+@posix_only
+def test_helper_launch_job_command_failure_and_shared_label(fx, monkeypatch):
+    """A failing bootout does not block the removal (a warning in the note);
+    a label another plist declares (here a /System daemon) is never booted
+    out, but the stale file is still removed, with a warning."""
+    from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
+
+    sysroot, _events, runner, _t = _sys_env(
+        fx, monkeypatch, plat.MACOS, "orphan_launch_jobs", "launch_job",
+        ("/Library/LaunchAgents", "/Library/LaunchDaemons"))
+    daemons = sysroot / "Library" / "LaunchDaemons"
+    sysd = sysroot / "System" / "Library" / "LaunchDaemons"
+    sysd.mkdir(parents=True)
+    f = _plist_job(daemons, "com.gone.fail")
+    s = _plist_job(daemons, "com.gone.shared")
+    _plist_job(sysd, "com.vendor.real", label="com.gone.shared", program="/usr/libexec/x")
+    runner.answers[("launchctl", "bootout", "system/com.gone.fail")] = (
+        5, "", "Boot-out failed: 5: Input/output error")
+    items = _own_items(OrphanLaunchJobReporter, daemons)
+    assert len(items) == 2
+    fx.cleaners.append(OrphanLaunchJobReporter(Config()))
+    rc, result = run_helper(fx, request(items, permanent=True))
+    assert rc == elevated.EXIT_OK
+    st = _by_name(result)
+    assert st["com.gone.fail.plist"].status == "removed" and not f.exists()
+    assert "warning: launchctl bootout system/com.gone.fail failed (exit 5" in \
+        st["com.gone.fail.plist"].note
+    assert st["com.gone.shared.plist"].status == "removed" and not s.exists()
+    assert "another job uses this label" in st["com.gone.shared.plist"].note
+    assert runner.calls == [["launchctl", "bootout", "system/com.gone.fail"]]
+    assert result.backup_run and result.quarantine_run == ""
+
+
+@posix_only
+def test_helper_launch_job_changed_after_its_scan_is_skipped(fx, monkeypatch):
+    """Right before acting, the ORIGINAL evidence is re-checked: a program
+    that reappeared, a plist swapped for a link, or a plist that became
+    writable by others is skipped -- no copy, no command, nothing removed."""
+    from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
+
+    sysroot, events, runner, _t = _sys_env(
+        fx, monkeypatch, plat.MACOS, "orphan_launch_jobs", "launch_job",
+        ("/Library/LaunchAgents", "/Library/LaunchDaemons"))
+    daemons = sysroot / "Library" / "LaunchDaemons"
+    back = _plist_job(daemons, "com.gone.back")
+    swap = _plist_job(daemons, "com.gone.swap")
+    loose = _plist_job(daemons, "com.gone.loose")
+    victim = fx.tmp / "victim.plist"
+    victim.write_bytes(swap.read_bytes())
+    items = _own_items(OrphanLaunchJobReporter, daemons)
+    assert len(items) == 3
+    fx.cleaners.append(OrphanLaunchJobReporter(Config()))
+    real_scan = service.scan
+
+    def scan_then_change(*a, **k):
+        result = real_scan(*a, **k)
+        prog = sysroot / "opt" / "gone" / "com.gone.back"
+        prog.parent.mkdir(parents=True, exist_ok=True)
+        prog.write_text("#!/bin/sh\n")  # reinstalled
+        swap.unlink()
+        os.symlink(str(victim), str(swap))
+        os.chmod(str(loose), 0o666)
+        return result
+
+    monkeypatch.setattr(service, "scan", scan_then_change)
+    rc, result = run_helper(fx, request(items))
+    assert rc == elevated.EXIT_OK
+    st = _by_name(result)
+    assert {o.status for o in st.values()} == {"skipped"}
+    assert back.exists() and os.path.islink(str(swap)) and victim.exists() and loose.exists()
+    assert runner.calls == [] and [e for e in events if e[0] in ("copy", "delete")] == []
+    assert result.backup_run == ""
+
+
+@posix_only
+def test_helper_systemd_units_end_to_end(fx, monkeypatch):
+    """Linux: unit files in /etc/systemd/system are re-verified (package
+    ownership re-queried right before), copied, disabled (template units
+    without --now) and deleted; ONE daemon-reload after the batch. A unit a
+    package started owning after the helper's scan is skipped."""
+    from cleanix.cleaners.stale_services import StaleSystemdUnitReporter
+
+    sysroot, events, runner, tools = _sys_env(
+        fx, monkeypatch, plat.LINUX, "stale_services", "systemd_unit", ("/etc/systemd/system",))
+    monkeypatch.setattr(StaleSystemdUnitReporter, "pkg_backend", lambda self: "dpkg")
+    etc = sysroot / "etc" / "systemd" / "system"
+    (sysroot / "usr" / "lib" / "systemd" / "system").mkdir(parents=True)
+    units = {}
+    for name in ("gone.service", "tpl@.service", "owned.service"):
+        p = etc / name
+        p.write_text("[Service]\nExecStart=/opt/gone/bin/x\n")
+        units[name] = _plain(p)
+    items = _own_items(StaleSystemdUnitReporter, etc)
+    assert {Path(i.path).name for i in items} == set(units)
+    assert all(i.remedy.kind is RemedyKind.SYSTEMD_UNIT for i in items)
+    fx.cleaners.append(StaleSystemdUnitReporter(Config()))
+    real_scan = service.scan
+
+    def scan_then_install(*a, **k):
+        result = real_scan(*a, **k)
+        tools.owned.add("/etc/systemd/system/owned.service")
+        return result
+
+    monkeypatch.setattr(service, "scan", scan_then_install)
+    rc, result = run_helper(fx, request(items, permanent=True))
+    assert rc == elevated.EXIT_OK, result.errors
+    st = _by_name(result)
+    assert st["gone.service"].status == "removed" and not units["gone.service"].exists()
+    assert st["tpl@.service"].status == "removed" and not units["tpl@.service"].exists()
+    assert st["owned.service"].status == "skipped" and units["owned.service"].exists()
+    assert "package owns it" in st["owned.service"].reason
+    assert runner.calls == [["systemctl", "disable", "--now", "gone.service"],
+                            ["systemctl", "disable", "tpl@.service"],
+                            ["systemctl", "daemon-reload"]]
+    # the reload runs once, after every removal of the batch
+    deletes = [n for n, e in enumerate(events) if e[0] == "delete"]
+    reload = _idx(events, "cmd", "daemon-reload")
+    assert len(reload) == 1 and max(deletes) < reload[0]
+    for name in ("gone.service", "tpl@.service"):
+        path = str(units[name])
+        assert (_idx(events, "verify", path)[-1] < _idx(events, "copy", path)[0]
+                < _idx(events, "delete", path)[0])
+        assert st[name].note.startswith("permanent: the job is stopped and its file removed")
+    # permanent run, yet the copies are kept in the root quarantine
+    assert result.quarantine_run == "" and result.backup_run
+    manifest = json.loads((fx.qbase / result.backup_run / "manifest.json").read_text())
+    assert sorted(Path(m["original"]).name for m in manifest["items"]) == [
+        "gone.service", "tpl@.service"]
+
+
+@posix_only
+def test_helper_receipts_end_to_end(fx, monkeypatch):
+    """macOS: a receipt whose every listed file is gone is copied (plist and
+    bom) and forgotten with ``pkgutil --forget <id>``; the helper then
+    verifies both files are gone. A forget that leaves the receipt, or
+    fails, is reported as not removed (the copy is kept)."""
+    import plistlib
+
+    from cleanix.cleaners import stale_receipts
+    from cleanix.cleaners.stale_receipts import StaleReceiptReporter
+
+    sysroot, events, runner, tools = _sys_env(
+        fx, monkeypatch, plat.MACOS, "stale_receipts", "pkg_receipt",
+        (stale_receipts.RECEIPTS_DIR,))
+    monkeypatch.setattr(oc, "tool", lambda name: f"/usr/sbin/{name}")
+    rd = sysroot / stale_receipts.RECEIPTS_DIR.lstrip("/")
+    paths = {}
+    for pkg_id in ("com.vendor.gone", "com.vendor.stuck", "com.vendor.fails"):
+        p = rd / f"{pkg_id}.plist"
+        p.write_text(f"receipt {pkg_id}")
+        b = rd / f"{pkg_id}.bom"
+        b.write_text(f"bom {pkg_id}")
+        paths[pkg_id] = (_plain(p), _plain(b))
+        info = plistlib.dumps({"pkgid": pkg_id, "volume": "/",
+                               "install-location": "Applications"}).decode("utf-8")
+        tools.pkgs[pkg_id] = (info, [f"Gone-{pkg_id}.app/Contents/MacOS/x"])
+    items = _own_items(StaleReceiptReporter, rd)
+    assert len(items) == 3 and all(i.remedy.kind is RemedyKind.PKG_RECEIPT for i in items)
+
+    def forgets(argv):
+        for f in paths[argv[2]]:
+            f.unlink()
+        return 0, "Forgot package 'x' on '/'.", ""
+
+    runner.answers[("pkgutil", "--forget", "com.vendor.gone")] = forgets
+    runner.answers[("pkgutil", "--forget", "com.vendor.fails")] = (1, "", "No receipt")
+    fx.cleaners.append(StaleReceiptReporter(Config()))
+    rc, result = run_helper(fx, request(items))
+    assert rc == elevated.EXIT_OK
+    st = {Path(o.key.split("|", 2)[2]).stem: o for o in result.findings}
+    assert st["com.vendor.gone"].status == "removed"
+    assert st["com.vendor.gone"].note.startswith(
+        "permanent: the install record is forgotten (pkgutil --forget; a copy of its files")
+    assert not any(f.exists() for f in paths["com.vendor.gone"])
+    assert st["com.vendor.stuck"].status == "not_removed"
+    assert "still there" in st["com.vendor.stuck"].reason
+    assert st["com.vendor.fails"].status == "not_removed"
+    assert "pkgutil --forget failed (exit 1" in st["com.vendor.fails"].reason
+    assert all(f.exists() for f in paths["com.vendor.stuck"] + paths["com.vendor.fails"])
+    assert sorted(runner.calls) == sorted(
+        [["pkgutil", "--forget", i] for i in ("com.vendor.gone", "com.vendor.stuck",
+                                              "com.vendor.fails")])
+    # plist AND bom copied before the forget, for every receipt acted on
+    for pkg_id, (p, b) in paths.items():
+        forget = _idx(events, "cmd", pkg_id)
+        assert _idx(events, "copy", str(p))[0] < forget[0]
+        assert _idx(events, "copy", str(b))[0] < forget[0]
+        assert _idx(events, "delete", str(p)) == []  # pkgutil removes it, never unlink
+    manifest = json.loads((fx.qbase / result.backup_run / "manifest.json").read_text())
+    stored = {Path(m["original"]).name: Path(m["stored"]).read_text()
+              for m in manifest["items"]}
+    assert stored["com.vendor.gone.plist"] == "receipt com.vendor.gone"
+    assert stored["com.vendor.gone.bom"] == "bom com.vendor.gone"
+    assert result.removed == 1 and result.quarantine_run == ""
+
+
+@posix_only
+def test_helper_receipt_with_a_file_back_is_skipped(fx, monkeypatch):
+    import plistlib
+
+    from cleanix.cleaners import stale_receipts
+    from cleanix.cleaners.stale_receipts import StaleReceiptReporter
+
+    sysroot, events, runner, tools = _sys_env(
+        fx, monkeypatch, plat.MACOS, "stale_receipts", "pkg_receipt",
+        (stale_receipts.RECEIPTS_DIR,))
+    monkeypatch.setattr(oc, "tool", lambda name: f"/usr/sbin/{name}")
+    rd = sysroot / stale_receipts.RECEIPTS_DIR.lstrip("/")
+    p = rd / "com.vendor.back.plist"
+    p.write_text("r")
+    _plain(p)
+    info = plistlib.dumps({"pkgid": "com.vendor.back", "volume": "/",
+                           "install-location": "/"}).decode("utf-8")
+    tools.pkgs["com.vendor.back"] = (info, ["usr/local/vend/one", "usr/local/vend/two"])
+    items = _own_items(StaleReceiptReporter, rd)
+    assert len(items) == 1
+    fx.cleaners.append(StaleReceiptReporter(Config()))
+    real_scan = service.scan
+
+    def scan_then_reinstall(*a, **k):
+        result = real_scan(*a, **k)
+        f = sysroot / "usr" / "local" / "vend" / "two"
+        f.parent.mkdir(parents=True)
+        f.write_text("x")
+        return result
+
+    monkeypatch.setattr(service, "scan", scan_then_reinstall)
+    rc, result = run_helper(fx, request(items))
+    (out,) = result.findings
+    assert out.status == "skipped" and "exists now" in out.reason
+    assert p.exists() and runner.calls == [] and _idx(events, "copy", "") == []
+
+
+@posix_only
+def test_helper_job_deadline_mid_batch_is_honest(fx, monkeypatch):
+    """The deadline passes during the second daemon's own re-check right
+    before acting: the first was removed, the second is neither copied,
+    stopped nor removed, and says so."""
+    from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
+
+    sysroot, events, runner, _t = _sys_env(
+        fx, monkeypatch, plat.MACOS, "orphan_launch_jobs", "launch_job",
+        ("/Library/LaunchAgents", "/Library/LaunchDaemons"))
+    daemons = sysroot / "Library" / "LaunchDaemons"
+    a = _plist_job(daemons, "com.gone.a")
+    b = _plist_job(daemons, "com.gone.b")
+    items = sorted(_own_items(OrphanLaunchJobReporter, daemons), key=lambda i: i.path)
+    fx.cleaners.append(OrphanLaunchJobReporter(Config()))
+    clock = [1000.0]
+    monkeypatch.setattr(elevated, "_monotonic", lambda: clock[0])
+    logged = reverify.REVERIFIERS["orphan_launch_jobs"]
+    calls = []
+
+    def slow(item, config):
+        calls.append(item.path)
+        why = logged(item, config)
+        if len(calls) == 4:  # b's re-check right before acting on it
+            clock[0] += elevated.DEFAULT_DEADLINE + 1
+        return why
+
+    monkeypatch.setitem(reverify.REVERIFIERS, "orphan_launch_jobs", slow)
+    rc, result = run_helper(fx, request(items))
+    assert rc == elevated.EXIT_DEADLINE and result.deadline_hit
+    st = _by_name(result)
+    assert st["com.gone.a.plist"].status == "removed" and not a.exists()
+    assert st["com.gone.b.plist"].status == "not_removed"
+    assert st["com.gone.b.plist"].reason == actions.STOPPED_AT_DEADLINE and b.exists()
+    assert runner.calls == [["launchctl", "bootout", "system/com.gone.a"]]
+    assert _idx(events, "copy", str(b)) == []
+
+
+@posix_only
+def test_helper_jobs_need_a_usable_backup_location(fx, monkeypatch):
+    """Even in permanent mode the copy is required: an unusable root
+    quarantine means nothing is copied, stopped or removed."""
+    from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
+
+    sysroot, events, runner, _t = _sys_env(
+        fx, monkeypatch, plat.MACOS, "orphan_launch_jobs", "launch_job",
+        ("/Library/LaunchAgents", "/Library/LaunchDaemons"))
+    d = _plist_job(sysroot / "Library" / "LaunchDaemons", "com.gone.d")
+    items = _own_items(OrphanLaunchJobReporter, sysroot)
+    fx.cleaners.append(OrphanLaunchJobReporter(Config()))
+
+    def broken(uid, groups):
+        raise elevated.Refused("is writable by other users")
+
+    monkeypatch.setattr(elevated, "_prepare_root_quarantine", broken)
+    rc, result = run_helper(fx, request(items, permanent=True))
+    (out,) = result.findings
+    assert out.status == "not_removed"
+    assert "administrator quarantine" in out.reason and "nothing was removed" in out.reason
+    assert d.exists() and runner.calls == [] and events == []
+
+
+@posix_only
+def test_helper_refuses_job_kinds_on_the_wrong_platform(fx, monkeypatch):
+    """A systemd unit request on macOS (or a launch job on Linux) is refused
+    per item; nothing is scanned for it."""
+    from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
+
+    sysroot, events, runner, _t = _sys_env(
+        fx, monkeypatch, plat.MACOS, "orphan_launch_jobs", "launch_job",
+        ("/Library/LaunchAgents", "/Library/LaunchDaemons"))
+    d = _plist_job(sysroot / "Library" / "LaunchDaemons", "com.gone.d")
+    items = _own_items(OrphanLaunchJobReporter, sysroot)
+    fx.cleaners.append(OrphanLaunchJobReporter(Config()))
+    monkeypatch.setattr(plat, "current_os", lambda: plat.LINUX)
+    rc, result = run_helper(fx, request(items))
+    (out,) = result.findings
+    assert out.status == "refused" and out.reason == elevated.KIND_NOT_SUPPORTED
+    assert fx.scans == [] and d.exists() and runner.calls == []
+
+
+@posix_only
+def test_helper_job_changed_while_the_batch_runs_is_skipped(fx, monkeypatch):
+    """The re-check right before acting on EACH job: b's program comes back
+    while a is being stopped; b is then neither copied, stopped nor
+    removed."""
+    from cleanix.cleaners.orphan_launch_jobs import OrphanLaunchJobReporter
+
+    sysroot, events, runner, _t = _sys_env(
+        fx, monkeypatch, plat.MACOS, "orphan_launch_jobs", "launch_job",
+        ("/Library/LaunchAgents", "/Library/LaunchDaemons"))
+    daemons = sysroot / "Library" / "LaunchDaemons"
+    a = _plist_job(daemons, "com.gone.a")
+    b = _plist_job(daemons, "com.gone.b")
+    items = sorted(_own_items(OrphanLaunchJobReporter, daemons), key=lambda i: i.path)
+
+    def reinstall_b(argv):
+        prog = sysroot / "opt" / "gone" / "com.gone.b"
+        prog.parent.mkdir(parents=True, exist_ok=True)
+        prog.write_text("#!/bin/sh\n")
+        return 0, "", ""
+
+    runner.answers[("launchctl", "bootout", "system/com.gone.a")] = reinstall_b
+    fx.cleaners.append(OrphanLaunchJobReporter(Config()))
+    rc, result = run_helper(fx, request(items))
+    st = _by_name(result)
+    assert st["com.gone.a.plist"].status == "removed" and not a.exists()
+    assert st["com.gone.b.plist"].status == "skipped" and b.exists()
+    assert "program exists now" in st["com.gone.b.plist"].reason
+    assert runner.calls == [["launchctl", "bootout", "system/com.gone.a"]]
+    assert _idx(events, "copy", str(b)) == []

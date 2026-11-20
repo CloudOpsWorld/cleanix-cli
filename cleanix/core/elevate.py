@@ -132,6 +132,9 @@ class FindingOutcome:
     status: str
     freed: int = 0
     reason: str = ""
+    # What was done beyond the status (e.g. "permanent: ... a copy of the
+    # file is kept in <dir> ...; warning: ..."); "" when nothing to add.
+    note: str = ""
 
 
 @dataclass
@@ -166,6 +169,10 @@ class HelperResult:
     # nothing was moved there).
     findings: List[FindingOutcome] = field(default_factory=list)
     quarantine_run: str = ""
+    # Findings action only: the copy-only run in the helper's root-owned
+    # quarantine holding copies of removed launch-job / unit / receipt
+    # files (manual recovery only; never an Undo). "" when none.
+    backup_run: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -656,6 +663,77 @@ def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
+# Remedy kind (other than "path") -> the one scenario that may carry it.
+KIND_SCENARIOS = {
+    "launch_job": "orphan_launch_jobs",
+    "systemd_unit": "stale_services",
+    "pkg_receipt": "stale_receipts",
+}
+# Scenario -> the remedy kinds its system-wide findings carry (any other
+# scenario: "path" only). A request pairing a scenario with another kind is
+# refused.
+SCENARIO_KINDS = {
+    "orphan_files": frozenset({"path"}),
+    "orphan_app_data": frozenset({"path"}),
+    "stale_launchers": frozenset({"path"}),
+    "stale_services": frozenset({"path", "systemd_unit"}),
+    "orphan_launch_jobs": frozenset({"launch_job"}),
+    "stale_receipts": frozenset({"pkg_receipt"}),
+}
+_KIND_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@:+-]{0,254}")
+_PKG_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,254}")
+
+
+def finding_kind_dirs() -> Dict[str, Tuple[str, ...]]:
+    """Per non-path remedy kind, the folders its files must lie DIRECTLY in
+    (the detectors' own constants)."""
+    from cleanix.cleaners import orphan_launch_jobs, stale_receipts
+
+    return {
+        "launch_job": tuple(orphan_launch_jobs.SYSTEM_DIRS),
+        "systemd_unit": ("/etc/systemd/system",),
+        "pkg_receipt": (stale_receipts.RECEIPTS_DIR,),
+    }
+
+
+def finding_kind_problem(cleaner_id: str, kind: str, path: str,
+                         kind_dirs: Optional[Dict[str, Tuple[str, ...]]] = None) -> Optional[str]:
+    """Why a request item of remedy ``kind`` is never acted on (lexical
+    only), or None. "path" items are judged by ``finding_path_problem``
+    alone. Every other kind belongs to exactly one scenario
+    (``KIND_SCENARIOS``) and its file must lie DIRECTLY in one of that
+    kind's folders, with a plain name: a ``.plist`` (never ``com.apple.*``),
+    a ``.service`` unit, or ``<package id>.plist``. A scenario is paired
+    only with the kinds it offers (``SCENARIO_KINDS``)."""
+    if kind not in SCENARIO_KINDS.get(cleaner_id, frozenset({"path"})):
+        return "this scenario never offers this kind of action"
+    if kind == "path":
+        return None
+    if KIND_SCENARIOS.get(kind) != cleaner_id:
+        return "this scenario never offers this kind of action"
+    dirs = (kind_dirs if kind_dirs is not None else finding_kind_dirs()).get(kind, ())
+    parent, _sep, base = path.rpartition("/")
+    if parent not in dirs:
+        return "it is not directly inside a folder this action may change"
+    if base.casefold().startswith("com.apple."):
+        return "an Apple job or package is never touched"
+    if kind == "launch_job":
+        stem = base[: -len(".plist")] if base.endswith(".plist") else ""
+        if not _KIND_NAME_RE.fullmatch(stem) or ".." in stem:
+            return "not a plain launch job file name"
+    elif kind == "systemd_unit":
+        if (not base.endswith(".service") or len(base) <= len(".service")
+                or not _KIND_NAME_RE.fullmatch(base) or ".." in base):
+            return "not a plain unit file name"
+    elif kind == "pkg_receipt":
+        stem = base[: -len(".plist")] if base.endswith(".plist") else ""
+        if not _PKG_ID_RE.fullmatch(stem) or ".." in stem:
+            return "not a plain receipt file name"
+    else:
+        return "unknown kind"
+    return None
+
+
 def finding_path_problem(cleaner_id: str, path: str,
                          roots: Dict[str, Tuple[str, ...]],
                          never: Sequence[str] = (), *,
@@ -835,14 +913,18 @@ def _result_payload(result: HelperResult) -> dict:
         "findings": [
             {"key": _CONTROL_RE.sub(" ", str(o.key)), "status": str(o.status),
              "freed": max(0, int(o.freed)),
-             "reason": plain_text(o.reason)}
+             "reason": plain_text(o.reason),
+             "note": _CONTROL_RE.sub(" ", str(o.note))[:MAX_NOTE_LEN]}
             for o in list(result.findings)[:MAX_FINDING_ITEMS]
         ],
         "quarantine_run": str(result.quarantine_run),
+        "backup_run": str(result.backup_run),
     }
 
 
 _RESULT_RUN_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z._-]{0,127}")
+MAX_NOTE_LEN = 2000
+_OUTCOME_FIELDS = {"key", "status", "freed", "reason"}
 
 
 def _parse_finding_outcomes(value) -> List[FindingOutcome]:
@@ -850,12 +932,16 @@ def _parse_finding_outcomes(value) -> List[FindingOutcome]:
         raise ValueError("result field 'findings' is invalid")
     out: List[FindingOutcome] = []
     for entry in value:
-        if not isinstance(entry, dict) or set(entry) != {"key", "status", "freed", "reason"}:
+        # An older helper writes no "note"; anything else is refused.
+        if not isinstance(entry, dict) or (set(entry) != _OUTCOME_FIELDS
+                                           and set(entry) != _OUTCOME_FIELDS | {"note"}):
             raise ValueError("result field 'findings' is invalid")
         key, status, freed, reason = (entry["key"], entry["status"], entry["freed"],
                                       entry["reason"])
+        note = entry.get("note", "")
         if (not isinstance(key, str) or len(key) > 64 + 6 + MAX_FINDING_PATH_LEN
                 or status not in FINDING_STATUSES or not isinstance(reason, str)
+                or not isinstance(note, str) or len(note) > MAX_NOTE_LEN
                 or type(freed) is not int or freed < 0):
             raise ValueError("result field 'findings' is invalid")
         try:
@@ -863,7 +949,8 @@ def _parse_finding_outcomes(value) -> List[FindingOutcome]:
         except ValueError:
             raise ValueError("result field 'findings' is invalid") from None
         out.append(FindingOutcome(key=key, status=status, freed=freed,
-                                  reason=plain_text(reason)))
+                                  reason=plain_text(reason),
+                                  note=_CONTROL_RE.sub(" ", note)))
     return out
 
 
@@ -901,6 +988,9 @@ def read_result(path: Path) -> HelperResult:
     run = obj.get("quarantine_run", "")
     if not isinstance(run, str) or (run and not _RESULT_RUN_RE.fullmatch(run)):
         raise ValueError("result field 'quarantine_run' is invalid")
+    backup = obj.get("backup_run", "")
+    if not isinstance(backup, str) or (backup and not _RESULT_RUN_RE.fullmatch(backup)):
+        raise ValueError("result field 'backup_run' is invalid")
     return HelperResult(
         freed=num("freed"), removed=num("removed"),
         errors=[plain_text(e) for e in errors[:MAX_ERRORS]],
@@ -908,4 +998,5 @@ def read_result(path: Path) -> HelperResult:
         refused=num("refused"),
         findings=_parse_finding_outcomes(obj.get("findings", [])),
         quarantine_run=run,
+        backup_run=backup,
     )

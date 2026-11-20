@@ -312,7 +312,8 @@ def _inventory(root, homes: Iterable[Path], budget=None, *,
     walked (``/System/Applications``, the other app roots, each home's
     ``Applications``) must be readable, and Spotlight's list of app bundles
     must be available AND plausible: it must name every top-level app
-    bundle the walk found (real folders, not links); otherwise None
+    bundle the walk found (real folders, not links; at least MIN_APPS of
+    them, so an empty walk never passes); otherwise None
     (unknown). Spotlight disabled, still indexing or not visible from the
     helper's environment thus never counts as "no such app"."""
     homes = [Path(h) for h in homes]
@@ -328,6 +329,10 @@ def _inventory(root, homes: Iterable[Path], budget=None, *,
             if not _walk_apps(h / "Applications", ctx, 1, 3) and require_mdfind:
                 return None
         if len(ctx.top_ids) < MIN_APPS:
+            return None
+        if require_mdfind and len(set(ctx.top_paths)) < MIN_APPS:
+            # strict: at least MIN_APPS REAL (non-link) bundles walked, so
+            # "Spotlight lists every walked bundle" is never vacuous
             return None
         if len(ctx.noid) > 3 or len(ctx.noid) * 10 > ctx.apps:
             return None

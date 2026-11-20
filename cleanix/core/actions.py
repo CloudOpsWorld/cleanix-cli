@@ -20,6 +20,7 @@ itself: accepted residual risk (the guard and the link-safe removal in
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
 from dataclasses import dataclass, field
@@ -57,6 +58,8 @@ KEEPS_COPY = "it is, or contains, the copy kept of a duplicate group"
 LISTED_TWICE = "listed twice"
 STOPPED_AT_DEADLINE = ("the time limit was reached while it was being re-checked; "
                        "nothing was done")
+NO_BACKUP_PLACE = ("no administrator location to keep a copy of the file; "
+                   "nothing was done")
 
 
 @dataclass
@@ -105,14 +108,23 @@ def _survivor_reason(item: CleanableItem, batch: Optional[Set[str]] = None) -> O
     return None
 
 
-def _recheck(item: CleanableItem, config: Config) -> Optional[str]:
+def _recheck(item: CleanableItem, config: Config, root_mode: bool = False) -> Optional[str]:
     """The fingerprint/type (and, for a duplicate, kept-copy) checks; run up
     front and again right before the item's removal. Launch jobs and units
-    get their own full re-verification (:func:`remedy_exec.check`)."""
+    get their own full re-verification: user-level ones by
+    :func:`remedy_exec.check`, system-wide ones (root mode only) by
+    :func:`system_remedy.check` -- never the other."""
+    from cleanix.core import system_remedy
+
     remedy = item.remedy
     assert remedy is not None and item.path
-    if remedy.kind in remedy_exec.KINDS:
+    if root_mode:
+        if remedy.kind in remedy_exec.SYSTEM_KINDS:
+            return system_remedy.check(item, config)[0]
+    elif remedy.kind in remedy_exec.KINDS:
         return remedy_exec.check(item, config)[0]
+    if remedy.kind is not RemedyKind.PATH:
+        return NOT_HANDLED
     grouped = bool(remedy.group)
     why = verify_path(item.path, remedy.fingerprint, allow_dir=not grouped,
                       link=link_target(remedy))
@@ -130,20 +142,36 @@ def _verify(item: CleanableItem, batch: Set[str],
             config: Config,
             cancel: Optional[Callable[[], bool]] = None,
             allow_root: bool = False,
-            root_mode: bool = False) -> Optional[str]:
+            root_mode: bool = False,
+            backup_root: Optional[Path] = None) -> Optional[str]:
     """Why ``item`` must be skipped, or None when it may be acted on now.
 
     ``batch`` holds the path keys of every supplied item (a duplicate's
     kept copy must not be among them); ``hashed`` caches the kept-copy
     content checks of this batch. ``allow_root`` lets ``requires_root``
     findings through (elevated helper only); ``root_mode`` (helper) handles
-    plain PATH findings only: no duplicates, no launch jobs or units."""
+    plain PATH findings and -- with ``allow_root`` and a ``backup_root``
+    for their copies -- system-wide launch jobs, units and package
+    receipts (``requires_root`` only); never duplicates or user-level
+    jobs/units."""
     remedy = item.remedy
     if not item.report_only or remedy is None:
         return NOT_A_FINDING
-    if item.kind is not ItemKind.PATH or remedy.kind not in _HANDLED or not item.path:
+    if item.kind is not ItemKind.PATH or not item.path:
         return NOT_HANDLED
-    if root_mode and (remedy.kind is not RemedyKind.PATH or remedy.group):
+    if root_mode:
+        if remedy.group:
+            return NOT_HANDLED
+        if remedy.kind in remedy_exec.SYSTEM_KINDS:
+            if not (allow_root and item.requires_root):
+                return NOT_HANDLED
+            if backup_root is None:
+                return NO_BACKUP_PLACE
+        elif remedy.kind is not RemedyKind.PATH:
+            return NOT_HANDLED
+    elif remedy.kind not in _HANDLED:
+        if remedy.kind in remedy_exec.SYSTEM_KINDS and item.requires_root:
+            return NEEDS_ELEVATION
         return NOT_HANDLED
     if link_target(remedy) is not None and not root_mode:
         # Link remedies (broken system unit links) are only acted on by the
@@ -157,7 +185,7 @@ def _verify(item: CleanableItem, batch: Set[str],
         why = _survivor_reason(item, batch)
         if why is not None:
             return why
-    why = _recheck(item, config)
+    why = _recheck(item, config, root_mode)
     if why is not None:
         return why
     try:
@@ -227,6 +255,8 @@ def act(
     on_item: Optional[Callable[[CleanableItem, Optional[CleanOutcome], Optional[str]],
                                None]] = None,
     on_quarantine_claim: Optional[Callable[[str], None]] = None,
+    backup_root: Optional[Path] = None,
+    on_backup_claim: Optional[Callable[[str], None]] = None,
 ) -> ActSummary:
     """Act on findings: quarantine (or, with ``permanent``, delete) each
     verified PATH finding through :func:`service.clean`, as one batch (one
@@ -260,8 +290,9 @@ def act(
     a non-None return skipping the item; after it (same two moments) the
     finding's own evidence is re-checked by its scenario's re-verifier
     (:func:`reverify.reverify`; no re-verifier: skipped). With ``allow_root`` or
-    ``quarantine_root`` only plain PATH findings are handled (no
-    duplicates, launch jobs or units). With ``allow_root`` an item that is a
+    ``quarantine_root`` only plain PATH findings and system-wide
+    (``requires_root``) jobs/units/receipts are handled (never duplicates
+    or user-level jobs/units). With ``allow_root`` an item that is a
     mount point or has a mount below it is skipped, and a permanent removal
     goes through :func:`root_delete.remove` (never ignores errors, never
     crosses filesystems, reports a partial removal as not removed).
@@ -271,8 +302,22 @@ def act(
     or processed by the Engine (``skip_reason`` set when the re-check right
     before its removal refused it). ``on_quarantine_claim(run_id)`` (with
     ``quarantine_root`` only) is called once the quarantine run exists.
+
+    System-wide launch jobs, units and package receipts (Task 9b; elevated
+    helper only: ``allow_root`` AND ``backup_root``, the helper's validated
+    root-owned quarantine directory, else skipped): right before each
+    removal they are re-checked (:func:`system_remedy.check`, then
+    ``extra_check`` and the re-verifier), the deadline is checked, every
+    file is copied into a copy-only run under ``backup_root``
+    (``backup_run``; ``on_backup_claim(run_id)`` once it exists; never
+    under a home), then the job is stopped (:func:`system_remedy.unload`,
+    best effort) and the file deleted -- or, for a receipt, ``pkgutil
+    --forget`` runs and the receipt must be gone. Always permanent. One
+    ``systemctl daemon-reload`` (system manager) after the batch if a
+    unit was acted on. All system-scope commands run inside
+    :func:`remedy_exec.system_scope`.
     """
-    from cleanix.core import reverify, root_delete
+    from cleanix.core import reverify, root_delete, system_remedy
 
     items = list(items)
     if not record_history and not permanent and not dry_run and quarantine_root is None:
@@ -335,7 +380,8 @@ def act(
         else:
             try:
                 reason = _verify(item, batch, hashed, config, cancel,
-                                 allow_root=allow_root, root_mode=root_mode)
+                                 allow_root=allow_root, root_mode=root_mode,
+                                 backup_root=backup_root)
                 if reason is None:
                     reason = run_extra_check(item, reverify.VERIFY)
             except Exception as exc:  # noqa: BLE001 - fail closed, never abort the batch
@@ -356,12 +402,35 @@ def act(
     if todo:
         original = {id(a): items[idx] for idx, a in todo}
         late: Dict[int, str] = {}  # id(activated item) -> precheck reason
+        copy_kinds = remedy_exec.SYSTEM_KINDS if root_mode else remedy_exec.KINDS
         jobs = {id(a) for _i, a in todo
                 if original[id(a)].remedy is not None
-                and original[id(a)].remedy.kind in remedy_exec.KINDS}  # type: ignore[union-attr]
+                and original[id(a)].remedy.kind in copy_kinds}  # type: ignore[union-attr]
         # id(activated) -> (kind, stop result, where the copy is) for every
-        # launch job / unit that got as far as its stop attempt.
+        # launch job / unit / receipt that got as far as its stop attempt.
         prepared: Dict[int, Tuple[RemedyKind, remedy_exec.Stop, str]] = {}
+        # path -> package id of every receipt ready to be forgotten (root mode)
+        receipts: Dict[str, str] = {}
+
+        def keep_copies(paths: Sequence[str]) -> Tuple[Optional[str], str]:
+            """Copy ``paths`` into the copy-only backup run: ``(problem,
+            where)``. In root mode the run lives under ``backup_root``
+            only (never under a home)."""
+            try:
+                if backup[0] is None:
+                    if root_mode:
+                        if backup_root is None:  # pragma: no cover - _verify refused
+                            return NO_BACKUP_PLACE, ""
+                        backup[0] = quarantine.new_run(root=backup_root,
+                                                       on_claim=on_backup_claim)
+                    else:
+                        backup[0] = quarantine.new_run()
+                for p in paths:
+                    backup[0].store_copy(p)
+                return None, str(backup[0].files_dir)
+            except Exception as exc:  # noqa: BLE001
+                return ("could not keep a copy of the file, nothing removed "
+                        f"({str(exc) or type(exc).__name__})"), ""
 
         def prepare(activated: CleanableItem, finding: CleanableItem) -> Optional[str]:
             """Re-verify a launch job/unit; on a real run keep a copy and
@@ -372,16 +441,43 @@ def act(
             if why is not None or dry_run:
                 return why
             assert name is not None
-            try:
-                if backup[0] is None:
-                    backup[0] = quarantine.new_run()
-                backup[0].store_copy(finding.path)
-                where = str(backup[0].files_dir)
-            except Exception as exc:  # noqa: BLE001
-                return ("could not keep a copy of the file, nothing removed "
-                        f"({str(exc) or type(exc).__name__})")
+            why, where = keep_copies([finding.path])
+            if why is not None:
+                return why
             stop = remedy_exec.unload(finding.remedy.kind, name, finding.path)
             prepared[id(activated)] = (finding.remedy.kind, stop, where)
+            return None
+
+        def prepare_system(activated: CleanableItem, finding: CleanableItem) -> Optional[str]:
+            """Root mode: re-verify a system-wide job/unit/receipt (its own
+            structural check, the helper's chain check and the scenario's
+            re-verifier on its ORIGINAL evidence), stop at the deadline,
+            then -- on a real run -- copy every file, stop the job, and
+            leave the removal to the Engine (``remove_path``). Nothing
+            after the copy may raise."""
+            assert finding.remedy is not None and finding.path
+            kind = finding.remedy.kind
+            why, name = system_remedy.check(finding, config)
+            if why is None:
+                why = run_extra_check(finding, reverify.REMOVAL)
+            if why is None and cancel is not None and cancel():
+                why = STOPPED_AT_DEADLINE
+            if why is not None or dry_run:
+                return why
+            assert name is not None
+            try:
+                paths = system_remedy.backup_paths(kind, finding.path, name)
+            except Exception as exc:  # noqa: BLE001
+                return f"could not be verified ({str(exc) or type(exc).__name__})"
+            why, where = keep_copies(paths)
+            if why is not None:
+                return why
+            if kind is RemedyKind.PKG_RECEIPT:
+                stop = remedy_exec.Stop(stopped=True)
+                receipts[path_key(finding.path)] = name
+            else:
+                stop = system_remedy.unload(kind, name, finding.path)
+            prepared[id(activated)] = (kind, stop, where)
             return None
 
         def precheck(activated: CleanableItem) -> Optional[str]:
@@ -391,10 +487,12 @@ def act(
             else:
                 try:
                     assert finding.remedy is not None
-                    if finding.remedy.kind in remedy_exec.KINDS:
+                    if root_mode and finding.remedy.kind in remedy_exec.SYSTEM_KINDS:
+                        why = prepare_system(activated, finding)
+                    elif not root_mode and finding.remedy.kind in remedy_exec.KINDS:
                         why = prepare(activated, finding)
                     else:
-                        why = _recheck(finding, config)
+                        why = _recheck(finding, config, root_mode)
                         if why is None:
                             why = run_extra_check(finding, reverify.REMOVAL)
                         if why is None and root_mode and cancel is not None and cancel():
@@ -424,23 +522,36 @@ def act(
             if on_quarantine_claim is not None:
                 root_kwargs["on_quarantine_claim"] = on_quarantine_claim
         if allow_root and not dry_run:
-            root_kwargs["remove_path"] = root_delete.remove
+            def remove_path(path: str):
+                # A prepared receipt is forgotten (pkgutil), never unlinked.
+                pkg_id = receipts.pop(path_key(path), None)
+                if pkg_id is not None:
+                    return system_remedy.forget(pkg_id, path)
+                return root_delete.remove(path)
+
+            root_kwargs["remove_path"] = remove_path
         if on_item is not None:
             root_kwargs["on_outcome"] = engine_outcome
-        try:
-            inner = service.clean(
-                [a for _i, a in todo], config, dry_run=dry_run,
-                use_quarantine=quarantine_paths, progress=progress, cancel=cancel,
-                record_history=record_history, precheck=precheck,
-                delete_instead=lambda a: id(a) in jobs,
-                **root_kwargs,  # type: ignore[arg-type]
-            )
-        finally:
-            if backup[0] is not None:
-                backup[0].discard_if_empty()
+        # System-scope commands (bootout system/..., systemctl without
+        # --user, pkgutil --forget) are runnable only inside this scope,
+        # which only the helper's root mode opens.
+        scope = remedy_exec.system_scope() if allow_root else contextlib.nullcontext()
         reload_warnings: List[str] = []
-        if any(k is RemedyKind.SYSTEMD_UNIT for k, _s, _d in prepared.values()):
-            reload_warnings = remedy_exec.reload_units()
+        with scope:
+            try:
+                inner = service.clean(
+                    [a for _i, a in todo], config, dry_run=dry_run,
+                    use_quarantine=quarantine_paths, progress=progress, cancel=cancel,
+                    record_history=record_history, precheck=precheck,
+                    delete_instead=lambda a: id(a) in jobs,
+                    **root_kwargs,  # type: ignore[arg-type]
+                )
+            finally:
+                if backup[0] is not None:
+                    backup[0].discard_if_empty()
+            if any(k is RemedyKind.SYSTEMD_UNIT for k, _s, _d in prepared.values()):
+                reload_warnings = (system_remedy.reload_units() if root_mode
+                                   else remedy_exec.reload_units())
         # Engine yields one outcome per processed item, in order; a cancel
         # leaves the rest unprocessed (no outcome), as in a normal clean.
         for (idx, activated), outcome in zip(todo, inner.result.outcomes):
@@ -448,7 +559,12 @@ def act(
                 skipped[idx] = late[id(activated)]
                 continue
             info = prepared.get(id(activated))
-            if info is not None:
+            if info is not None and root_mode:
+                kind, stop, where = info
+                reload_extra = reload_warnings if kind is RemedyKind.SYSTEMD_UNIT else []
+                note = system_remedy.note(kind, where, stop, outcome.removed, reload_extra)
+                outcome = dataclasses.replace(outcome, note=note)
+            elif info is not None:
                 kind, stop, where = info
                 reload_extra = reload_warnings if kind is RemedyKind.SYSTEMD_UNIT else []
                 if outcome.removed:
