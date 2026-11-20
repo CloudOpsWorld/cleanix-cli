@@ -152,6 +152,17 @@ def _rank_key(keep: str):
     return lambda i: (len(i.path or ""), i.path or "")
 
 
+def default_survivor(copies: Sequence[CleanableItem], keep: str = "oldest"
+                     ) -> CleanableItem:
+    """The copy :func:`plan_duplicates` keeps by ``keep``, judged from the
+    scan-time data alone (no filesystem access). ``copies`` must not be
+    empty."""
+    if keep not in KEEP_POLICIES:
+        raise ValueError(
+            f"keep must be one of {', '.join(KEEP_POLICIES)}, not {keep!r}")
+    return min(copies, key=_rank_key(keep))
+
+
 def survivor_of(item: CleanableItem) -> Optional[Survivor]:
     """The kept copy stamped by :func:`plan_duplicates`, else None
     (also None for a malformed stamp)."""
@@ -360,9 +371,8 @@ def plan_duplicates(items: Sequence[CleanableItem], keep: str) -> ActPlan:
         raise ValueError(
             f"keep must be one of {', '.join(KEEP_POLICIES)}, not {keep!r}")
     plan = ActPlan()
-    rank = _rank_key(keep)
     for copies in _group_copies(items, plan).values():
-        _plan_group(copies, min(copies, key=rank), plan)
+        _plan_group(copies, default_survivor(copies, keep), plan)
     return plan
 
 

@@ -43,6 +43,12 @@ _BADGE_DARK = {
     Safety.PERMANENT: "#ef9a9a",
 }
 
+
+def badge_color(safety: Safety, dark: bool) -> str:
+    """Badge text colour for ``safety`` on a dark or a light base."""
+    return (_BADGE_DARK if dark else _BADGE_LIGHT)[safety]
+
+
 REVIEW_ONLY_REASON = "Review only: Cleanix never deletes this."
 ADMIN_REASON = "Needs administrator permission."
 
@@ -281,8 +287,7 @@ class GroupedResults(QTreeWidget):
     def _badge(self, row: QTreeWidgetItem, safety: Safety) -> None:
         row.setText(2, safety.value)
         dark = self.palette().base().color().lightness() < 128
-        row.setForeground(2, QBrush(QColor(
-            (_BADGE_DARK if dark else _BADGE_LIGHT)[safety])))
+        row.setForeground(2, QBrush(QColor(badge_color(safety, dark))))
         row.setToolTip(2, f"Safety: {safety.value}")
 
     def _make_group_row(self, gi: int, g: Group) -> QTreeWidgetItem:
