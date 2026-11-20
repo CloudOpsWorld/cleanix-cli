@@ -33,6 +33,7 @@ from cleanix.gui import findings_act, review_view, workers  # noqa: E402
 from cleanix.gui.review_tab import DEEP_TEXT, SCAN_TEXT, ReviewTab, finding_scan_ids  # noqa: E402
 
 PHRASE = "DELETE SYSTEM FILES"
+_REAL_START = workers.start_worker
 ROOTS = {
     "orphan_files": ("/opt", "/usr/local", "/var/lib", "/var/cache"),
     "orphan_launch_jobs": ("/Library/LaunchDaemons",),
@@ -680,3 +681,82 @@ def test_tabs_order_and_names(qtbot, app_env, monkeypatch, osname, titles):
     assert w.power_view.tabs.widget(1) is w.review_tab
     assert w.review_tab.scan_button.accessibleName() == SCAN_TEXT
     assert w.review_tab.deep_check.accessibleName() == DEEP_TEXT
+
+
+# ============================================== real dialogs and threads
+def _later(fn):
+    from PySide6.QtCore import QTimer
+
+    QTimer.singleShot(0, fn)
+
+
+def test_default_confirm_really_execs_and_gates_on_phrase(qtbot, tmp_path):
+    from PySide6.QtTest import QTest
+
+    p, user = user_file(tmp_path)
+    plan = findings_act.ActPlan(permanent=False, user_items=[user],
+                                system_offered=[sys_item()])
+    tab = make_tab(qtbot)
+    states = []
+
+    # Enter in the phrase field neither acts nor cancels; Act then works.
+    d = tab.confirm_dialog(plan)
+
+    def drive():
+        d.phrase_edit.setText(PHRASE)
+        QTest.keyClick(d.phrase_edit, Qt.Key.Key_Return)
+        states.append(d.isVisible())
+        d.accept_button.click()
+
+    _later(drive)
+    assert ReviewTab._default_confirm(d) is True
+    assert states == [True]
+
+    # Cancel and Escape say no.
+    d2 = tab.confirm_dialog(plan)
+    _later(lambda: (d2.phrase_edit.setText(PHRASE), d2.cancel_button.click()))
+    assert ReviewTab._default_confirm(d2) is False
+    d3 = tab.confirm_dialog(plan)
+    _later(lambda: QTest.keyClick(d3, Qt.Key.Key_Escape))
+    assert ReviewTab._default_confirm(d3) is False
+    # A wrong phrase: clicking the (disabled) Act button does nothing.
+    d4 = tab.confirm_dialog(plan)
+
+    def wrong():
+        d4.phrase_edit.setText("delete system files")
+        d4.accept_button.click()
+        states.append(d4.isVisible())
+        d4.reject()
+
+    _later(wrong)
+    assert ReviewTab._default_confirm(d4) is False
+    assert states == [True, True]
+
+
+def test_act_flow_through_real_worker_threads(qtbot, tmp_path, monkeypatch):
+    import threading
+
+    # The real QThread-based start (the env fixture made it synchronous).
+    monkeypatch.setattr(workers, "start_worker", _REAL_START)
+    launcher = Launcher()
+    p, user = user_file(tmp_path)
+    s = sys_item()
+    results = []
+    tab = ReviewTab(Config(), scan_worker_factory=ScanFactory(scan_of(user, s)),
+                    launcher=launcher, confirm=Confirm(), show_results=results.append,
+                    elevation_available=True)
+    qtbot.addWidget(tab)
+    tab.scan_button.click()
+    qtbot.waitUntil(lambda: not tab.busy(), timeout=5000)
+    for sc in tab.view.model.scenarios:
+        tab.view.scenario_row(sc.cleaner_id).setExpanded(True)
+    tick(tab, user, s)
+    main = threading.get_ident()
+    seen = []
+    launcher.on_call = lambda: seen.append(threading.get_ident())
+    act(tab)
+    qtbot.waitUntil(lambda: bool(results), timeout=10000)
+    qtbot.waitUntil(lambda: workers.active_count() == 0, timeout=5000)
+    assert seen and seen[0] != main  # the prompt ran off the GUI thread
+    assert not p.exists() and len(launcher.calls) == 1
+    assert "System-wide items (administrator helper):" in body(results[-1])

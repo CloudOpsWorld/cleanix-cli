@@ -213,3 +213,74 @@ def test_registry_cancelled_confirmation_changes_nothing(qtbot, monkeypatch):
     v.tree.topLevelItem(0).setCheckState(0, Qt.CheckState.Checked)
     v.remove_button.click()
     assert "Nothing was changed" in v.status_label.text()
+
+
+def test_registry_names_are_plain_and_sanitised(qtbot):
+    hostile = "Entry <img src=x> <b>bold</b> \u202eevil\u202c bell\x07"
+    it = CleanableItem(
+        cleaner_id="win_reg_uninstall", description=hostile, kind=ItemKind.REGISTRY,
+        reg=RegTarget("HKCU", "SOFTWARE\\Test\\a\u202eb\x07", None, "fp"),
+        hint="<i>hint</i>\u2066x <img src=y>")
+    v = make(qtbot)
+    v.set_result(ScanResult(reports=[CleanerReport("win_reg_uninstall", "u", "d",
+                                                   items=[it])]))
+    top = v.tree.topLevelItem(0)
+    v.tree.expandItem(top)
+    row = top.child(0)
+    for col in (0, 1):
+        text = row.text(col)
+        for bad in ("\u202e", "\u202c", "\x07", "\u2066"):
+            assert bad not in text
+        tip = row.toolTip(col)
+        assert tip.startswith("<qt>") and "<img" not in tip and "<b>" not in tip
+        assert "&lt;i&gt;hint&lt;/i&gt;" in tip and "&lt;img src=y&gt;" in tip
+        for bad in ("\u202e", "\u202c", "\x07", "\u2066"):
+            assert bad not in tip
+    assert "<b>bold</b>" in row.text(0)  # literal, in a plain-text cell
+    # Copy path still copies the original key.
+    from PySide6.QtWidgets import QApplication
+    v.tree.copy_path(it)
+    assert QApplication.clipboard().text() == it.reg.display
+    # The confirmation shows it literally and sanitised too.
+    d = v.confirm_dialog([it])
+    body = d.body.toPlainText()
+    assert "<img src=x>" in body and "\u202e" not in body and "\x07" not in body
+
+
+def test_registry_default_confirm_really_execs(qtbot):
+    from PySide6.QtCore import QTimer
+
+    v = make(qtbot)
+    v.scan_button.click()
+    item = v.tree._groups[0].items[0]
+    d = v.confirm_dialog([item])
+    QTimer.singleShot(0, d.accept_button.click)
+    assert v._confirm(d) is True
+    d2 = v.confirm_dialog([item])
+    QTimer.singleShot(0, d2.cancel_button.click)
+    assert v._confirm(d2) is False
+
+
+def test_quarantine_panel_copy_only_run_is_not_an_undo(qtbot, monkeypatch):
+    from cleanix.core import quarantine
+    from cleanix.gui.panels_data import COPIES_ONLY_RESTORE, QuarantinePanel
+
+    runs = [{"run_id": "r-copies", "created": 1700000000, "count": 2, "size": 10,
+             "registry": 0, "registry_admin": 0, "removed_count": 0},
+            {"run_id": "r-files", "created": 1700000001, "count": 1, "size": 5,
+             "registry": 0, "registry_admin": 0, "removed_count": 1}]
+    monkeypatch.setattr(quarantine, "list_runs", lambda: list(runs))
+
+    def no_restore(rid):
+        raise AssertionError("a copies-only run must not be restored")
+
+    monkeypatch.setattr(quarantine, "restore", no_restore)
+    asked = []
+    p = QuarantinePanel(confirm=lambda m: asked.append(m) or True)
+    qtbot.addWidget(p)
+    p.refresh()
+    assert "copies only; not restorable" in p.table.item(0, 2).text()
+    assert "copies only" not in p.table.item(1, 2).text()
+    p.table.selectRow(0)
+    p._on_restore()
+    assert p.status_label.text() == COPIES_ONLY_RESTORE and asked == []
