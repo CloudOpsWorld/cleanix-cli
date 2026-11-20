@@ -27,8 +27,25 @@ from cleanix.cleaners.base import Cleaner
 from cleanix.core import platform as _platform
 from cleanix.core import scanmode
 from cleanix.core.models import CleanableItem, ItemKind
-from cleanix.core.remedy import Remedy, RemedyKind, fingerprint_of
+from cleanix.core.remedy import (
+    Remedy,
+    RemedyKind,
+    fingerprint_of,
+    link_remedy,
+    path_remedy,
+)
 from cleanix.core.utils import _allocated_bytes, run_command, which
+
+# ``Finding.remedy_extra`` marker: the system-wide finding IS a symbolic link
+# (a broken unit link) and its PATH remedy removes the link itself.
+LINK_REMEDY: Tuple[Tuple[str, str], ...] = (("entry", "symlink"),)
+
+
+def evidence_problem(path) -> Optional[str]:
+    """Why the absence of ``path`` must not be trusted (helper/strict mode
+    only; see ``scanmode.evidence_problem``), else None. Detectors call it
+    as ``oc.evidence_problem`` before calling anything "missing"."""
+    return scanmode.evidence_problem(str(path))
 
 READ_ONLY_COMMANDS: frozenset = frozenset(
     {
@@ -107,8 +124,8 @@ class Finding:
     hint: str
     requires_root: bool = True
     note: bool = False  # notes are never sized (size 0)
-    # Optional remedy kind. Only honoured for user-space (requires_root False),
-    # non-note findings; system-wide findings get no remedy yet.
+    # Optional remedy kind (never for notes). System-wide (requires_root)
+    # findings honour only PATH (see OrphanReporter._remedy).
     remedy_kind: Optional[RemedyKind] = None
     remedy_extra: Tuple[Tuple[str, str], ...] = ()
 
@@ -262,6 +279,19 @@ def logical_path(root: str | Path, real: Path) -> str:
         return Path(real).as_posix()
     r = rel.as_posix()
     return "/" if r == "." else "/" + r
+
+
+def link_dest(link: Path, root: str | Path) -> str:
+    """Where the symlink ``link`` points (absolute targets inside ``root``,
+    relative ones against the link's folder; not normalised), or "" when
+    it cannot be read (then any evidence check fails closed)."""
+    try:
+        target = os.readlink(link)
+    except OSError:
+        return ""
+    if target.startswith("/"):
+        return str(in_root(root, target))
+    return str(Path(link).parent / target)
 
 
 def link_target_exists(link: Path, root: str | Path) -> Optional[bool]:
@@ -588,9 +618,21 @@ class OrphanReporter(Cleaner):
 
     @staticmethod
     def _remedy(f: Finding) -> Optional[Remedy]:
-        """The remedy for a user-space, non-note finding that asks for one."""
-        if f.remedy_kind is None or f.note or f.requires_root:
+        """The remedy for a non-note finding that asks for one.
+
+        System-wide (``requires_root``) findings get PATH remedies only (the
+        elevated helper's findings action): a real file or folder, or -- when
+        the detector asks for it with :data:`LINK_REMEDY` -- the symbolic
+        link itself. Other system-wide kinds (launch jobs, units, receipts)
+        get none yet."""
+        if f.remedy_kind is None or f.note:
             return None
+        if f.requires_root:
+            if f.remedy_kind is not RemedyKind.PATH:
+                return None
+            if f.remedy_extra == LINK_REMEDY:
+                return link_remedy(str(f.path))
+            return path_remedy(str(f.path))
         fp = fingerprint_of(str(f.path))
         if f.remedy_kind is RemedyKind.PATH:
             if fp is None:

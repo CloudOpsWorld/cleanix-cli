@@ -100,6 +100,21 @@ nothing in it beyond *identifiers*, and nothing in its environment:
     Support/Cleanix/quarantine``) and validates without following links;
     if it is not usable nothing is removed. No history; nothing under the
     user's home. Per-item outcomes and the run id go into the result.
+    Task 9a hardening: (i) only scenarios with an act-time re-verifier
+    (``reverify.REVERIFIERS``) are acted on; it re-checks the finding's
+    ORIGINAL evidence (package ownership re-queried, installed apps
+    re-listed, the program / link target still missing, the unit still
+    unknown) up front and right before each removal, fail closed; (ii)
+    absence evidence is judged by the parent-chain rule bound to the
+    requesting user (``evidence_rule``): a missing path below a folder an
+    ordinary user can write (sticky folders included), below a link, or
+    behind a dangling link is "unknown", never "missing"; (iii) the chain
+    check also refuses a folder carrying an access control list; (iv) the
+    item is compared by (st_dev, st_ino) with the helper's own folders and
+    the folders above them, and the lexical protected/quarantine checks
+    ignore case, so another spelling of the quarantine is never acted on.
+    The root quarantine has no restore or purge yet: the UI must not offer
+    Undo for its items.
 
 What the design does and does not protect:
 * The nonce only detects stale or mixed-up result files; it provides no
@@ -125,7 +140,11 @@ Known residuals, accepted for now:
     user-writable interpreter or site-packages (a venv in the home, a
     per-user Python) is still user-writable code run as root. A root-owned
     install location plus a launcher check is future work (Plan 2B packaging).
-(c) POSIX ACLs are not inspected; only owner, group and mode bits are.
+(c) POSIX ACLs are not inspected by the ordinary admin-cleaner path; only
+    owner, group and mode bits are. The findings action (point 11) refuses
+    any folder on the chain that carries one (Linux: POSIX/NFSv4 ACL
+    xattrs; macOS: an extended ACL via ``acl_get_link_np``; undeterminable
+    = refused).
 (d) Windows: the result file is written by path, as administrator, into the
     requesting user's directory; a junction swap after validation could
     redirect that fixed-name file write. Handle-based writing is future work.
@@ -174,7 +193,7 @@ import time
 from pathlib import Path
 from typing import FrozenSet, Iterator, List, Optional, Sequence
 
-from cleanix.core import context, elevate, scanmode, service, winregistry
+from cleanix.core import context, elevate, reverify, scanmode, service, winregistry
 from cleanix.core.models import ItemKind, item_key
 
 EXIT_OK = 0
@@ -951,11 +970,109 @@ def static_admin_problem(item, cleaner_id_allowlist=None) -> Optional[str]:
     return None
 
 
+# --------------------------------------------------------------------------
+# access control lists (findings action: a component carrying an ACL is
+# refused -- mode bits alone do not say who may modify it)
+# --------------------------------------------------------------------------
+# Linux xattrs that hold an ACL: POSIX access/default ACLs, and the NFSv4
+# ACL some network filesystems expose.
+_ACL_XATTRS = frozenset({
+    "system.posix_acl_access", "system.posix_acl_default", "system.nfs4_acl",
+})
+_ACL_TYPE_EXTENDED = 0x00000100  # macOS <sys/acl.h>
+_ACL_FIRST_ENTRY = 0
+
+
+def _acl_os() -> str:
+    """"linux", "darwin" or something else (a seam for tests)."""
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return sys.platform
+
+
+def _list_xattrs(path: str) -> List[str]:
+    """Extended attribute names of ``path`` itself (never followed)."""
+    return os.listxattr(path, follow_symlinks=False)  # type: ignore[attr-defined]
+
+
+def _macos_has_acl(path: str) -> Optional[bool]:
+    """Whether ``path`` (not followed) carries an extended ACL with at least
+    one entry; None when this cannot be determined. CPython has no ACL API
+    and ``os.listxattr`` is Linux-only, so this calls libSystem's
+    ``acl_get_link_np(path, ACL_TYPE_EXTENDED)``: NULL with ENOENT means no
+    ACL; any other failure is "cannot tell"."""
+    import ctypes
+    import ctypes.util
+    import errno as _errno
+
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+        get = libc.acl_get_link_np
+        get.restype = ctypes.c_void_p
+        get.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        entry = libc.acl_get_entry
+        entry.restype = ctypes.c_int
+        entry.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+        free = libc.acl_free
+        free.restype = ctypes.c_int
+        free.argtypes = [ctypes.c_void_p]
+    except (OSError, AttributeError):
+        return None
+    ctypes.set_errno(0)
+    acl = get(os.fsencode(path), _ACL_TYPE_EXTENDED)
+    if not acl:
+        return False if ctypes.get_errno() == _errno.ENOENT else None
+    try:
+        first = ctypes.c_void_p()
+        return entry(acl, _ACL_FIRST_ENTRY, ctypes.byref(first)) == 0
+    finally:
+        free(acl)
+
+
+def _acl_problem(path: str) -> Optional[str]:
+    """Why ``path`` (a directory on an item's chain) cannot be trusted
+    because of an access control list, or None.
+
+    Linux: any of :data:`_ACL_XATTRS` present is a refusal; a filesystem
+    that supports no extended attributes at all (ENOTSUP/EOPNOTSUPP) cannot
+    hold such an ACL (accepted); any other error refuses. macOS: any
+    extended ACL entry refuses, as does not being able to tell. Other
+    systems: refused (cannot tell)."""
+    import errno as _errno
+
+    system = _acl_os()
+    if system == "linux":
+        try:
+            names = _list_xattrs(path)
+        except OSError as exc:
+            if exc.errno in (getattr(_errno, "ENOTSUP", None),
+                             getattr(_errno, "EOPNOTSUPP", None)):
+                return None
+            return "has extended attributes that cannot be read (access control list unknown)"
+        except Exception:  # noqa: BLE001 - fail closed
+            return "cannot be checked for an access control list"
+        if any(n in _ACL_XATTRS for n in names):
+            return "carries an access control list"
+        return None
+    if system == "darwin":
+        try:
+            has = _macos_has_acl(path)
+        except Exception:  # noqa: BLE001 - fail closed
+            has = None
+        if has is None:
+            return "cannot be checked for an access control list"
+        return "carries an access control list" if has else None
+    return "cannot be checked for an access control list on this system"
+
+
 def _path_chain_problem(path: str, expected_uid: Optional[int],
-                        group_ids: Optional[FrozenSet[int]]) -> Optional[str]:
+                        group_ids: Optional[FrozenSet[int]], *,
+                        acls: bool = False) -> Optional[str]:
     """Check every directory from the filesystem root down to the item's
     parent, with lstat, right before the item is deleted. Fails closed: a
-    component that cannot be inspected is a refusal."""
+    component that cannot be inspected is a refusal. ``acls`` (POSIX, the
+    findings action): a component carrying an access control list is
+    refused as well (:func:`_acl_problem`)."""
     if not _is_posix():
         programdata = os.environ.get("ProgramData", "")  # API value (sanitised)
         if programdata and _is_under(path, programdata):
@@ -999,7 +1116,100 @@ def _path_chain_problem(path: str, expected_uid: Optional[int],
         problem = _component_problem(st, expected_uid, group_ids)
         if problem:
             return f"{comp} {problem}"
+        if acls:
+            problem = _acl_problem(str(comp))
+            if problem:
+                return f"{comp} {problem}"
     return None
+
+
+# --------------------------------------------------------------------------
+# trustworthy absence (M1: detectors must not judge "missing" from a path
+# an ordinary user controls)
+# --------------------------------------------------------------------------
+def _evidence_component_problem(st, expected_uid: Optional[int],
+                                group_ids: Optional[FrozenSet[int]]) -> Optional[str]:
+    """The parent-chain rule (:func:`_component_problem`) WITHOUT its sticky
+    exemption: in a sticky world-writable folder (``/tmp``) anyone can still
+    create or remove their own entries, so an absence there proves nothing."""
+    problem = _component_problem(st, expected_uid, group_ids)
+    if problem:
+        return problem
+    mode = st.st_mode
+    if mode & _stat_mod.S_IWOTH:
+        return "is writable by everyone"
+    if mode & _stat_mod.S_IWGRP and _untrusted_group(st, group_ids):
+        return "is writable by a non-system group"
+    return None
+
+
+def _evidence_problem(path: str, expected_uid: Optional[int],
+                      group_ids: Optional[FrozenSet[int]]) -> Optional[str]:
+    """Why the absence of the absolute ``path`` is not trustworthy evidence
+    (an ordinary user could have caused it), or None.
+
+    Walks from ``/`` down (lstat, never following anything): every existing
+    folder on the way must pass the parent-chain rule without the sticky
+    exemption (:func:`_evidence_component_problem`) and carry no access
+    control list. The walk ends at the first missing component (its parent
+    is trusted, so only a system account could have created it): None. A
+    symbolic link anywhere on the way -- including the final component, a
+    dangling link whose target is what decides -- is NOT followed: not
+    trustworthy (the literal parent-chain rule; usr-merge links such as
+    ``/lib -> usr/lib`` are links too). A component that exists but is not
+    a folder (nothing can exist below it) ends the walk: None."""
+    import posixpath
+
+    from cleanix.core.utils import canonical_system_path
+
+    if not isinstance(path, str) or not path.startswith("/") or "\0" in path:
+        return "is not a plain absolute path"
+    # The same normalisation as _path_chain_problem (macOS /tmp, /var, /etc).
+    path = canonical_system_path(path)
+    parts = [p for p in path.split("/") if p not in ("", ".")]
+    if len(parts) > 256:
+        return "is too deep to judge"
+    current = "/"
+    try:
+        st = _lstat(current)
+    except OSError:
+        return "/ cannot be inspected"
+    idx = 0
+    while True:
+        if _stat_mod.S_ISLNK(st.st_mode):
+            return f"{current} is a symbolic link"
+        if not _stat_mod.S_ISDIR(st.st_mode):
+            return None  # nothing can exist below a non-folder
+        if idx == len(parts):
+            return None  # the path exists as a folder: not missing at all
+        problem = _evidence_component_problem(st, expected_uid, group_ids)
+        if problem is None:
+            problem = _acl_problem(current)
+        if problem:
+            return f"{current} {problem}"
+        name = parts[idx]
+        idx += 1
+        # ``current`` is a verified real folder (never a link), so ".." is
+        # its lexical parent, itself verified on the way down.
+        current = posixpath.dirname(current) if name == ".." else posixpath.join(current, name)
+        try:
+            st = _lstat(current)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError:
+            return f"{current} cannot be inspected"
+
+
+def evidence_rule(expected_uid: Optional[int],
+                  group_ids: Optional[FrozenSet[int]]):
+    """The absence rule registered with ``scanmode.evidence_rule`` while
+    the helper scans and acts on findings (bound to the requesting user)."""
+    def rule(path: str) -> Optional[str]:
+        if not _is_posix():
+            return "cannot be judged on this system"
+        return _evidence_problem(path, expected_uid, group_ids)
+
+    return rule
 
 
 def _user_groups(user: context.TargetUser) -> Optional[FrozenSet[int]]:
@@ -1125,6 +1335,66 @@ def root_quarantine_never():
     return (posixpath.join(parent, own[0]), posixpath.join(parent, *own))
 
 
+def _quarantine_alias_problem(path: str) -> Optional[str]:
+    """Why ``path`` is (by identity, not by spelling) the helper's own
+    folder or quarantine, lies inside them, or is a folder containing them;
+    else None. Run right before each removal (also in ``permanent`` mode,
+    where the quarantine is never prepared).
+
+    Compares ``(st_dev, st_ino)`` (lstat): the item against the helper's
+    folders and every folder above them, and each folder above the item
+    against the helper's folders. So another spelling of the same folder
+    (a different case on a case-insensitive volume, Unicode normalisation)
+    is still recognised. A helper folder that does not exist protects
+    nothing; one that cannot be inspected refuses."""
+    import posixpath
+
+    parent, own = _root_quarantine_location()
+    ours = set()
+    current = parent
+    for name in own:
+        current = posixpath.join(current, name)
+        try:
+            st = _lstat(current)
+        except FileNotFoundError:
+            break
+        except OSError:
+            return f"{current} cannot be inspected"
+        ours.add((st.st_dev, st.st_ino))
+    above = set()
+    comp = parent
+    while True:
+        try:
+            st = _lstat(comp)
+        except OSError:
+            return f"{comp} cannot be inspected"
+        above.add((st.st_dev, st.st_ino))
+        nxt = posixpath.dirname(comp)
+        if nxt == comp:
+            break
+        comp = nxt
+    try:
+        st = _lstat(path)
+    except OSError:
+        return "it cannot be inspected"
+    ident = (st.st_dev, st.st_ino)
+    if ident in ours or ident in above:
+        return "it is the administrator quarantine or a folder containing it"
+    comp = posixpath.dirname(path)
+    while True:
+        try:
+            st = _lstat(comp)
+        except OSError:
+            return f"{comp} cannot be inspected"
+        if (st.st_dev, st.st_ino) in ours:
+            return "it lies inside the administrator quarantine"
+        nxt = posixpath.dirname(comp)
+        if nxt == comp:
+            break
+        comp = nxt
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class _FindingsPlan:
     only: List[str]
@@ -1184,6 +1454,8 @@ def _finding_problem(item, sel: elevate.FindingSelection, allowed, roots, never)
         return "refused", NO_ACTION
     if item.cleaner_id not in allowed:
         return "refused", _FIXED_LIST_REASON
+    if not reverify.has_reverifier(item.cleaner_id):
+        return "refused", reverify.NO_REVERIFIER
     if not item.requires_root:
         return "refused", NOT_SYSTEM_WIDE
     if remedy.group:
@@ -1239,7 +1511,7 @@ def _prepare_root_quarantine(expected_uid: Optional[int],
             st = _lstat(comp)
         except OSError:
             raise Refused(f"{comp} cannot be inspected") from None
-        problem = _component_problem(st, expected_uid, group_ids)
+        problem = _component_problem(st, expected_uid, group_ids) or _acl_problem(comp)
         if problem:
             raise Refused(f"{comp} {problem}")
     current = parent
@@ -1262,7 +1534,7 @@ def _prepare_root_quarantine(expected_uid: Optional[int],
                 raise Refused(f"{current} cannot be inspected") from None
         except OSError:
             raise Refused(f"{current} cannot be inspected") from None
-        problem = _own_dir_problem(st, private)
+        problem = _own_dir_problem(st, private) or _acl_problem(current)
         if problem:
             raise Refused(f"{current} {problem}")
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -1318,7 +1590,11 @@ def _execute_findings(session: _Session, plan: _FindingsPlan, config, cancel,
         flush()
         if not scan_keys:
             return False
-        with scanmode.helper_mode():
+        # Absence evidence (a missing program / link target) is judged by the
+        # parent-chain rule bound to the requesting user (M1), here and in
+        # the act-time re-checks below.
+        rule = evidence_rule(expected_uid, group_ids)
+        with scanmode.helper_mode(), scanmode.evidence_rule(rule):
             scan = service.scan(config, only=plan.only, cancel=cancel)
         found = {}
         for item in scan.all_items():
@@ -1358,8 +1634,12 @@ def _execute_findings(session: _Session, plan: _FindingsPlan, config, cancel,
                 return False
 
         def chain(item) -> Optional[str]:
-            problem = _path_chain_problem(item.path or "", expected_uid, group_ids)
-            return f"untrusted parent directory ({problem})" if problem else None
+            path = item.path or ""
+            problem = _path_chain_problem(path, expected_uid, group_ids, acls=True)
+            if problem:
+                return f"untrusted parent directory ({problem})"
+            alias = _quarantine_alias_problem(path)
+            return f"not removed: {alias}" if alias else None
 
         # Until an item's fate is known it is reported as possibly acted on:
         # if the watchdog ends the process mid-batch, the result it writes
@@ -1394,11 +1674,14 @@ def _execute_findings(session: _Session, plan: _FindingsPlan, config, cancel,
         flush()
         old_mask = os.umask(0o077)
         try:
-            summary = actions.act(candidates, config, dry_run=False,
-                                  permanent=plan.permanent, cancel=cancel,
-                                  record_history=False, allow_root=True,
-                                  quarantine_root=qroot, extra_check=chain,
-                                  on_item=on_item, on_quarantine_claim=on_claim)
+            # act re-runs each finding's re-verifier (reverify.REVERIFIERS)
+            # after ``chain``, up front and right before each removal.
+            with scanmode.helper_mode(), scanmode.evidence_rule(rule):
+                summary = actions.act(candidates, config, dry_run=False,
+                                      permanent=plan.permanent, cancel=cancel,
+                                      record_history=False, allow_root=True,
+                                      quarantine_root=qroot, extra_check=chain,
+                                      on_item=on_item, on_quarantine_claim=on_claim)
         finally:
             os.umask(old_mask)
         with session.lock:

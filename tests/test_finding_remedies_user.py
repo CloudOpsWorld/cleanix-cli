@@ -96,16 +96,21 @@ def test_orphan_app_data_user_item_has_remedy(mac):  # noqa: F811
     assert item.remedy.fingerprint == fingerprint_of(str(d))
 
 
-def test_orphan_app_data_system_item_has_no_remedy(mac):  # noqa: F811
+def test_orphan_app_data_system_item_has_path_remedy(mac):  # noqa: F811
+    # Task 9a: system-wide items get a PATH remedy (acted on only by the
+    # elevated helper, which re-verifies them; the normal path skips them).
     lib = mac.root / "Library" / "Application Support"
     lib.mkdir(parents=True)
-    _old_dir(lib / "com.unknownvendor.SysData")
+    d = lib / "com.unknownvendor.SysData"
+    _old_dir(d)
     items = [
         i for i in oad.OrphanAppDataReporter(Config()).scan().items
         if i.description.startswith("Left by a removed app")
     ]
     assert items and all(i.requires_root for i in items)
-    assert all(i.remedy is None for i in items)
+    (item,) = [i for i in items if i.path == str(d)]
+    assert item.remedy.kind is RemedyKind.PATH
+    assert item.remedy.fingerprint == fingerprint_of(str(d))
 
 
 def _job(path, label, program="/Applications/Gone.app/Contents/MacOS/gone"):
@@ -179,7 +184,9 @@ def test_stale_launcher_user_entry_has_path_remedy(orphan_env):
     assert u.remedy.kind is RemedyKind.PATH
     assert u.remedy.fingerprint == fingerprint_of(str(entry))
     (s,) = [i for i in items if i.path == str(sysentry)]
-    assert s.requires_root and s.remedy is None
+    # Task 9a: system entries get a PATH remedy too (helper only)
+    assert s.requires_root and s.remedy.kind is RemedyKind.PATH
+    assert s.remedy.fingerprint == fingerprint_of(str(sysentry))
 
 
 def test_notes_have_no_remedy(orphan_env, monkeypatch):

@@ -27,15 +27,22 @@ import sys
 from typing import List, Optional, Tuple
 
 MOUNTINFO = "/proc/self/mountinfo"
+# Largest mount table read; a longer one is treated as unreadable (a table
+# cut off at the cap could miss the very mount that matters).
+MAX_MOUNTINFO_BYTES = 16 * 1024 * 1024
 
 
 def _read_mountinfo() -> Optional[str]:
-    """The raw mount table (indirection: tests inject one). None if unreadable."""
+    """The raw mount table (indirection: tests inject one). None if
+    unreadable or longer than :data:`MAX_MOUNTINFO_BYTES` (truncated)."""
     try:
         with open(MOUNTINFO, "rb") as fh:
-            return fh.read(16 * 1024 * 1024).decode("utf-8", "surrogateescape")
+            raw = fh.read(MAX_MOUNTINFO_BYTES + 1)
     except OSError:
         return None
+    if len(raw) > MAX_MOUNTINFO_BYTES:
+        return None
+    return raw.decode("utf-8", "surrogateescape")
 
 
 def _unescape(field: str) -> str:
@@ -56,7 +63,9 @@ def _unescape(field: str) -> str:
 
 
 def parse_mountinfo(text: str) -> Optional[List[str]]:
-    """Mount points (field 5) of a mountinfo text; None if any line is malformed."""
+    """Mount points (field 5) of a mountinfo text; None if any line is
+    malformed or the table has no entry for ``/`` (an empty or garbled
+    table is never read as "no mounts")."""
     mounts = []
     for line in text.splitlines():
         if not line.strip():
@@ -65,6 +74,8 @@ def parse_mountinfo(text: str) -> Optional[List[str]]:
         if len(fields) < 6 or not fields[4].startswith("/"):
             return None
         mounts.append(posixpath.normpath(_unescape(fields[4])))
+    if "/" not in mounts:
+        return None
     return mounts
 
 

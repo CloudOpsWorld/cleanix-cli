@@ -285,10 +285,13 @@ def _tool_names(root, homes, ctx: "_Ctx") -> list:
     return names
 
 
-def _inventory(root, homes: Iterable[Path], budget=None) -> Optional[tuple]:
+def _inventory(root, homes: Iterable[Path], budget=None, *,
+               require_mdfind: bool = False) -> Optional[tuple]:
     """``(ids, names_of_apps_without_id)`` or None when the inventory cannot
     be trusted: ``/Applications`` unreadable, fewer than MIN_APPS distinct app
-    ids, too many apps with no readable id, or the budget ran out."""
+    ids, too many apps with no readable id, or the budget ran out.
+    ``require_mdfind`` (the act-time re-check): Spotlight's list of app
+    bundles must be available too, else None."""
     homes = [Path(h) for h in homes]
     ctx = _Ctx(budget)
     try:
@@ -307,6 +310,8 @@ def _inventory(root, homes: Iterable[Path], budget=None) -> Optional[tuple]:
         rc, out, _ = oc.run(
             ["mdfind", "kMDItemContentType == 'com.apple.application-bundle'"]
         )
+        if rc != 0 and require_mdfind:
+            return None
         if rc == 0:
             for n, line in enumerate(out.splitlines()):
                 if n >= MAX_MDFIND_PATHS:
@@ -351,17 +356,56 @@ class OrphanAppDataReporter(oc.OrphanReporter):
         self._index: Optional[_Index] = None
         self._index_built = False
 
+    @staticmethod
+    def _homes() -> list:
+        homes = [home()]
+        try:
+            homes += [u.home for u in context.get_target_users()]
+        except Exception:  # noqa: BLE001 - fall back to the current user
+            pass
+        return homes
+
     def _installed(self) -> Optional[_Index]:
         if not self._index_built:
             self._index_built = True
-            homes = [home()]
-            try:
-                homes += [u.home for u in context.get_target_users()]
-            except Exception:  # noqa: BLE001 - fall back to the current user
-                pass
-            inv = _inventory(self.sysroot, homes, self.budget)
+            inv = _inventory(self.sysroot, self._homes(), self.budget)
             self._index = _Index(*inv) if inv is not None else None
         return self._index
+
+    # ------------------------------------------------- act-time re-check
+    def still_orphaned(self, real: Path) -> Optional[str]:
+        """Why ``real`` (a system-wide finding: an entry directly in one of
+        :data:`SYSTEM_DIRS`) must not be removed now, or None when no
+        installed app uses its id: the installed-apps inventory is rebuilt
+        (Spotlight's list of app bundles required) and the id checked
+        exactly as the scan did. An inventory that cannot be built is a
+        reason (fail closed)."""
+        logical = oc.logical_path(self.sysroot, real)
+        parent = logical.rsplit("/", 1)[0]
+        if parent not in SYSTEM_DIRS:
+            return "it is not in a folder this scenario checks"
+        dirs = parent == SYSTEM_DIRS[0]
+        name = real.name
+        if oc.bad_name(name) or (not dirs and not name.endswith(".plist")):
+            return "its name is not a bundle id"
+        bid = candidate_id(name)
+        if bid is None:
+            return "its name is not a bundle id"
+        cutoff = time.time() - float(self.config.orphan_min_age_days) * 86400
+        try:
+            newest = real.lstat().st_mtime
+        except OSError:
+            return "it cannot be inspected"
+        if dirs:
+            newest = max(newest, self._newest_child_mtime(real))
+        if newest > cutoff:
+            return "it changed recently (it may be in use)"
+        inv = _inventory(self.sysroot, self._homes(), self.budget, require_mdfind=True)
+        if inv is None:
+            return "the installed apps could not be listed now"
+        if is_excluded(bid, _Index(*inv)):
+            return f"an installed app now uses the id {bid}"
+        return None
 
     # ------------------------------------------------------------ discovery
     def system_findings(self) -> Iterable[oc.Finding]:
@@ -471,3 +515,10 @@ class OrphanAppDataReporter(oc.OrphanReporter):
             f"If you no longer need it, move {shlex.quote(logical)} "
             "to the Trash in Finder."
         )
+
+
+def reverify_system_item(path: str, config) -> Optional[str]:
+    """Act-time re-check of one system-wide finding (``reverify`` table)."""
+    reporter = OrphanAppDataReporter(config)
+    reporter.budget.start()
+    return reporter.still_orphaned(Path(path))

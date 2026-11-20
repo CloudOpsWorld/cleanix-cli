@@ -106,7 +106,8 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
     def _check(self, plist: Path, system: bool) -> Optional[oc.Finding]:
         logical = oc.logical_path(self.sysroot, plist)
         if os.path.islink(plist):
-            if oc.link_target_exists(plist, self.sysroot) is False:
+            if (oc.link_target_exists(plist, self.sysroot) is False
+                    and not oc.evidence_problem(oc.link_dest(plist, self.sysroot))):
                 return oc.Finding(
                     plist,
                     f"Broken job link: {logical}",
@@ -187,6 +188,10 @@ class OrphanLaunchJobReporter(oc.OrphanReporter):
                 bundle = "/".join(parts[:i])
                 if _exists(oc.in_root(self.sysroot, bundle)) is not False:
                     return True
+        # Helper (root) scans: an absence an ordinary user could have caused
+        # (a folder on the way they can write, a link) is unknown.
+        if oc.evidence_problem(oc.in_root(self.sysroot, program)):
+            return True
         return False
 
     def _hint(self, logical: str, label: str, system: bool) -> str:

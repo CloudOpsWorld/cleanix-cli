@@ -97,6 +97,47 @@ def _win_copy_no_reparse(src: str, dst: str) -> None:
     shutil.copystat(src, dst)
 
 
+# Longest stored file name, in bytes (filesystem encoding). 255 is the usual
+# POSIX NAME_MAX; 200 also stays below Windows' 255 UTF-16 units for any name.
+MAX_STORED_NAME_BYTES = 200
+
+
+def stored_name(idx: int, name: str) -> str:
+    """The name of item ``idx`` inside a run's ``files`` folder.
+
+    ``f"{idx}__{name}"`` when that fits in :data:`MAX_STORED_NAME_BYTES`
+    (unchanged for every ordinary name). A longer one (the index prefix
+    pushes a 255-byte name over the filesystem limit) is shortened
+    deterministically: ``f"{idx}__{hash12}__{head}"``, where ``hash12`` is
+    the first 12 hex digits of the SHA-256 of the full name's bytes and
+    ``head`` the longest leading part of the name that fits, cut on a
+    character boundary. The original path (with the full name) is in the
+    manifest entry, which also records ``name``."""
+    plain = f"{idx}__{name}"
+    if len(os.fsencode(plain)) <= MAX_STORED_NAME_BYTES:
+        return plain
+    raw = os.fsencode(name)
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    prefix = f"{idx}__{digest}__"
+    budget = MAX_STORED_NAME_BYTES - len(os.fsencode(prefix))
+    head = ""
+    used = 0
+    for ch in name:
+        size = len(os.fsencode(ch))
+        if used + size > budget:
+            break
+        head += ch
+        used += size
+    return prefix + head
+
+
+def _file_entry(src: str, dest: Path, size: int, name: str) -> Dict:
+    entry = {"original": src, "stored": str(dest), "size": size}
+    if not dest.name.endswith("__" + name):
+        entry["name"] = name  # the stored name was shortened (see stored_name)
+    return entry
+
+
 def quarantine_root() -> Path:
     from cleanix.core import platform as plat
     from cleanix.core import winenv
@@ -181,8 +222,8 @@ class Quarantine:
         size = path_size(src)
         self.files_dir.mkdir(parents=True, exist_ok=True)
         idx = len(self.items)
-        dest = self.files_dir / f"{idx}__{src.name}"
-        entry = {"original": str(src), "stored": str(dest), "size": size}
+        dest = self.files_dir / stored_name(idx, src.name)
+        entry = _file_entry(str(src), dest, size, src.name)
         if self._root is not None:
             # The elevated helper's root quarantine. The origin is recorded
             # (manifest saved) BEFORE the move, so a process killed right
@@ -197,13 +238,18 @@ class Quarantine:
                 raise
             try:
                 _rename(str(src), str(dest))
-            except BaseException as exc:
+            except OSError as exc:
+                # Only a failed rename (OSError: nothing was moved) drops the
+                # entry. An asynchronous exception (KeyboardInterrupt, the
+                # watchdog's unwind) may arrive after the rename completed:
+                # the entry then stays recorded (at worst a phantom entry
+                # whose stored file is missing), never a real move unrecorded.
                 self.items.pop()
                 try:
                     self.save()
                 except Exception:  # noqa: BLE001 - the final save retries
                     pass
-                if isinstance(exc, OSError) and _is_cross_volume(exc):
+                if _is_cross_volume(exc):
                     raise OSError(
                         "it is on another filesystem than the administrator "
                         "quarantine; nothing was moved (delete it permanently instead)"
@@ -234,7 +280,7 @@ class Quarantine:
         size = path_size(src)
         self.files_dir.mkdir(parents=True, exist_ok=True)
         idx = len(self.items)
-        dest = self.files_dir / f"{idx}__{src.name}"
+        dest = self.files_dir / stored_name(idx, src.name)
         dest_s = str(dest)
         try:
             _rename(src_s, dest_s)
@@ -242,7 +288,7 @@ class Quarantine:
             if not _is_cross_volume(exc):
                 raise
         else:
-            self.items.append({"original": src_s, "stored": dest_s, "size": size})
+            self.items.append(_file_entry(src_s, dest, size, src.name))
             return
 
         link = _win_find_reparse(src_s)
@@ -273,7 +319,7 @@ class Quarantine:
             })
             self.save()
             raise
-        self.items.append({"original": src_s, "stored": dest_s, "size": size})
+        self.items.append(_file_entry(src_s, dest, size, src.name))
 
     def store_copy(self, path: os.PathLike | str) -> str:
         """Copy one regular file into this run (metadata kept) and save the
@@ -294,11 +340,13 @@ class Quarantine:
         self._claim()
         self.files_dir.mkdir(parents=True, exist_ok=True)
         idx = len(self.items)
-        dest = self.files_dir / f"{idx}__{os.path.basename(src)}"
+        base = os.path.basename(src)
+        dest = self.files_dir / stored_name(idx, base)
         try:
             shutil.copy2(src, str(dest), follow_symlinks=False)
-            self.items.append({"type": "copy", "original": src, "stored": str(dest),
-                               "size": st.st_size})
+            entry = _file_entry(src, dest, st.st_size, base)
+            entry = {"type": "copy", **entry}
+            self.items.append(entry)
             try:
                 self.save()
             except BaseException:

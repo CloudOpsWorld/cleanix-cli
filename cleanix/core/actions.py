@@ -41,7 +41,7 @@ from cleanix.core.findings import (  # re-exported: actions is the public home
 )
 from cleanix.core import remedy_exec
 from cleanix.core.models import CleanableItem, CleanOutcome, CleanResult, ItemKind
-from cleanix.core.remedy import CHANGED, RemedyKind, unchanged, verify_path
+from cleanix.core.remedy import CHANGED, RemedyKind, link_target, unchanged, verify_path
 
 __all__ = [
     "ActPlan", "ActSummary", "KEEP_POLICIES", "act", "plan_duplicates",
@@ -112,7 +112,8 @@ def _recheck(item: CleanableItem, config: Config) -> Optional[str]:
     if remedy.kind in remedy_exec.KINDS:
         return remedy_exec.check(item, config)[0]
     grouped = bool(remedy.group)
-    why = verify_path(item.path, remedy.fingerprint, allow_dir=not grouped)
+    why = verify_path(item.path, remedy.fingerprint, allow_dir=not grouped,
+                      link=link_target(remedy))
     if why is not None:
         return why
     if not unchanged(item):
@@ -141,6 +142,10 @@ def _verify(item: CleanableItem, batch: Set[str],
     if item.kind is not ItemKind.PATH or remedy.kind not in _HANDLED or not item.path:
         return NOT_HANDLED
     if root_mode and (remedy.kind is not RemedyKind.PATH or remedy.group):
+        return NOT_HANDLED
+    if link_target(remedy) is not None and not root_mode:
+        # Link remedies (broken system unit links) are only acted on by the
+        # helper, whose re-verifier proves the link is still broken.
         return NOT_HANDLED
     if item.requires_root and not allow_root:
         return NEEDS_ELEVATION
@@ -250,7 +255,9 @@ def act(
     quarantine directory, the only case in which ``record_history=False``
     may be combined with a quarantine; ``extra_check`` is called (after
     every built-in check) up front and again right before each removal,
-    a non-None return skipping the item. With ``allow_root`` or
+    a non-None return skipping the item; after it (same two moments) the
+    finding's own evidence is re-checked by its scenario's re-verifier
+    (:func:`reverify.reverify`; no re-verifier: skipped). With ``allow_root`` or
     ``quarantine_root`` only plain PATH findings are handled (no
     duplicates, launch jobs or units). With ``allow_root`` an item that is a
     mount point or has a mount below it is skipped, and a permanent removal
@@ -263,7 +270,7 @@ def act(
     before its removal refused it). ``on_quarantine_claim(run_id)`` (with
     ``quarantine_root`` only) is called once the quarantine run exists.
     """
-    from cleanix.core import root_delete
+    from cleanix.core import reverify, root_delete
 
     items = list(items)
     if not record_history and not permanent and not dry_run and quarantine_root is None:
@@ -275,7 +282,12 @@ def act(
             why = root_delete.mount_problem(item.path, permanent=permanent)
             if why is not None:
                 return f"not removed: {why}"
-        return extra_check(item) if extra_check is not None else None
+        why = extra_check(item) if extra_check is not None else None
+        if why is None and root_mode:
+            # The finding's own evidence, re-checked right before removal;
+            # a scenario without a re-verifier is refused (reverify.py).
+            why = reverify.reverify(item, config)
+        return why
 
     def report(item: CleanableItem, outcome: Optional[CleanOutcome],
                reason: Optional[str]) -> None:

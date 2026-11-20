@@ -658,14 +658,22 @@ def _under(path: str, root: str) -> bool:
 
 def finding_path_problem(cleaner_id: str, path: str,
                          roots: Dict[str, Tuple[str, ...]],
-                         never: Sequence[str] = ()) -> Optional[str]:
+                         never: Sequence[str] = (), *,
+                         fold: bool = True) -> Optional[str]:
     """Why the helper never acts on ``path`` for ``cleaner_id`` (lexical
     only), or None. ``path`` must be acceptable to ``posix_path_problem``,
     lie strictly below one of the scenario's ``roots``, and be neither
     equal to nor an ancestor of a protected root (``safety._PROTECTED``),
     any scenario's root, the standard ``/usr/local`` folders or a path in
     ``never`` (the helper's own quarantine); nor lie inside a ``never``
-    path."""
+    path.
+
+    ``fold`` (default, on every system): the protected/never comparisons
+    ignore case (``str.casefold``), so on a case-insensitive volume (macOS)
+    ``/Library/Application Support/cleanix`` in another case is still the
+    helper's own folder. Folding only ever refuses more; the containment in
+    the scenario's own roots stays exact (``/OPT/x`` is not below
+    ``/opt``)."""
     from cleanix.cleaners import orphan_files
     from cleanix.core import safety
 
@@ -675,16 +683,21 @@ def finding_path_problem(cleaner_id: str, path: str,
     own = roots.get(cleaner_id, ())
     if not any(path != r and _under(path, r) for r in own):
         return "it is not inside a folder this scenario reports on"
+
+    def norm(text: str) -> str:
+        return text.casefold() if fold else text
+
     fixed = set(safety._PROTECTED)
     for rs in roots.values():
         fixed.update(rs)
     fixed.update(f"/usr/local/{d}" for d in orphan_files._USR_LOCAL_STD)
     fixed.update(never)
+    cpath = norm(path)
     for p in fixed:
-        if _under(p, path):
+        if _under(norm(p), cpath):
             return "it is, or contains, a protected folder"
     for p in never:
-        if _under(path, p):
+        if _under(cpath, norm(p)):
             return "it is inside the administrator quarantine"
     return None
 

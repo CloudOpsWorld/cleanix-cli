@@ -379,4 +379,61 @@ class UnownedSystemFilesReporter(OrphanReporter):
             yield Finding(
                 real, label, self._hint(backend, logical, sampled),
                 requires_root=True,
+                remedy_kind=oc.RemedyKind.PATH,
             )
+
+    # ------------------------------------------------- act-time re-check
+    def still_unowned(self, real: Path) -> Optional[str]:
+        """Why ``real`` (a finding of this detector) must not be removed
+        now, or None when the scan's evidence still holds: the package
+        manager still answers, positively, that no package owns it (nor,
+        for a folder, its probed children -- the usr-merge alias rule of
+        :func:`orphan_common.query_unowned` applies), no installed package,
+        system account or service has its name (``/var/lib``,
+        ``/var/cache``; ``/opt``: no service runs from it) and it did not
+        change recently. Unknown, unreadable or timed-out answers are a
+        reason (fail closed)."""
+        backend = self.pkg_backend()
+        if backend is None:
+            return "package ownership cannot be checked now"
+        logical = oc.logical_path(self.sysroot, real)
+        root = next((r for r in _ROOTS if logical.startswith(r + "/")), None)
+        if root is None:
+            return "it is not in a folder this scenario checks"
+        name = real.name
+        if oc.bad_name(logical) or (_GLOB & set(logical)):
+            return "its name cannot be checked for package ownership"
+        units = self._unit_evidence()
+        if root in _NEEDS_NAMES:
+            names = oc.installed_package_names(backend)
+            if not names:
+                return "the installed packages could not be listed now"
+            evidence = NameEvidence(names | oc.system_account_names(self.sysroot) | units)
+            if evidence.matches(name):
+                return "an installed package, account or service now has its name"
+        if root == "/opt" and oc._norm(name) in NameEvidence(units)._set:
+            return "a service now runs from it or is named after it"
+        days = float(self.config.orphan_min_age_days)
+        cutoff = time.time() - days * 86400 if days > 0 else None
+        if self._is_fresh(real, cutoff):
+            return "it changed recently (it may be in use)"
+        status, probes, _sampled = self._probes(real)
+        if status != "ok":
+            return "its contents could not be checked for package ownership"
+        queried = [logical] + list(probes)
+        budget = oc.ScanBudget(len(queried) + 1, _REVERIFY_SECONDS)
+        budget.start()
+        unowned = oc.query_unowned(backend, queried, budget)
+        if any(q not in unowned for q in queried):
+            return "a package owns it now, or its ownership could not be confirmed"
+        return None
+
+
+_REVERIFY_SECONDS = 120.0
+
+
+def reverify_system_item(path: str, config) -> Optional[str]:
+    """Act-time re-check of one system-wide finding (``reverify`` table)."""
+    reporter = UnownedSystemFilesReporter(config)
+    reporter.budget.start()
+    return reporter.still_unowned(Path(path))

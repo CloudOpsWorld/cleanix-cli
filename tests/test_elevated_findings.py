@@ -28,6 +28,7 @@ from cleanix.core import (
     engine,
     history,
     quarantine,
+    reverify,
     safety,
     scanmode,
     service,
@@ -174,6 +175,15 @@ def fx(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "is_root", lambda: True)
     monkeypatch.setattr(elevated, "_trusted_owner", lambda st, uid: True)
     monkeypatch.setattr(elevated, "_untrusted_group", lambda st, groups: False)
+    # The fake scan's items are not real orphan_files findings: their
+    # act-time re-check (Task 9a, tested in test_system_remedies) passes.
+    reverified = []
+
+    def permissive(item, config):
+        reverified.append(item.path)
+        return None
+
+    monkeypatch.setitem(reverify.REVERIFIERS, "orphan_files", permissive)
 
     def no_history(*a, **k):
         pytest.fail("the helper recorded history")
@@ -203,6 +213,7 @@ def fx(tmp_path, monkeypatch):
     ns.user_qroot = user_qroot
     ns.cleaners, ns.scans, ns.reqdir = cleaners, scans, reqdir
     ns.result = reqdir / elevate.RESULT_NAME
+    ns.reverified = reverified
     yield ns
     context.configure(None)
     safety.set_protected_globs([])
@@ -954,8 +965,13 @@ def test_watchdog_mid_batch_result_is_honest_and_manifest_records_moves(fx, monk
     assert result.removed == 1 and result.freed > 0
     assert result.quarantine_run
     manifest = json.loads((fx.qbase / result.quarantine_run / "manifest.json").read_text())
-    assert [i["original"] for i in manifest["items"]] == [str(a)]
+    # b was recorded before its move and the kill (an asynchronous
+    # exception) arrived before the rename: its entry stays (Task 9a carry-over
+    # (a): only an OSError from the rename drops it), as a real os._exit
+    # would leave it -- a phantom entry: stored file missing, original intact.
+    assert [i["original"] for i in manifest["items"]] == [str(a), str(b)]
     assert Path(manifest["items"][0]["stored"]).read_text() == "aaaa"
+    assert not Path(manifest["items"][1]["stored"]).exists() and b.exists()
 
 
 @posix_only
@@ -980,11 +996,12 @@ def test_root_quarantine_records_origin_before_moving(fx, monkeypatch):
 def test_mountinfo_parsing_unescapes_mount_points():
     from cleanix.core import root_delete
 
-    text = ("36 35 98:0 /mnt1 /mnt/with\\040space rw,noatime master:1 - ext3 /dev/root rw\n"
+    text = ("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"
+            "36 35 98:0 /mnt1 /mnt/with\\040space rw,noatime master:1 - ext3 /dev/root rw\n"
             "37 35 98:0 / /var/lib/kubelet/pods/x/volumes rw - tmpfs tmpfs rw\n"
             "38 35 98:0 / /odd\\134name\\011tab rw - tmpfs tmpfs rw\n")
     assert root_delete.parse_mountinfo(text) == [
-        "/mnt/with space", "/var/lib/kubelet/pods/x/volumes", "/odd\\name\ttab"]
+        "/", "/mnt/with space", "/var/lib/kubelet/pods/x/volumes", "/odd\\name\ttab"]
     assert root_delete.parse_mountinfo("garbage\n") is None
 
 
@@ -998,8 +1015,13 @@ def mounts(monkeypatch):
     return table
 
 
+ROOT_MOUNT = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"
+
+
 def _mount_line(path):
-    return "40 35 98:0 / " + str(path).replace(" ", "\\040") + " rw - tmpfs tmpfs rw\n"
+    """A mount table with the root entry plus one mount at ``path``."""
+    return ROOT_MOUNT + ("40 35 98:0 / " + str(path).replace(" ", "\\040")
+                         + " rw - tmpfs tmpfs rw\n")
 
 
 @posix_only
@@ -1158,3 +1180,204 @@ def test_parent_swapped_for_a_link_mid_batch_is_caught_before_removal(fx, monkey
     late = st[f"orphan_files|path|{f2}"]
     assert late.status == "skipped" and "symbolic link" in late.reason
     assert calls == [str(f1)]
+
+
+# --------------------------------------------------------------------------
+# Task 9a: real detectors, act-time re-verification, hardening, end to end
+# --------------------------------------------------------------------------
+def _aged(path, days=100):
+    import time as _time
+
+    t = _time.time() - days * 86400
+    os.utime(str(path), (t, t), follow_symlinks=False)
+    return path
+
+
+class _FakeDpkg:
+    """dpkg behind ``oc.run``: ``owned`` paths are owned, others unowned."""
+
+    def __init__(self):
+        self.owned = set()
+        self.queries = []
+
+    def __call__(self, argv, timeout=60):
+        argv = list(argv)
+        if argv[:2] == ["dpkg-query", "-W"]:
+            return 0, "bash\ncoreutils\n", ""
+        if argv[:2] == ["dpkg-query", "-S"]:
+            ps = argv[2:]
+            self.queries.append(ps)
+            out = [f"somepkg: {p}" for p in ps if p in self.owned]
+            err = [f"dpkg-query: no path found matching pattern {p}"
+                   for p in ps if p not in self.owned]
+            return (1 if err else 0), "\n".join(out), "\n".join(err)
+        return 127, "", "not found"
+
+
+@posix_only
+def test_helper_end_to_end_removes_unowned_item_and_refuses_owned_one(fx, monkeypatch):
+    """The real orphan_files detector in the helper's scan, the real
+    package-ownership re-verifier right before removal: a file a package
+    started to own after the helper's own scan is skipped and kept."""
+    from cleanix.cleaners.orphan_files import UnownedSystemFilesReporter
+
+    sysroot = fx.tmp / "fsroot"
+    varlib = sysroot / "var" / "lib"
+    varlib.mkdir(parents=True)
+    monkeypatch.setattr(UnownedSystemFilesReporter, "sysroot", str(sysroot))
+    monkeypatch.setattr(UnownedSystemFilesReporter, "pkg_backend", lambda self: "dpkg")
+    monkeypatch.setattr(elevated, "finding_path_roots", lambda: {"orphan_files": (str(varlib),)})
+    monkeypatch.setitem(reverify.REVERIFIERS, "orphan_files", reverify._orphan_files)
+    dpkg = _FakeDpkg()
+    monkeypatch.setattr(oc, "run", dpkg)
+    gone = varlib / "zzgone"
+    gone.write_text("left over")
+    owned = varlib / "zzsoon"
+    owned.write_text("about to be owned")
+    _aged(gone)
+    _aged(owned)
+    user_items = [i for i in UnownedSystemFilesReporter(Config()).scan().items
+                  if i.remedy is not None]
+    assert {i.path for i in user_items} == {str(gone), str(owned)}
+    fx.cleaners.append(UnownedSystemFilesReporter(Config()))
+    real_scan = service.scan
+
+    def scan_then_install(*a, **k):
+        result = real_scan(*a, **k)
+        dpkg.owned.add("/var/lib/zzsoon")  # installed between scan and act
+        return result
+
+    monkeypatch.setattr(service, "scan", scan_then_install)
+    rc, result = run_helper(fx, request(user_items))
+    assert rc == elevated.EXIT_OK
+    st = {o.key: o for o in result.findings}
+    assert st[f"orphan_files|path|{gone}"].status == "removed"
+    late = st[f"orphan_files|path|{owned}"]
+    assert late.status == "skipped" and "a package owns it now" in late.reason
+    assert not gone.exists() and owned.read_text() == "about to be owned"
+    assert ["/var/lib/zzsoon"] in dpkg.queries  # the exact path, re-queried
+    run = fx.qbase / result.quarantine_run
+    manifest = json.loads((run / "manifest.json").read_text())
+    assert [i["original"] for i in manifest["items"]] == [str(gone)]
+
+
+@posix_only
+def test_helper_end_to_end_removes_a_broken_wants_link_only_while_broken(fx, monkeypatch):
+    """stale_services' broken *.wants links: the LINK itself is moved into
+    the root quarantine (never its target); a link whose target appeared
+    after the helper's scan is kept."""
+    from cleanix.cleaners.stale_services import StaleSystemdUnitReporter
+
+    sysroot = fx.tmp / "fsroot"
+    etc = sysroot / "etc" / "systemd" / "system"
+    wants = etc / "multi-user.target.wants"
+    wants.mkdir(parents=True)
+    unitdir = sysroot / "usr" / "lib" / "systemd" / "system"
+    unitdir.mkdir(parents=True)
+    for name in ("gone.service", "back.service"):
+        os.symlink(f"/usr/lib/systemd/system/{name}", str(wants / name))
+    monkeypatch.setattr(StaleSystemdUnitReporter, "sysroot", str(sysroot))
+    monkeypatch.setattr(StaleSystemdUnitReporter, "pkg_backend", lambda self: None)
+    monkeypatch.setattr(elevated, "admin_finding_ids", lambda: frozenset({"stale_services"}))
+    monkeypatch.setattr(elevated, "finding_path_roots",
+                        lambda: {"stale_services": (str(etc),)})
+    # tmp_path lies in sticky, world-writable /tmp: accept the chain for the
+    # absence rule here (its own logic is tested in test_system_remedies)
+    monkeypatch.setattr(elevated, "_evidence_component_problem", lambda st, u, g: None)
+    items = [i for i in StaleSystemdUnitReporter(Config()).scan().items
+             if i.remedy is not None and i.path.startswith(str(wants))]
+    assert {Path(i.path).name for i in items} == {"gone.service", "back.service"}
+    fx.cleaners.append(StaleSystemdUnitReporter(Config()))
+    real_scan = service.scan
+
+    def scan_then_reinstall(*a, **k):
+        result = real_scan(*a, **k)
+        (unitdir / "back.service").write_text("[Service]\n")  # target is back
+        return result
+
+    monkeypatch.setattr(service, "scan", scan_then_reinstall)
+    rc, result = run_helper(fx, request(items))
+    assert rc == elevated.EXIT_OK
+    st = {Path(o.key.split("|", 2)[2]).name: o for o in result.findings}
+    assert st["gone.service"].status == "removed"
+    assert st["back.service"].status == "skipped"
+    assert "target exists now" in st["back.service"].reason
+    assert not os.path.lexists(str(wants / "gone.service"))
+    assert os.path.islink(str(wants / "back.service"))
+    assert (unitdir / "back.service").exists()
+    run = fx.qbase / result.quarantine_run
+    (entry,) = json.loads((run / "manifest.json").read_text())["items"]
+    assert entry["original"] == str(wants / "gone.service")
+    assert os.readlink(entry["stored"]) == "/usr/lib/systemd/system/gone.service"
+
+
+@posix_only
+def test_helper_scan_judges_absence_with_the_chain_rule(fx, monkeypatch):
+    """Helper scan with the REAL absence rule: tmp_path lies in sticky,
+    world-writable /tmp (anyone may create or remove entries there), so a
+    wants link whose target would lie below it is unknown: not found."""
+    from cleanix.cleaners.stale_services import StaleSystemdUnitReporter
+
+    sysroot = fx.tmp / "fsroot"
+    etc = sysroot / "etc" / "systemd" / "system"
+    wants = etc / "multi-user.target.wants"
+    wants.mkdir(parents=True)
+    os.symlink("/usr/lib/systemd/system/gone.service", str(wants / "gone.service"))
+    monkeypatch.setattr(StaleSystemdUnitReporter, "sysroot", str(sysroot))
+    monkeypatch.setattr(StaleSystemdUnitReporter, "pkg_backend", lambda self: None)
+    monkeypatch.setattr(elevated, "admin_finding_ids", lambda: frozenset({"stale_services"}))
+    monkeypatch.setattr(elevated, "finding_path_roots",
+                        lambda: {"stale_services": (str(etc),)})
+    items = [i for i in StaleSystemdUnitReporter(Config()).scan().items
+             if i.remedy is not None]
+    assert len(items) == 1
+    fx.cleaners.append(StaleSystemdUnitReporter(Config()))
+    rc, result = run_helper(fx, request(items))
+    assert rc == elevated.EXIT_OK
+    (out,) = result.findings
+    assert out.status == "not_found" and os.path.islink(str(wants / "gone.service"))
+
+
+@posix_only
+def test_acl_on_item_chain_or_quarantine_parent_refuses(fx, monkeypatch):
+    a = make(fx, "a")
+    fx.cleaners.append(FakeCleaner("orphan_files", lambda: [finding(a)]))
+    monkeypatch.setattr(elevated, "_acl_os", lambda: "linux")
+    monkeypatch.setattr(elevated, "_list_xattrs",
+                        lambda p: ["system.posix_acl_access"] if str(p) == str(fx.sys) else [])
+    rc, result = run_helper(fx, request([finding(a)], permanent=True))
+    (out,) = result.findings
+    assert out.status == "skipped" and "access control list" in out.reason and a.exists()
+    monkeypatch.setattr(elevated, "_list_xattrs",
+                        lambda p: ["system.posix_acl_default"] if str(p) == str(fx.qparent)
+                        else [])
+    rc, result = run_helper(fx, request([finding(a)]))
+    (out,) = result.findings
+    assert out.status == "not_removed" and "access control list" in out.reason
+    assert a.exists()
+
+
+@posix_only
+def test_helper_refuses_the_quarantine_under_another_spelling(fx, monkeypatch):
+    """Act-time identity check: an item that IS the helper's own folder by
+    (st_dev, st_ino) is refused even when its spelling differs (as another
+    case of it would on a case-insensitive volume)."""
+    alias = fx.sys / "Cleanix-alias"
+    alias.mkdir()
+    qdir = fx.qparent / "cleanix"
+    qdir.mkdir()
+    real_lstat = elevated._lstat
+
+    def lstat(path):
+        if str(path) == str(alias):
+            return real_lstat(str(qdir))
+        return real_lstat(path)
+
+    monkeypatch.setattr(elevated, "_lstat", lstat)
+    item = finding(alias)
+    fx.cleaners.append(FakeCleaner("orphan_files", lambda: [item]))
+    for permanent in (True, False):
+        rc, result = run_helper(fx, request([item], permanent=permanent))
+        (out,) = result.findings
+        assert out.status == "skipped" and "administrator quarantine" in out.reason
+        assert alias.exists()

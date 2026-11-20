@@ -74,7 +74,49 @@ def _lstat(path: str) -> os.stat_result:  # indirection: tests inject failures
     return os.lstat(path)
 
 
-def verify_path(path: str, fingerprint: object, *, allow_dir: bool = True) -> Optional[str]:
+# ``Remedy.extra`` key of a PATH remedy whose entry IS a symbolic link (a
+# broken unit link of a system-wide finding): the link's recorded target.
+# Only such a remedy lets :func:`verify_path` accept a link, and only when
+# the link still points at exactly that target.
+LINK_TARGET = "link_target"
+
+
+def link_target(remedy: Optional[Remedy]) -> Optional[str]:
+    """The recorded target of a link PATH remedy, else None."""
+    if remedy is None or remedy.kind is not RemedyKind.PATH:
+        return None
+    for key, value in remedy.extra:
+        if key == LINK_TARGET:
+            return value
+    return None
+
+
+def link_remedy(path: str) -> Optional[Remedy]:
+    """A PATH remedy for the symbolic link ``path`` itself (never its
+    target), pinned to its lstat identity and its target text. None when it
+    is not a link, cannot be read, or its name or target holds a
+    newline/CR/NUL."""
+    if any(c in os.path.basename(path) for c in ("\n", "\r", "\0")):
+        return None
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISLNK(st.st_mode):
+            return None
+        target = os.readlink(path)
+    except (OSError, ValueError):
+        return None
+    if not target or any(c in target for c in ("\n", "\r", "\0")):
+        return None
+    fp = (st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev)
+    return Remedy(RemedyKind.PATH, fp, extra=((LINK_TARGET, target),))
+
+
+def _readlink(path: str) -> str:  # indirection: tests inject failures
+    return os.readlink(path)
+
+
+def verify_path(path: str, fingerprint: object, *, allow_dir: bool = True,
+                link: Optional[str] = None) -> Optional[str]:
     """Why ``path`` must not be acted on now, or None when it is still the
     entry fingerprinted at scan time.
 
@@ -101,6 +143,19 @@ def verify_path(path: str, fingerprint: object, *, allow_dir: bool = True) -> Op
         return f"{CHANGED} (missing or unreadable)"
     mode = st.st_mode
     attrs = getattr(st, "st_file_attributes", 0) or 0
+    if link is not None:
+        # A link remedy: the entry must still be that very link (identity
+        # and target text); it is removed as a link, never followed.
+        if not stat.S_ISLNK(mode):
+            return f"{CHANGED} (no longer a link)"
+        if (st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev) != fp:
+            return CHANGED
+        try:
+            if _readlink(path) != link:
+                return f"{CHANGED} (the link points elsewhere)"
+        except (OSError, ValueError):
+            return f"{CHANGED} (missing or unreadable)"
+        return None
     if stat.S_ISLNK(mode) or attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
         return f"{CHANGED} (now a link or reparse point)"
     if not (stat.S_ISREG(mode) or (allow_dir and stat.S_ISDIR(mode))):

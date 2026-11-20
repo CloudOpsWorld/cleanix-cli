@@ -31,6 +31,7 @@ _SYSTEM_SCAN = (
     "/usr/local/lib/systemd/system",
     "/etc/systemd/user",
 )
+_SYSTEM_USER_DIR = "/etc/systemd/user"
 _SYSTEM_LOOKUP = (
     "/etc/systemd/system",
     "/run/systemd/system",
@@ -150,6 +151,10 @@ class StaleSystemdUnitReporter(OrphanReporter):
             return  # unknown, not stale
         if oc.link_target_exists(link, self.sysroot) is not False:
             return
+        # Helper (root) scans: a missing target an ordinary user could have
+        # removed (a folder on the way they can write, a link) is unknown.
+        if oc.evidence_problem(oc.link_dest(link, self.sysroot)):
+            return
         logical = oc.logical_path(self.sysroot, link)
         yield Finding(
             link,
@@ -157,6 +162,8 @@ class StaleSystemdUnitReporter(OrphanReporter):
             self._hint(link.name, logical, user),
             requires_root=not user,
             remedy_kind=RemedyKind.PATH,
+            # system-wide: the remedy removes the link itself (helper only)
+            remedy_extra=() if user else oc.LINK_REMEDY,
         )
 
     # ------------------------------------------------------ (c) drop-in
@@ -174,12 +181,16 @@ class StaleSystemdUnitReporter(OrphanReporter):
             if _unit_known(f"{prefix}@.{unit.rsplit('.', 1)[1]}", lookup):
                 return
         logical = oc.logical_path(self.sysroot, d)
+        # A system-wide drop-in for USER units (/etc/systemd/user) applies to
+        # units that may exist only in some user's home, which this scan
+        # cannot see: no remedy (report only), never removed by the helper.
+        for_user_units = not user and logical.startswith(_SYSTEM_USER_DIR + "/")
         yield Finding(
             d,
             f"Settings for a removed service: {logical}",
             self._hint(unit, logical, user),
             requires_root=not user,
-            remedy_kind=RemedyKind.PATH,
+            remedy_kind=None if for_user_units else RemedyKind.PATH,
         )
 
     # ------------------------------------------------------ (a) unit file
@@ -244,11 +255,14 @@ class StaleSystemdUnitReporter(OrphanReporter):
         else:
             candidates = [f"{d}/{binary}" for d in _BIN_DIRS]
         try:
-            return any(
-                os.path.exists(oc.in_root(self.sysroot, c)) for c in candidates
-            )
+            if any(os.path.exists(oc.in_root(self.sysroot, c)) for c in candidates):
+                return True
         except OSError:
             return None
+        # Helper (root) scans: an absence an ordinary user could cause is unknown.
+        if any(oc.evidence_problem(str(oc.in_root(self.sysroot, c))) for c in candidates):
+            return None
+        return False
 
     # ------------------------------------------------------------- misc
     def _reset(self) -> None:
@@ -369,3 +383,53 @@ def _parse_unit(text: str) -> tuple[list, list]:
         elif key.startswith(("Condition", "Assert")):
             conds.append(value)
     return execs, conds
+
+
+# ------------------------------------------------------- act-time re-check
+_REVERIFY_SECONDS = 120.0
+
+
+def _scan_root_of(logical: str) -> Optional[str]:
+    """The scanned system folder ``logical`` lies in (directly, or in one of
+    its ``*.wants``/``*.requires``/``*.upholds`` folders), else None."""
+    parent = logical.rsplit("/", 1)[0]
+    if parent in _SYSTEM_SCAN:
+        return parent
+    grand, _, sub = parent.rpartition("/")
+    if grand in _SYSTEM_SCAN and sub.endswith(_LINK_SUBDIRS):
+        return grand
+    return None
+
+
+def reverify_system_item(path: str, config) -> Optional[str]:
+    """Act-time re-check of one system-wide finding (``reverify`` table):
+    a broken unit link must still be a link whose target is positively
+    missing (strict evidence); a drop-in folder (directly in a scanned
+    folder, never ``/etc/systemd/user``) must still belong to no known
+    unit. Unit files are not handled here (no PATH remedy). Anything
+    unknown is a reason (fail closed)."""
+    reporter = StaleSystemdUnitReporter(config)
+    reporter.budget.start()
+    real = Path(path)
+    logical = oc.logical_path(reporter.sysroot, real)
+    root = _scan_root_of(logical)
+    if root is None:
+        return "it is not in a folder this scenario checks"
+    if oc.bad_name(real.name):
+        return "its name cannot be checked"
+    mode = _lmode(real)
+    if mode is None:
+        return "it cannot be inspected"
+    if stat.S_ISLNK(mode):
+        if not list(reporter._check_link(real, user=False)):
+            return "its target exists now, or cannot be confirmed missing"
+        return None
+    directly_in_root = logical.rsplit("/", 1)[0] == root
+    if stat.S_ISDIR(mode) and real.name.endswith(".d") and directly_in_root:
+        if root == _SYSTEM_USER_DIR:
+            return "drop-ins for user units are never removed"
+        dirs = [oc.in_root(reporter.sysroot, d) for d in _SYSTEM_LOOKUP]
+        if not list(reporter._check_dropin(real, dirs, user=False)):
+            return "its service exists now, or cannot be confirmed missing"
+        return None
+    return "it is not a link or settings folder this scenario removes"
