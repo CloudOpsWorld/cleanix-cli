@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 from cleanix.core import findings, system_findings
 from cleanix.core.curation import Safety, display_label, shorten_path
 from cleanix.core.findings import FindingGroup
-from cleanix.core.models import CleanableItem, ItemKind, ScanResult, item_target
+from cleanix.core.models import CleanableItem, ItemKind, ScanResult, _visible, item_target
 from cleanix.core.remedy import RemedyKind, link_target
 from cleanix.core.utils import human_size
 from cleanix.gui import reveal
@@ -60,6 +60,8 @@ NOT_HANDLED = "Report only: Cleanix cannot act on this kind of finding."
 LINK_NOT_HERE = ("Report only here: this link is only removed with "
                  "administrator rights.")
 KEPT = "Kept: this is the copy that stays."
+AMBIGUOUS_GROUP = ("Not offered: duplicate group is ambiguous (its id appears in "
+                   "more than one place), so no copy of it is acted on.")
 NEEDS_ADMIN = "Needs admin"
 ADMIN_UNAVAILABLE = "administrator permission is not available here"
 NOT_OFFERED = "Not offered"
@@ -94,6 +96,22 @@ _CATEGORY_TIPS = {
     findings.INSTALL_RECORDS: "Install records of packages whose files are gone.",
     findings.OTHER_FINDINGS: "Findings from scenarios that have no category yet.",
 }
+
+
+def shown(text) -> str:
+    """Display form of finding-derived text (names, paths, titles, reasons):
+    control, format (bidi overrides/isolates) and line/paragraph separator
+    characters are shown as backslash-u escapes, as the CLI's ``report.safe``
+    does, so a hostile name can neither reorder nor split what is read.
+    Only for display: Copy path copies the original text."""
+    return _visible(str(text or ""))
+
+
+def tip_lines(*parts) -> str:
+    """A plain tooltip of several finding-derived parts, one per line (each
+    part sanitised with :func:`shown` first, so its own newlines never
+    become line breaks)."""
+    return plain_tip("\n".join(shown(p) for p in parts if p))
 
 
 def plain_tip(text: str) -> str:
@@ -275,15 +293,28 @@ class ReviewModel:
             self.scenarios.append(sc)
             for item in items:
                 self._scenario_of[id(item)] = si
+        # A duplicate group id must name exactly one unit (one scenario):
+        # one seen twice is ambiguous and fails closed -- none of its copies
+        # can be ticked and it gets no survivor.
+        units_of: Dict[str, List[List[CleanableItem]]] = {}
+        for sc in self.scenarios:
             for unit in sc.units:
                 group = sc.unit_group(unit)
                 if group is not None:
-                    self._group_of[group] = unit
-                    self._survivors[group] = unit[0]  # default (see _units)
+                    units_of.setdefault(group, []).append(unit)
+        ambiguous = set()
+        for group, units in units_of.items():
+            if len(units) == 1:
+                self._group_of[group] = units[0]
+                self._survivors[group] = units[0][0]  # default (see _units)
+            else:
+                ambiguous.update(id(i) for u in units for i in u)
         every = [i for sc in self.scenarios for i in sc.items]
         system = self._system_reasons([i for i in every if i.requires_root])
         for item in every:
-            if item.requires_root:
+            if id(item) in ambiguous:
+                self._static[id(item)] = AMBIGUOUS_GROUP
+            elif item.requires_root:
                 why = (NO_ACTION if not findings.is_finding(item)
                        else system.get(id(item), None))
                 self._static[id(item)] = why
@@ -463,15 +494,14 @@ class ReviewModel:
 
     def set_checked(self, item: CleanableItem, on: bool) -> bool:
         """Tick/untick one item; False when nothing changed (refused)."""
+        self.cap_note = ""  # an untick, or a new tick: any old cap note is stale
         if not on:
             return self._selected.pop(id(item), None) is not None
-        self.cap_note = ""
         return self._add(item)
 
     def set_unit(self, unit: List[CleanableItem], on: bool) -> bool:
         changed = False
-        if on:
-            self.cap_note = ""
+        self.cap_note = ""
         for item in unit:
             changed = (self._add(item) if on else
                        self._selected.pop(id(item), None) is not None) or changed
@@ -480,11 +510,11 @@ class ReviewModel:
     def set_scenario(self, sc: Scenario, on: bool) -> List[List[CleanableItem]]:
         """Bulk tick/untick; returns the units realised for it (the view
         shows them). Unticking clears every item of the scenario."""
+        self.cap_note = ""
         if not on:
             for item in sc.items:
                 self._selected.pop(id(item), None)
             return []
-        self.cap_note = ""
         new = self.realise(sc, len(self._scope_units(sc)))
         for item in self.bulk_targets(sc):
             self._add(item)
@@ -521,6 +551,7 @@ class ReviewModel:
         self._prune()
 
     def _prune(self) -> None:
+        self.cap_note = ""
         for key, item in list(self._selected.items()):
             if not self.tickable(item):
                 del self._selected[key]
@@ -533,6 +564,14 @@ class ReviewModel:
     def selected_items(self) -> List[CleanableItem]:
         return [i for sc in self.scenarios for i in sc.items
                 if id(i) in self._selected and self.tickable(i)]
+
+    def selected_user_items(self) -> List[CleanableItem]:
+        """The ticked user-space items (acted on in-process)."""
+        return [i for i in self.selected_items() if not i.requires_root]
+
+    def selected_system_items(self) -> List[CleanableItem]:
+        """The ticked system-wide items (for the administrator helper)."""
+        return [i for i in self.selected_items() if i.requires_root]
 
     def selected_size(self) -> int:
         return sum(real_size(i) for i in self.selected_items())
@@ -552,7 +591,7 @@ class ReviewModel:
         for sc in self.scenarios:
             n = self.unrealised_tickable(sc)
             if n and any(self.is_selected(i) for i in sc.items):
-                notes.append(MORE_NOT_SHOWN.format(title=sc.title, n=n))
+                notes.append(MORE_NOT_SHOWN.format(title=shown(sc.title), n=n))
         return notes
 
     def check_invariants(self) -> None:
@@ -585,6 +624,10 @@ class ReviewView(QWidget):
     """The Review tree and its footer (no tab, no act flow: see Task 12)."""
 
     actRequested = Signal(object, bool, object)  # items, permanent, survivors
+    # The same request, split for the owner: (user_items, system_items,
+    # permanent, survivors). user_items are acted on in-process; system_items
+    # go to the administrator helper. Emitted right after actRequested.
+    actRequestedSplit = Signal(object, object, bool, object)
     selectionChanged = Signal()
 
     def __init__(self, parent=None, *, home: Optional[str] = None) -> None:
@@ -788,12 +831,12 @@ class ReviewView(QWidget):
                 for sc in scs:
                     row = QTreeWidgetItem()
                     row.setData(0, _ROLE, _Row("sc", si=sc.index))
-                    row.setText(0, sc.title)
+                    row.setText(0, shown(sc.title))
                     acts = sum(1 for i in sc.items if findings.is_finding(i))
                     row.setText(3, f"{len(sc.items)} item(s), {acts} with an action")
                     row.setText(4, human_size(sum(i.size for i in sc.items)))
                     row.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                    row.setToolTip(0, plain_tip(f"{sc.title} ({sc.cleaner_id})"))
+                    row.setToolTip(0, tip_lines(f"{sc.title} ({sc.cleaner_id})"))
                     row.setChildIndicatorPolicy(
                         QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
                     cat.addChild(row)
@@ -825,10 +868,10 @@ class ReviewView(QWidget):
                 dup = QTreeWidgetItem()
                 dup.setData(0, _ROLE, _Row("dup", si=sc.index, unit=unit))
                 name = os.path.basename(unit[0].path or "") or "file"
-                dup.setText(0, f"{len(unit)} copies of {name}")
+                dup.setText(0, f"{len(unit)} copies of {shown(name)}")
                 dup.setText(4, human_size(real_size(unit[0])) + " each")
                 dup.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                dup.setToolTip(0, plain_tip(
+                dup.setToolTip(0, tip_lines(
                     f"Identical copies of {name}. One copy always stays; "
                     "right-click a copy and choose \"Keep this copy instead\" "
                     "to change which one."))
@@ -859,8 +902,9 @@ class ReviewView(QWidget):
         # copy by its file name instead (its folder is in the next column).
         label = (os.path.basename(item.path or "") if is_duplicate_copy(item)
                  else "") or display_label(item, self._home)
-        row.setText(0, label)
-        row.setText(1, shorten_path(item_target(item), self._home))
+        # Displayed sanitised; Copy path copies the original (item_target).
+        row.setText(0, shown(label))
+        row.setText(1, shown(shorten_path(item_target(item), self._home)))
         row.setText(4, human_size(real_size(item)))
         row.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if self.model.has_remedy_row(item):
@@ -887,12 +931,12 @@ class ReviewView(QWidget):
             kept = m.survivor(item.remedy.group)  # type: ignore[union-attr]
             if kept is not None:
                 col3 = f"{happens}; keeps {shorten_path(kept.path or '', self._home)}"
+        col3 = shown(col3)
         row.setText(3, col3)
-        tip = "\n".join(t for t in (item_target(item), reason,
-                                     happens if happens != col3 else "",
-                                     item.hint) if t)
+        tip = tip_lines(item_target(item), reason,
+                        happens if shown(happens) != col3 else "", item.hint)
         for c in range(len(COLUMNS)):
-            row.setToolTip(c, plain_tip(tip))
+            row.setToolTip(c, tip)
         row.setData(0, _ACCESSIBLE, f"{row.text(0)}, {row.text(2)}, {row.text(4)}, {col3}")
         if m.has_remedy_row(item):
             flags = Qt.ItemFlag.ItemIsSelectable
@@ -1024,8 +1068,8 @@ class ReviewView(QWidget):
             m.set_checked(p.item, on)
         elif p.kind == "dup":
             m.set_unit(p.unit, on)
-            if on:
-                self._reveal_ticked(m.scenarios[p.si])
+            if on:  # same reveal as a scenario tick: ancestors and the row
+                self._show_scenario(m.scenarios[p.si], [])
         elif p.kind == "sc":
             sc = m.scenarios[p.si]
             if on:
@@ -1075,4 +1119,8 @@ class ReviewView(QWidget):
         items = self.model.selected_items()
         if not items:
             return
-        self.actRequested.emit(items, self.model.permanent, self.model.survivor_map())
+        survivors = self.model.survivor_map()
+        self.actRequested.emit(items, self.model.permanent, survivors)
+        self.actRequestedSplit.emit(self.model.selected_user_items(),
+                                    self.model.selected_system_items(),
+                                    self.model.permanent, survivors)

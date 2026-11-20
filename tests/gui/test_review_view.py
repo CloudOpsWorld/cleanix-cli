@@ -673,3 +673,142 @@ def test_palette_only_no_fixed_light_colours(qtbot, dark, fake_plan):
                     # readable on this base (badge colours follow the palette)
                     assert abs(fg.lightness() - base.lightness()) > 80
                 assert row.background(c).style() == Qt.BrushStyle.NoBrush
+
+
+# ----------------------------------------------------------- fix round 1
+def test_ambiguous_duplicate_group_fails_closed(qtbot):
+    gid = "9" * 64
+    x = fnd("big_files", "x", group=gid)
+    y = fnd("big_files", "y", group=gid)
+    c0 = fnd("duplicates", "copy0", group=gid, mtime=1)
+    c1 = fnd("duplicates", "copy1", group=gid, mtime=2)
+    other = dup_group("8" * 64)
+    w = make(qtbot, scan(report("big_files", [x, y]),
+                         report("duplicates", [c0, c1] + other)))
+    tick(w, w.category_row(findings.YOUR_FILES))
+    realise_all(w)
+    for item in (x, y, c0, c1):
+        assert w.model.reason(item) == review_view.AMBIGUOUS_GROUP
+        assert not w.model.is_selected(item)
+        assert w.model.set_checked(item, True) is False
+        assert w.model.set_survivor(item) is False
+        assert not checkable(w.item_row(item))
+    assert gid not in w.survivor_map()
+    assert set(w.survivor_map()) == {"8" * 64}  # the sound group still works
+    w.model.check_invariants()
+
+
+def test_selected_user_and_system_split(qtbot, fake_plan):
+    good, bad, user, s = _system_scan()
+    w = make(qtbot, s)
+    w.set_elevation_available(True)
+    for cat in (findings.YOUR_FILES, findings.UNOWNED_FILES):
+        tick(w, w.category_row(cat))
+    m = w.model
+    assert m.selected_user_items() == [user]
+    assert m.selected_system_items() == [good]
+    union = m.selected_user_items() + m.selected_system_items()
+    assert {id(i) for i in union} == {id(i) for i in w.selected_items()}
+    assert len(union) == len(w.selected_items())
+    got, split = [], []
+    w.actRequested.connect(lambda *a: got.append(a))
+    w.actRequestedSplit.connect(lambda *a: split.append(a))
+    qtbot.mouseClick(w.act_button, Qt.MouseButton.LeftButton)
+    [(items, perm, surv)] = got
+    [(users, systems, perm2, surv2)] = split
+    assert [id(i) for i in users] == [id(user)]
+    assert [id(i) for i in systems] == [id(good)]
+    assert perm2 is perm is False and surv2 == surv == {}
+
+
+def test_bidi_and_control_characters_are_escaped(qtbot):
+    from PySide6.QtWidgets import QApplication
+
+    rlo = "evil\u202eexe.txt"
+    nl = "two\nlines"
+    a = fnd("big_files", rlo, path=f"{HOME}/{rlo}")
+    b = fnd("big_files", nl, path=f"{HOME}/{nl}")
+    w = make(qtbot, scan(report("big_files", [a, b])))
+    realise_all(w)
+    for item, raw in ((a, "\u202e"), (b, "\n")):
+        row = w.item_row(item)
+        for c in range(len(review_view.COLUMNS)):
+            assert raw not in row.text(c)
+            assert raw not in row.toolTip(c)
+    assert "evil\\u202eexe.txt" in w.item_row(a).text(0)
+    assert "evil\\u202eexe.txt" in w.item_row(a).text(1)
+    assert "two\\u000alines" in w.item_row(b).text(1)
+    assert "two\\u000alines" in w.item_row(b).toolTip(0)
+    w.copy_path(b)  # the original path, not the display form
+    assert QApplication.clipboard().text() == b.path
+
+
+def test_cap_note_cleared_when_capped_ticks_are_gone(qtbot, monkeypatch):
+    from cleanix.core import elevate
+
+    monkeypatch.setattr(elevate, "MAX_FINDING_ITEMS", 2)
+
+    def plan(items):
+        return system_findings.SystemPlan(offered=list(items))
+
+    monkeypatch.setattr(system_findings, "plan", plan)
+    a = [fnd("orphan_files", f"a{k}", root=True) for k in range(3)]
+    m = ReviewModel()
+    m.load(findings.group_findings(scan(report("orphan_files", a))))
+    m.set_elevation(True)
+    sc = m.scenarios[0]
+    m.realise_initial(sc)
+    m.set_scenario(sc, True)
+    assert m.cap_note
+    m.set_checked(m.selected_items()[0], False)  # an untick
+    assert m.cap_note == ""
+    m.set_scenario(sc, True)
+    assert m.cap_note
+    m.set_scenario(sc, False)  # a bulk untick
+    assert m.cap_note == ""
+    m.set_scenario(sc, True)
+    assert m.cap_note
+    m.set_elevation(False)  # elevation lost (prune)
+    assert m.cap_note == "" and m.selected_items() == []
+    m.set_elevation(True)
+    m.set_scenario(sc, True)
+    m.set_unit([a[0]], False)
+    assert m.cap_note == ""
+
+
+def test_dup_row_toggle_reveals_ancestors(qtbot):
+    g = dup_group("7" * 64)
+    w = make(qtbot, scan(report("duplicates", g)))
+    sc_row = w.scenario_row("duplicates")
+    sc_row.setExpanded(True)
+    dup_row = w.item_row(g[1]).parent()
+    dup_row.setExpanded(False)
+    sc_row.setExpanded(False)
+    w.category_row(findings.YOUR_FILES).setExpanded(False)
+    w.toggle(payload(dup_row), True)
+    assert w.selected_items()
+    for item in w.selected_items():
+        assert _shown(w.item_row(item))
+
+
+def test_selected_items_filters_untickable_entries():
+    plain = fnd("big_files", "plain", remedy=False)
+    ok = fnd("big_files", "ok")
+    m = ReviewModel()
+    m.load(findings.group_findings(scan(report("big_files", [plain, ok]))))
+    m.realise_initial(m.scenarios[0])
+    m._selected[id(plain)] = plain  # forced past the guards
+    m.set_checked(ok, True)
+    assert m.selected_items() == [ok]
+
+
+def test_last_unticked_copy_guard():
+    g = dup_group("6" * 64)
+    m = ReviewModel()
+    m.load(findings.group_findings(scan(report("duplicates", g))))
+    m.realise_initial(m.scenarios[0])
+    # simulate a survivor that is not a copy of this group: every copy is
+    # tickable, but the last unticked one must still be refused
+    m._survivors["6" * 64] = fnd("duplicates", "elsewhere", group="6" * 64)
+    assert m.set_checked(g[0], True) and m.set_checked(g[1], True)
+    assert m.set_checked(g[2], True) is False
