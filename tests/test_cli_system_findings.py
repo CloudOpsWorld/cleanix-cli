@@ -5,6 +5,7 @@ result; no real elevation, no real helper, no system path is touched)."""
 from __future__ import annotations
 
 import builtins
+import sys
 import re
 from pathlib import Path
 
@@ -213,7 +214,8 @@ def test_typed_confirmation_wrong_text_aborts(tmp_path, monkeypatch, capsys):
     _patch_scan(monkeypatch, [user, _sys()])
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
     launch = _install(monkeypatch, Launcher())
-    for wrong in ("delete system files", "DELETE SYSTEM", "yes", ""):
+    for wrong in ("delete system files", "DELETE SYSTEM", "yes", "", " DELETE SYSTEM FILES",
+                  "DELETE SYSTEM FILES ", "Delete System Files", "DELETE  SYSTEM FILES"):
         asked = _phrase(monkeypatch, wrong)
         code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
         assert code == 1 and len(asked) == 1 and PHRASE in asked[0]
@@ -238,11 +240,15 @@ def test_typed_confirmation_exact_text_proceeds(tmp_path, monkeypatch, capsys):
     (sel,) = launch.requests
     assert [x.key for x in sel.findings.items] == [item_key(s)]
     assert sel.findings.permanent is False
-    assert "moved to the root-only quarantine (you cannot restore from it yet)" in out
+    assert "moved to the root-only quarantine (you cannot restore from it yet; 100 B moved, no space freed)" in out
+    assert "moved 1 item(s) (100 B) into the root-only quarantine; no space was freed" in out
     assert "20261120-root" in out and "/var/lib/cleanix/quarantine" in out
     assert "You cannot restore from it yet" in out
     # one history entry for the user part, one for the helper's removals
-    assert [e["mode"] for e in history.load()] == ["quarantine", "administrator"]
+    # the moved bytes are never counted as freed
+    assert [(e["mode"], e["freed"], e["items"]) for e in history.load()][1:] == [
+        ("administrator-quarantine", 0, 1)]
+    assert history.load()[0]["mode"] == "quarantine"
 
 
 def test_yes_without_elevation_skips_system_but_runs_user(tmp_path, monkeypatch, capsys):
@@ -291,7 +297,7 @@ def test_summary_lists_not_done(tmp_path, monkeypatch, capsys):
     assert "skipped: changed since the scan" in out
     assert "not done: the administrator scan did not report this item" in out
     assert "refused by the administrator helper" in out
-    assert "removed 1 item(s)" in out
+    assert "moved 1 item(s)" in out
     assert code == 2  # a refusal is a real error
 
 
@@ -409,7 +415,7 @@ def test_helper_error_exit_code_2(tmp_path, monkeypatch, capsys):
     _install(monkeypatch, Launcher(write=False, exc=elevate_launch.ElevationUnavailable(
         "pkexec (polkit) was not found")))
     code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
-    assert code == 2 and "nothing was removed" in out
+    assert code == 2 and "none of the system-wide items was removed" in out
     # helper refused the whole request (exit 1 with a result, no outcomes)
     _install(monkeypatch, Launcher(omit=True, errors=["refused: the process is not root"],
                                    exc=elevate_launch.ElevationFailed("x", exit_code=1)))
@@ -428,7 +434,7 @@ def test_helper_error_exit_code_2(tmp_path, monkeypatch, capsys):
     launch = _install(monkeypatch, Launcher())
     monkeypatch.setattr(elevate_launch, "run_findings_request", too_big)
     code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
-    assert code == 2 and "No prompt was shown; nothing was removed" in out
+    assert code == 2 and "No prompt was shown; none of the system-wide items was removed" in out
     assert launch.calls == []
 
 
@@ -438,7 +444,7 @@ def test_abort_exit_code_1(tmp_path, monkeypatch, capsys):
     _install(monkeypatch, Launcher(write=False, exc=elevate_launch.ElevationDeclined(
         "authentication was declined")))
     code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
-    assert code == 1 and "declined; nothing was removed" in out
+    assert code == 1 and "declined; none of the system-wide items was removed" in out
     monkeypatch.setattr(cli, "_is_root_process", lambda: False)
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
     _phrase(monkeypatch, KeyboardInterrupt)
@@ -503,11 +509,22 @@ def test_request_identity_and_config_agree(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_never_passes_allow_root(tmp_path, monkeypatch, capsys):
+    import ast
+
     root = Path(cli.__file__).parent
+    forbidden = {"allow_root", "quarantine_root", "backup_root"}
     for rel in ("cli.py", "core/review.py", "core/system_findings.py"):
         text = (root / rel).read_text(encoding="utf-8")
         assert not re.search(r"allow_root\s*=", text), rel
         assert "quarantine_root=" not in text and "backup_root=" not in text, rel
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.keyword):
+                assert node.arg not in forbidden, (rel, node.arg)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                assert not forbidden & {node.value.strip()}, (rel, node.value)
+                assert "allow_root" not in node.value, (rel, node.value)
+            if isinstance(node, ast.Name):
+                assert node.id != "allow_root", rel
     seen = []
     real = actions.act
 
@@ -684,3 +701,140 @@ def test_review_lists_not_offered_system_items(tmp_path, monkeypatch, capsys):
     assert code == 0 and len(asked) == 1 and launch.calls == []
     assert "root.bin: not offered: the administrator helper does not act on this " \
            "scenario" in out
+
+
+# --------------------------------------------------------------------------
+# fix round 1
+# --------------------------------------------------------------------------
+def test_root_quarantine_moves_free_nothing(tmp_path, monkeypatch, capsys):
+    _patch_scan(monkeypatch, [_sys("/opt/a"), _sys("/opt/b")])
+    monkeypatch.setattr(cli, "_is_root_process", lambda: True)
+    _install(monkeypatch, Launcher(quarantine_run="rq"))
+    code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
+    assert code == 0
+    assert ("moved 2 item(s) (200 B) into the root-only quarantine; no space was "
+            "freed (there is no purge for it yet)") in out
+    assert "freed 200 B" not in out
+    assert [(e["mode"], e["freed"], e["items"]) for e in history.load()] == [
+        ("administrator-quarantine", 0, 2)]
+    assert history.stats()["total_freed"] == 0
+
+
+def test_permanent_helper_batch_records_real_freed(tmp_path, monkeypatch, capsys):
+    _patch_scan(monkeypatch, [_sys("/opt/a"), _sys("/opt/b")])
+    monkeypatch.setattr(cli, "_is_root_process", lambda: True)
+    _install(monkeypatch, Launcher())
+    code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes",
+                     "--permanent")
+    assert code == 0 and "removed 2 item(s) permanently, freed 200 B" in out
+    assert "into the root-only quarantine" not in out
+    assert [(e["mode"], e["freed"], e["items"]) for e in history.load()] == [
+        ("administrator", 200, 2)]
+
+
+def test_mixed_helper_batch_history(tmp_path, monkeypatch, capsys):
+    _patch_scan(monkeypatch, [_sys("/opt/a"), _job()])
+    monkeypatch.setattr(cli, "_is_root_process", lambda: True)
+    _install(monkeypatch, Launcher(quarantine_run="rq", backup_run="rb"))
+    code, out = _run(capsys, "--act-on", "orphan_files,orphan_launch_jobs",
+                     "--execute", "--yes")
+    assert code == 0
+    assert "removed 1 item(s) permanently, freed 100 B" in out
+    assert "moved 1 item(s) (100 B) into the root-only quarantine" in out
+    assert sorted((e["mode"], e["freed"], e["items"]) for e in history.load()) == [
+        ("administrator", 100, 1), ("administrator-quarantine", 0, 1)]
+
+
+def test_never_started_vs_unknown_outcome(tmp_path, monkeypatch, capsys):
+    _patch_scan(monkeypatch, [_sys()])
+    monkeypatch.setattr(cli, "_is_root_process", lambda: True)
+    for exc in (elevate_launch.ElevationNotStarted(
+                    "could not start the elevation prompt: [Errno 2] no such file"),
+                elevate_launch.ElevationNotStarted("pkexec could not run the helper",
+                                                   exit_code=127)):
+        _install(monkeypatch, Launcher(write=False, exc=exc))
+        code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
+        assert code == 2
+        assert ("the administrator helper did not run" in out.lower()
+                and "none of the system-wide items was removed" in out)
+        assert "unknown" not in out
+    # the launcher's own failures map to the typed class
+    real_run = elevate_launch._run
+    monkeypatch.setattr(elevate_launch, "current_os", lambda: "linux")
+    monkeypatch.setattr(elevate_launch.utils, "safe_which", lambda n: "/usr/bin/pkexec")
+    monkeypatch.setattr(elevate_launch, "_run",
+                        lambda argv, timeout: (127, "Error executing command"))
+    with pytest.raises(elevate_launch.ElevationNotStarted):
+        elevate_launch.launch_elevated([sys.executable, "-I"])
+
+    def popen_fails(*a, **k):
+        raise OSError(2, "No such file or directory")
+
+    monkeypatch.setattr(elevate_launch.subprocess, "Popen", popen_fails)
+    with pytest.raises(elevate_launch.ElevationNotStarted):
+        real_run(["/nope"], 5)
+    # still an ElevationFailed for every older caller
+    assert issubclass(elevate_launch.ElevationNotStarted, elevate_launch.ElevationFailed)
+
+
+def test_interrupt_during_launch_and_request_dir_error(tmp_path, monkeypatch, capsys):
+    _patch_scan(monkeypatch, [_sys()])
+    monkeypatch.setattr(cli, "_is_root_process", lambda: True)
+    _install(monkeypatch, Launcher(write=False, exc=KeyboardInterrupt()))
+    code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
+    assert code == 2 and "may still be running; check before retrying" in out
+
+    def no_dir():
+        raise OSError(28, "No space left on device")
+
+    launch = _install(monkeypatch, Launcher())
+    monkeypatch.setattr(elevate, "make_request_dir", no_dir)
+    code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
+    assert code == 2 and launch.calls == []
+    assert "could not be prepared" in out and "none of the system-wide items was removed" in out
+
+
+def test_review_interrupt_during_launch_still_prints_summary(tmp_path, monkeypatch, capsys):
+    p, user = _user(tmp_path)
+    _patch_scan(monkeypatch, [user, _sys()])
+    _install(monkeypatch, Launcher(write=False, exc=KeyboardInterrupt()))
+    code, out, asked = _review(monkeypatch, capsys, ["d", "d", PHRASE],
+                               "big_files", "orphan_files")
+    assert code == 2 and not p.exists()
+    assert "may still be running" in out and "Removed 1 item(s)" in out
+
+
+def test_invalid_run_ids_are_never_printed(tmp_path, monkeypatch, capsys):
+    # read_result validates both run ids with a strict regex: an invalid one
+    # makes the whole result unreadable, so no path is ever joined/printed.
+    _patch_scan(monkeypatch, [_sys()])
+    monkeypatch.setattr(cli, "_is_root_process", lambda: True)
+    for field in ("backup_run", "quarantine_run"):
+        bad = "../../etc"
+        kw = {field: bad}
+        _install(monkeypatch, Launcher(**kw))
+        code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
+        assert code == 2 and "../../etc" not in out and "/etc/files" not in out
+        assert "outcome is unknown" in out
+
+
+def test_preview_and_non_tty_wording(tmp_path, monkeypatch, capsys):
+    _patch_scan(monkeypatch, [_sys()])
+    monkeypatch.setattr(cli, "_is_root_process", lambda: True)
+    code, out = _run(capsys, "--act-on", "orphan_files", "--yes")
+    assert "after typing" not in out and "no typed confirmation" in out
+    monkeypatch.setattr(cli, "_is_root_process", lambda: False)
+    code, out = _run(capsys, "--act-on", "orphan_files")
+    assert f"after typing {PHRASE}" in out
+    # non-TTY with --yes but not root: no "to act on" banner, just not done
+    p, user = _user(tmp_path)
+    _patch_scan(monkeypatch, [user, _sys()])
+    code, out = _run(capsys, "--act-on", "big_files,orphan_files", "--execute", "--yes")
+    assert code == 0 and "to act on with administrator rights" not in out
+    assert "not done: needs an elevated run" in out
+    # executing lists each offered item in full only once
+    monkeypatch.setattr(cli, "_is_root_process", lambda: True)
+    _patch_scan(monkeypatch, [_sys("/opt/only-once")])
+    _install(monkeypatch, Launcher())
+    code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
+    assert out.count("root-only quarantine you cannot restore from yet") == 1

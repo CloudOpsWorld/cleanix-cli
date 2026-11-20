@@ -614,14 +614,16 @@ def _system_part(console: Console, items, *, permanent: bool, yes: bool,
     items = list(items)
     if not items:
         return 0
+    if not (yes and _is_root_process()) and not _stdin_is_tty():
+        # Nothing will be done: no banner, just say so per item.
+        console.print("\n[yellow]System-wide items not done:[/yellow]")
+        for i in items:
+            console.print(f"  {safe(i.description)}: "
+                          f"{safe('not done: ' + system_findings.NOT_ELEVATED)}")
+        return 0
     _system_listing(console, items, permanent)
+    none_removed = "none of the system-wide items was removed"
     if not (yes and _is_root_process()):
-        if not _stdin_is_tty():
-            console.print("\n[yellow]System-wide items not done:[/yellow]")
-            for i in items:
-                console.print(f"  {safe(i.description)}: "
-                              f"{safe('not done: ' + system_findings.NOT_ELEVATED)}")
-            return 0
         phrase = system_findings.CONFIRM_PHRASE
         try:
             answer = ask_phrase(
@@ -629,9 +631,11 @@ def _system_part(console: Console, items, *, permanent: bool, yes: bool,
                 "(anything else aborts): ")
         except (EOFError, KeyboardInterrupt, OSError):
             answer = None
-        if answer is None or answer.strip() != phrase:
+        # Exact: only the line ending is dropped (no other whitespace, no
+        # case folding).
+        if answer is None or answer.rstrip("\r\n") != phrase:
             console.print("Aborted: the system-wide items were not touched; "
-                          "nothing of them was removed.")
+                          f"{none_removed}.")
             return 1
 
     # No spinner here: the platform's password prompt may need the terminal.
@@ -639,18 +643,32 @@ def _system_part(console: Console, items, *, permanent: bool, yes: bool,
     try:
         result = system_findings.run_batch(items, permanent,
                                            launcher=_findings_launcher)
+    except KeyboardInterrupt:
+        console.print("[red]Interrupted: the administrator helper may still be "
+                      "running; check before retrying (scan again to see what "
+                      "is left).[/red]")
+        return 2
     except ValueError as exc:
         console.print(f"[red]The administrator request was not sent: "
-                      f"{helper_safe(exc)}. No prompt was shown; nothing was "
-                      "removed.[/red]")
+                      f"{helper_safe(exc)}. No prompt was shown; {none_removed}."
+                      "[/red]")
+        return 2
+    except OSError as exc:
+        # Before any launch (the private request directory / file).
+        console.print(f"[red]The administrator request could not be prepared "
+                      f"({helper_safe(exc)}); the administrator helper did not "
+                      f"run; {none_removed}.[/red]")
         return 2
     except el.ElevationDeclined:
-        console.print("Administrator permission was declined; nothing was removed.")
+        console.print(f"Administrator permission was declined; {none_removed}.")
         return 1
     except el.ElevationUnavailable as exc:
         console.print(f"[red]Acting with administrator rights is not available "
-                      f"on this system ({helper_safe(exc)}); nothing was "
-                      "removed.[/red]")
+                      f"on this system ({helper_safe(exc)}); {none_removed}.[/red]")
+        return 2
+    except el.ElevationNotStarted as exc:
+        console.print(f"[red]The administrator helper did not run "
+                      f"({helper_safe(exc)}); {none_removed}.[/red]")
         return 2
     except el.ElevationFailed as exc:
         if getattr(exc, "exit_code", None) is None and "timed out" in str(exc).lower():
@@ -661,7 +679,7 @@ def _system_part(console: Console, items, *, permanent: bool, yes: bool,
         else:
             console.print(f"[red]The administrator helper failed "
                           f"({helper_safe(exc)}): the outcome is unknown; some "
-                          "items may already have been removed. Scan again to "
+                          "system-wide items may already have been removed. Scan again to "
                           "see what is left.[/red]")
         return 2
 
@@ -677,14 +695,21 @@ def _system_part(console: Console, items, *, permanent: bool, yes: bool,
         for e in result.errors[:10]:
             console.print(f"  {helper_safe(e)}")
     qdir = system_findings.root_quarantine_dir()
-    console.print(f"[green]Administrator helper: removed {result.removed} "
-                  f"item(s), freed {human_size(result.freed)}.[/green]")
+    t = system_findings.tally(result, items, permanent)
+    if t.deleted or t.freed or not t.moved:
+        console.print(f"[green]Administrator helper: removed {t.deleted} "
+                      f"item(s) permanently, freed {human_size(t.freed)}.[/green]")
+    if t.moved:
+        console.print(
+            f"[cyan]Administrator helper: moved {t.moved} item(s) "
+            f"({human_size(t.moved_bytes)}) into the root-only quarantine; no "
+            "space was freed (there is no purge for it yet).[/cyan]")
     if result.quarantine_run:
         console.print(
-            f"[cyan]Moved into the root-only quarantine run "
+            f"[cyan]Root-only quarantine run "
             f"'{helper_safe(result.quarantine_run)}' in {helper_safe(qdir)}.[/cyan] "
             "You cannot restore from it yet (Cleanix has no restore or purge for "
-            "it), and the space is not freed until it is purged.")
+            "it).")
     if result.backup_run:
         where = posixpath.join(qdir, result.backup_run, "files")
         console.print(
@@ -699,11 +724,14 @@ def _system_part(console: Console, items, *, permanent: bool, yes: bool,
                           "`systemctl daemon-reload` as root.[/yellow]")
     if system_findings.nothing_removed(result):
         console.print("Nothing was removed by the administrator helper.")
-    elif result.removed:
-        try:
-            history.record(result.freed, result.removed, mode="administrator")
-        except Exception:  # noqa: BLE001 - history is best-effort
-            pass
+    # History counts only space really freed: moved bytes stay on disk.
+    try:
+        if t.deleted or t.freed:
+            history.record(t.freed, t.deleted, mode="administrator")
+        if t.moved:
+            history.record(0, t.moved, mode="administrator-quarantine")
+    except Exception:  # noqa: BLE001 - history is best-effort
+        pass
     return 2 if system_findings.batch_failed(result, items) else 0
 
 
@@ -811,8 +839,15 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
     if root_items:
         console.print("\n[bold yellow]System-wide items (need administrator "
                       "rights)[/bold yellow]")
-        for i in splan.offered:
-            _act_line(console, i, safe(system_findings.what_happens(i, permanent)))
+        if args.execute and splan.offered:
+            # Listed in full once, with their confirmation (after the
+            # user-space part).
+            console.print(f"  {len(splan.offered)} item(s) the administrator "
+                          "helper may act on: listed with their confirmation "
+                          "after the user-space part")
+        else:
+            for i in splan.offered:
+                _act_line(console, i, safe(system_findings.what_happens(i, permanent)))
         _list_not_offered(console, splan.not_offered)
 
     total = sum(i.size for i in eligible)
@@ -824,10 +859,12 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
     n_paths = len(eligible) - n_jobs
     sys_text = ""
     if sys_items:
+        how = ("after one administrator prompt (--yes in a root process: no "
+               "typed confirmation)" if args.yes and _is_root_process() else
+               f"after typing {system_findings.CONFIRM_PHRASE}")
         sys_text = (f" Plus {len(sys_items)} system-wide item(s), up to "
                     f"{human_size(sum(i.size for i in sys_items))}: acted on "
-                    "afterwards by the administrator helper, after typing "
-                    f"{system_findings.CONFIRM_PHRASE}.")
+                    f"afterwards by the administrator helper, {how}.")
     if not args.execute:
         if eligible:
             console.print(

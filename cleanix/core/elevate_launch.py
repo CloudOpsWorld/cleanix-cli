@@ -39,6 +39,13 @@ class ElevationFailed(Exception):
         self.exit_code = exit_code
 
 
+class ElevationNotStarted(ElevationFailed):
+    """The elevation prompt or the helper could not be started at all (the
+    program could not be executed, pkexec could not run the helper, UAC
+    could not launch it): the helper did not run, nothing was done. A
+    subclass, so callers that catch ElevationFailed behave as before."""
+
+
 def _invoker_uid() -> int:
     getuid = getattr(os, "getuid", None)
     return int(getuid()) if getuid else 0
@@ -76,7 +83,7 @@ def _run(argv: List[str], timeout: int):
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
     except OSError as exc:
-        raise ElevationFailed(f"could not start the elevation prompt: {exc}") from exc
+        raise ElevationNotStarted(f"could not start the elevation prompt: {exc}") from exc
     try:
         _out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -144,7 +151,8 @@ def launch_elevated(argv: Sequence[str], *, timeout: int = 3600) -> int:
         if rc == 127:
             if "no authentication agent" in err.lower():
                 raise ElevationUnavailable("no polkit authentication agent is running")
-            raise ElevationFailed(err.strip() or "pkexec could not run the helper", exit_code=rc)
+            raise ElevationNotStarted(err.strip() or "pkexec could not run the helper",
+                                      exit_code=rc)
     elif osname == MACOS:
         script = ('do shell script "%s" with administrator privileges'
                   % _applescript_quote(shlex.join(args)))

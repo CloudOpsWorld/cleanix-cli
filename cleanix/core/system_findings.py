@@ -5,7 +5,7 @@ per batch, and plain-language text for the helper's per-item outcomes.
 Nothing here acts on an item in this process: system-wide findings are only
 ever acted on by the elevated helper (``cleanix.elevated``), which scans
 again itself and acts only on items its own scan still reports. The normal
-in-process path (``actions.act`` without ``allow_root``) keeps skipping
+in-process path (``actions.act`` as called by the CLI and the GUI) keeps skipping
 them with "needs an elevated run". Every check here mirrors a check of
 ``elevate_launch.run_findings_request`` per item, so one unsuitable item is
 listed as "not offered" instead of refusing the whole batch.
@@ -270,7 +270,8 @@ def outcome_lines(item: CleanableItem, outcome, permanent: bool) -> List[str]:
             lines.append(f"deleted permanently, no undo ({human_size(outcome.freed)})")
         else:
             lines.append("moved to the root-only quarantine (you cannot restore "
-                         f"from it yet) ({human_size(outcome.freed)})")
+                         f"from it yet; {human_size(outcome.freed)} moved, no space "
+                         "freed)")
     elif status == "not_removed":
         lines.append(f"NOT removed: {outcome.reason or 'no reason given'}")
         if outcome.freed:
@@ -289,6 +290,41 @@ def outcome_lines(item: CleanableItem, outcome, permanent: bool) -> List[str]:
     if outcome.note:
         lines.append(f"note: {outcome.note}")
     return lines
+
+
+@dataclass
+class Tally:
+    """What the helper really did, by effect: ``moved`` items went into the
+    root-only quarantine (no space freed: there is no purge for it);
+    ``deleted`` items were removed for good (permanent paths, job / unit /
+    receipt files), and ``freed`` counts only their bytes (including bytes
+    of a partial permanent removal)."""
+
+    moved: int = 0
+    moved_bytes: int = 0
+    deleted: int = 0
+    freed: int = 0
+
+
+def tally(result, items: Sequence[CleanableItem], permanent: bool) -> Tally:
+    got = outcomes_by_key(result)
+    out = Tally()
+    for item in items:
+        o = got.get(item_key(item))
+        if o is None:
+            continue
+        kind = _kind(item)
+        quarantined = (kind in ("", "path")) and not permanent
+        if o.status == "removed":
+            if quarantined:
+                out.moved += 1
+                out.moved_bytes += max(0, int(o.freed))
+            else:
+                out.deleted += 1
+                out.freed += max(0, int(o.freed))
+        elif o.freed and not quarantined:
+            out.freed += max(0, int(o.freed))  # e.g. "partially removed"
+    return out
 
 
 def batch_failed(result, items: Sequence[CleanableItem]) -> bool:
