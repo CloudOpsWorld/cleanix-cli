@@ -197,6 +197,34 @@ def invoking_user_name() -> str:
     return getpass.getuser()
 
 
+def _is_posix() -> bool:
+    return os.name != "nt"
+
+
+def _process_is_root() -> bool:
+    from cleanix.core import utils
+
+    return bool(utils.is_root())
+
+
+def _default_config_path() -> Optional[str]:
+    """The ``--config`` for the helper, consistent with the identity sent
+    with the request (``--uid`` and ``invoking_user`` come from the real
+    uid). As a normal user: the user's own config file, as the GUI does.
+    In a root process (e.g. under sudo, where HOME / XDG_CONFIG_HOME may
+    still point at the invoking user's files, which the helper would refuse
+    as not owned by uid 0): None, so the helper reads the config of the
+    account it binds (root) itself."""
+    if _is_posix() and _process_is_root():
+        return None
+    try:
+        from cleanix import config as config_mod
+
+        return str(config_mod.config_file_path())
+    except Exception:  # noqa: BLE001 - the helper then uses defaults
+        return None
+
+
 def run_batch(items: Sequence[CleanableItem], permanent: bool, *,
               launcher: Optional[Callable[[List[str]], int]] = None,
               config_path: Optional[str] = None):
@@ -208,12 +236,7 @@ def run_batch(items: Sequence[CleanableItem], permanent: bool, *,
 
     request = elevate.findings_request_for(list(items), permanent=permanent)
     if config_path is None:
-        try:
-            from cleanix import config as config_mod
-
-            config_path = str(config_mod.config_file_path())
-        except Exception:  # noqa: BLE001 - the helper then uses defaults
-            config_path = None
+        config_path = _default_config_path()
     return elevate_launch.run_findings_request(
         request, invoking_user_name(), launcher=launcher, config_path=config_path)
 

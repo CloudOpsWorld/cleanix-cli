@@ -465,6 +465,43 @@ def test_user_space_part_still_runs_when_system_part_declined(tmp_path, monkeypa
     assert [why for _i, why in summary.skipped] == [actions.NEEDS_ELEVATION]
 
 
+def test_user_decline_stops_whole_run_and_says_so(tmp_path, monkeypatch, capsys):
+    p, user = _user(tmp_path)
+    _patch_scan(monkeypatch, [user, _sys()])
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
+    confirms = _confirm(monkeypatch, False)
+    asked = _phrase(monkeypatch, PHRASE)
+    launch = _install(monkeypatch, Launcher())
+    code, out = _run(capsys, "--act-on", "big_files,orphan_files", "--execute")
+    assert code == 1 and p.exists() and launch.calls == [] and asked == []
+    assert "answering no stops the whole run" in confirms[0]
+    assert "system-wide items were not touched either" in out
+
+
+def test_request_identity_and_config_agree(tmp_path, monkeypatch, capsys):
+    """--uid / invoking_user come from the real uid; --config must belong to
+    the same account: in a root process (sudo) no user's config is sent."""
+    s = _sys()
+    _patch_scan(monkeypatch, [s])
+    monkeypatch.setattr(cli, "_is_root_process", lambda: True)
+    monkeypatch.setattr(system_findings, "_is_posix", lambda: True)
+    monkeypatch.setattr(system_findings, "invoking_user_name", lambda: "root")
+    launch = _install(monkeypatch, Launcher())
+    monkeypatch.setattr(system_findings, "_process_is_root", lambda: True)
+    code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
+    assert code == 0 and "--config" not in launch.calls[-1]
+    assert launch.requests[-1].invoking_user == "root"
+    # a normal user: its own config file, as the GUI sends it
+    monkeypatch.setattr(system_findings, "_process_is_root", lambda: False)
+    monkeypatch.setattr(system_findings, "invoking_user_name", lambda: "alice")
+    code, out = _run(capsys, "--act-on", "orphan_files", "--execute", "--yes")
+    argv = launch.calls[-1]
+    from cleanix import config as config_mod
+
+    assert argv[argv.index("--config") + 1] == str(config_mod.config_file_path())
+    assert launch.requests[-1].invoking_user == "alice"
+
+
 def test_cli_never_passes_allow_root(tmp_path, monkeypatch, capsys):
     root = Path(cli.__file__).parent
     for rel in ("cli.py", "core/review.py", "core/system_findings.py"):

@@ -856,7 +856,8 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
             confirmed = Confirm.ask(
                 f"Act on {len(eligible)} item(s), up to {human_size(total)}? "
                 f"{_batch_text(n_paths, n_jobs, permanent, 'will be')}."
-                + (" (System-wide items are confirmed separately afterwards.)"
+                + (" (System-wide items are confirmed separately afterwards; "
+                   "answering no stops the whole run and changes nothing.)"
                    if sys_items else ""),
                 default=False)
         except (EOFError, OSError):
@@ -865,7 +866,9 @@ def cmd_clean_act_on(args: argparse.Namespace, console: Console) -> int:
                 "--yes to proceed. Nothing was changed.[/red]")
             return 2
         if not confirmed:
-            console.print("Aborted. Nothing was changed.")
+            console.print("Aborted. Nothing was changed"
+                          + (" (the system-wide items were not touched either)."
+                             if sys_items else "."))
             return 1
 
     def ask_phrase(prompt: str) -> str:
