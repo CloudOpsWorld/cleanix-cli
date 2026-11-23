@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -43,9 +43,9 @@ Repository = "https://github.com/CloudOpsWorld/cleanix-cli"
 Issues = "https://github.com/CloudOpsWorld/cleanix-cli/issues"
 
 [project.optional-dependencies]
-gui = ["PySide6>=6.6,<7"]
-gui-test = ["PySide6>=6.6,<7", "pytest-qt>=4.4"]
-dev = ["pytest>=9.1.1", "ruff>=0.15.21", "mypy>=2.3.0", "build>=1.5.1"]
+gui = ["PySide6>=6.12.0,<7"]
+gui-test = ["PySide6>=6.12.0,<7", "pytest-qt>=4.5.0"]
+dev = ["pytest>=9.2.0", "ruff>=0.17.6", "mypy>=2.4.1", "build>=1.6.1"]
 
 [project.scripts]
 cleanix = "cleanix.cli:main"
